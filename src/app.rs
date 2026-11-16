@@ -224,6 +224,8 @@ pub enum Modal {
     Help,
     /// Confirm deletion of the given node.
     ConfirmDelete(NodeIdx),
+    /// Confirm an export while directories are still unread: the dump will be partial.
+    ConfirmExport,
     /// The largest files under the directory the popup was opened from.
     TopFiles(Box<TopFiles>),
     /// Details of the selected entry (tree data plus a fresh on-disk stat).
@@ -307,6 +309,9 @@ pub struct App {
     /// A pending request to suspend the TUI and spawn `$SHELL` in this directory, consumed
     /// once per frame by the event loop (which owns the terminal).
     shell_request: Option<String>,
+    /// Where the export key writes its dump; `None` means the working directory at that
+    /// moment. Tests point it at a scratch directory.
+    export_dir: Option<PathBuf>,
     /// Spinner animation frame.
     pub tick: usize,
 }
@@ -344,6 +349,7 @@ impl App {
             bytes_seen: 0,
             scan_started: None,
             shell_request: None,
+            export_dir: None,
             tick: 0,
             tree,
         }
@@ -527,9 +533,24 @@ impl App {
     /// next free `rcdu-dump*.json` in the working directory, in the same ncdu format as `-o`.
     /// Synchronous: dumps write fast relative to scanning, and the outcome lands in the
     /// status line.
+    ///
+    /// While directories are still unread, the dump would be partial yet look like the result
+    /// of a finished scan to whoever reads it, so that case is confirmed first.
     fn request_export(&mut self) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        self.export_into(&cwd);
+        if self.tree.unread_dirs() > 0 {
+            self.modal = Modal::ConfirmExport;
+        } else {
+            self.export_now();
+        }
+    }
+
+    /// Write the dump without further questions.
+    fn export_now(&mut self) {
+        let dir = self
+            .export_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        self.export_into(&dir);
     }
 
     fn export_into(&mut self, dir: &Path) {
@@ -538,7 +559,16 @@ impl App {
         match written {
             Ok(path) => {
                 let entries = self.tree.total_dirs + self.tree.total_files;
-                self.status = Some(format!("exported {entries} entries to {}", path.display()));
+                let path = path.display();
+                self.status = Some(match self.tree.unread_dirs() {
+                    0 => format!("exported {entries} entries to {path}"),
+                    1 => format!(
+                        "partial export ({entries} entries, 1 directory not read yet) to {path}"
+                    ),
+                    n => format!(
+                        "partial export ({entries} entries, {n} directories not read yet) to {path}"
+                    ),
+                });
             }
             Err(e) => self.status = Some(format!("export failed: {e}")),
         }
@@ -904,6 +934,16 @@ impl App {
                     }
                     // Any other key: keep waiting in the dialog.
                     _ => self.modal = Modal::ConfirmDelete(idx),
+                }
+                return;
+            }
+            Modal::ConfirmExport => {
+                match action {
+                    KeyAction::Confirm => self.export_now(),
+                    KeyAction::Quit | KeyAction::Leave | KeyAction::Cancel => {
+                        self.status = Some("export cancelled".into());
+                    }
+                    _ => self.modal = Modal::ConfirmExport,
                 }
                 return;
             }
@@ -1948,6 +1988,120 @@ mod tests {
             app.status
         );
         assert!(crate::dump::import(std::fs::File::open(&out).unwrap()).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tree whose scan is still running: `done/` (with one file) has been read, `pending/`
+    /// (scanner id 2) has not.
+    fn app_mid_scan() -> App {
+        use crate::scan::NewNode;
+        let node = |name: &str, kind, dir_id| NewNode {
+            name: name.into(),
+            kind,
+            apparent: 10,
+            disk: 10,
+            dev: 1,
+            ino: 1,
+            hlink: false,
+            shared: false,
+            excluded: Excluded::No,
+            read_error: false,
+            dir_id,
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                node("done", NodeKind::Dir, Some(1)),
+                node("pending", NodeKind::Dir, Some(2)),
+            ],
+            error: None,
+        });
+        app.tree.apply(Batch {
+            parent_id: 1,
+            nodes: vec![node("f", NodeKind::File, None)],
+            error: None,
+        });
+        app
+    }
+
+    /// An empty directory of its own for a test to export into.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rcdu_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn files_in(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    /// Exporting while directories are still unread is asked about first: to whoever reads
+    /// the dump later, it would look like the result of a finished scan.
+    #[test]
+    fn export_during_a_scan_asks_first() {
+        let dir = scratch_dir("export_ask");
+        let mut app = app_mid_scan();
+        app.export_dir = Some(dir.clone());
+
+        app.on_key(KeyAction::Export);
+        assert!(
+            matches!(app.modal, Modal::ConfirmExport),
+            "asks before writing"
+        );
+        assert_eq!(files_in(&dir), 0, "nothing written yet");
+
+        app.on_key(KeyAction::Cancel);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.status.as_deref(), Some("export cancelled"));
+        assert_eq!(files_in(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A confirmed partial export says so, and the dump tells unread directories apart from
+    /// empty ones: they carry the read-error flag, which every reader shows as incomplete.
+    #[test]
+    fn confirmed_partial_export_marks_unread_directories() {
+        let dir = scratch_dir("export_partial");
+        let mut app = app_mid_scan();
+        app.export_dir = Some(dir.clone());
+
+        app.on_key(KeyAction::Export);
+        app.on_key(KeyAction::Confirm);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("partial"), "{status:?}");
+
+        let dump =
+            crate::dump::import(std::fs::File::open(dir.join("rcdu-dump.json")).unwrap()).unwrap();
+        let named = |name: &str| dump.nodes.iter().find(|n| n.name == name).unwrap();
+        assert!(named("pending").read_error, "unread: shown as incomplete");
+        assert!(!named("done").read_error, "read: not flagged");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Once everything has been read there is nothing to ask and nothing to mark.
+    #[test]
+    fn export_of_a_finished_scan_needs_no_question() {
+        let dir = scratch_dir("export_done");
+        let mut app = app_mid_scan();
+        app.export_dir = Some(dir.clone());
+        app.tree.apply(Batch {
+            parent_id: 2,
+            nodes: vec![],
+            error: None,
+        });
+
+        app.on_key(KeyAction::Export);
+        assert!(matches!(app.modal, Modal::None));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("exported") && !status.contains("partial"),
+            "{status:?}"
+        );
+        let dump =
+            crate::dump::import(std::fs::File::open(dir.join("rcdu-dump.json")).unwrap()).unwrap();
+        assert!(dump.nodes.iter().all(|n| !n.read_error));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

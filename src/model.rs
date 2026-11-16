@@ -309,6 +309,20 @@ impl Tree {
         self.nodes[idx].unscanned == 0
     }
 
+    /// Directories in the whole tree that are still waiting to be read. Zero once every scan
+    /// and rescan has finished.
+    pub fn unread_dirs(&self) -> u32 {
+        self.nodes[self.root].unscanned
+    }
+
+    /// True for a directory whose listing has not arrived yet: it will be read, but for now
+    /// its (empty) child list says nothing about what it holds. Excluded directories are
+    /// never read and are not "unread" in this sense.
+    pub fn is_unread(&self, idx: NodeIdx) -> bool {
+        let n = &self.nodes[idx];
+        n.is_dir() && !n.scanned && n.excluded == Excluded::No
+    }
+
     /// Remove a fully-scanned subtree from the tree (after it has been removed from disk).
     /// Returns the number of (dirs, files) removed.
     pub fn delete_subtree(&mut self, idx: NodeIdx) -> (u64, u64) {

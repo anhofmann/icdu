@@ -230,10 +230,12 @@ touch a local file that happens to have the same path. Independently of that, `-
 dump whose entry names aren't single path components (empty, `.`, `..`, or containing `/` or
 NUL), or whose root path contains a `..` component.
 
-
 Press `e` in the UI to write the currently browsed tree — including deletions made this session —
 to `rcdu-dump.json` in the working directory (`rcdu-dump-2.json` and so on if one already
 exists), in the same format as `-o`: handy for snapshotting a long scan without redoing it.
+While the scan is still running, `e` asks first, because the dump will be partial. Directories
+that have not been read yet are then written with the read-error flag, so rcdu and ncdu show
+them as incomplete (`!`) instead of as empty.
 
 ## Portable, dependency-free binaries
 

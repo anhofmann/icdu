@@ -82,6 +82,7 @@ pub fn render(f: &mut Frame, app: &App) {
     match &app.modal {
         Modal::Help => render_help(f),
         Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
+        Modal::ConfirmExport => render_confirm_export(f, app),
         Modal::TopFiles(tf) => render_top_files(f, app, tf),
         Modal::Info(idx) => render_info(f, app, *idx),
         Modal::Find(find) => render_find(f, app, find),
@@ -690,9 +691,73 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
     );
 }
 
+/// Headline and the two explanatory lines of the export confirmation, for the number of
+/// directories still unread. The dialog stays open while the scan goes on, so the number is
+/// live and can reach zero under the user's eyes.
+fn confirm_export_text(unread: usize) -> [String; 3] {
+    let waiting = match unread {
+        0 => {
+            return [
+                "Export the dump?".into(),
+                "  The scan has finished in the meantime: every directory has been read.".into(),
+                "  The dump will be complete.".into(),
+            ]
+        }
+        1 => "1 directory has".to_string(),
+        n => format!("{} directories have", fmt_count(n)),
+    };
+    [
+        "Export a partial dump?".into(),
+        format!("  The scan is still running: {waiting} not been read yet."),
+        "  The dump marks them as unreadable (!) instead of showing them empty.".into(),
+    ]
+}
+
+/// Asked before exporting while directories are still unread: the dump would otherwise look
+/// like the result of a finished scan.
+fn render_confirm_export(f: &mut Frame, app: &App) {
+    let [headline, first, second] = confirm_export_text(app.tree.unread_dirs() as usize);
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            headline,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(first),
+        Line::from(second),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  y",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" export now    "),
+            Span::styled("n / Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    let width = 76.min(f.area().width.saturating_sub(4)).max(24);
+    let height = wrapped_height(&lines, width - 2) + 2;
+    let area = popup(f.area(), width, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Confirm export "),
+        ),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fmt_count, fmt_items, item_cell, truncate_left, ITEMS_WIDTH};
+    use super::{confirm_export_text, fmt_count, fmt_items, item_cell, truncate_left, ITEMS_WIDTH};
     use crate::model::{Excluded, NodeKind, Tree};
 
     /// Exact while it fits, compact (rounded down) beyond, never wider than the column.
@@ -758,6 +823,23 @@ mod tests {
         assert_eq!(fmt_count(999), "999");
         assert_eq!(fmt_count(1_000), "1,000");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    /// The export confirmation counts what is still unread, in the right grammatical number,
+    /// and changes its question when the scan finishes while it is open.
+    #[test]
+    fn confirm_export_text_follows_the_scan() {
+        let [headline, first, _] = confirm_export_text(1_500);
+        assert_eq!(headline, "Export a partial dump?");
+        assert!(first.contains("1,500 directories have not been read"));
+
+        let [_, first, _] = confirm_export_text(1);
+        assert!(first.contains("1 directory has not been read"));
+
+        let [headline, first, second] = confirm_export_text(0);
+        assert_eq!(headline, "Export the dump?");
+        assert!(first.contains("finished"));
+        assert!(second.contains("complete"));
     }
 
     /// Long paths lose their head, cut at a `/` so the tail (and the name) stays readable.

@@ -69,7 +69,10 @@ fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> 
     if matches!(n.kind, NodeKind::Link | NodeKind::Other) {
         write!(w, ",\"notreg\":true")?;
     }
-    if n.read_error {
+    // A directory whose listing has not arrived yet (a dump taken while the scan is still
+    // running) is written as a read error too. The format has no word for "not read yet", and
+    // this one makes every reader show the directory as incomplete instead of as empty.
+    if n.read_error || tree.is_unread(idx) {
         write!(w, ",\"read_error\":true")?;
     }
     match n.excluded {
