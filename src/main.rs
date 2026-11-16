@@ -240,6 +240,8 @@ fn main() {
         let tree = unwrap_or_die(load_import(src), src);
         let mut app = App::new(tree, args.disk_usage, args.read_only, false);
         app.show_item_count = args.show_item_count;
+        // A dump is not the local filesystem: nothing may act on its paths.
+        app.imported = true;
         run_ui(&mut app);
         return;
     }

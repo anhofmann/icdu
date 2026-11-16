@@ -179,9 +179,9 @@ can slightly overcount until a full restart.
 Press `i` on the selected entry to see its path, type, total and own sizes, the number of
 entries for directories (direct, and recursive as `total items`), and flags (hard links,
 exclusions, read errors) — plus, statted lazily from disk at open time, its permissions,
-numeric owner, modification time, inode, and link count. Nothing extra is stored per node, so the tree stays lean; if the path is gone
-(deleted mid-session, or a dump whose paths no longer exist) the on-disk section is simply
-omitted.
+numeric owner, modification time, inode, and link count. Nothing extra is stored per node, so
+the tree stays lean; if the path is gone (deleted mid-session) the popup says the on-disk
+details are unavailable. For an imported dump (`-f`) nothing is read from disk at all.
 
 ### Deleting
 
@@ -222,9 +222,15 @@ results (`remove_dir_all` can't be cleanly cancelled). Any other key disarms the
 `-o` writes the ncdu export format (`[1, 2, {meta}, <root>]`, per-item `asize`/`dsize`, `hlnkc`,
 `notreg`, `excluded`, `read_error`), readable by ncdu and other tools. `-f` reads the same format
 (including dumps produced by ncdu itself), re-deriving hard-link dedup so totals match a live scan.
-Because delete, open and the shell act on the paths an imported tree names, `-f` refuses a dump
-whose entry names aren't single path components (empty, `.`, `..`, or containing `/` or NUL), or
-whose root path contains a `..` component.
+
+A dump describes the machine and the moment it was taken on, not the local filesystem as it is
+now. While browsing one, delete, the shell, open and rescan are therefore disabled, and the
+info popup reads nothing from disk, as in ncdu. So `ssh host ncdu -o- / | rcdu -f -` can never
+touch a local file that happens to have the same path. Independently of that, `-f` refuses a
+dump whose entry names aren't single path components (empty, `.`, `..`, or containing `/` or
+NUL), or whose root path contains a `..` component.
+
+
 Press `e` in the UI to write the currently browsed tree — including deletions made this session —
 to `rcdu-dump.json` in the working directory (`rcdu-dump-2.json` and so on if one already
 exists), in the same format as `-o`: handy for snapshotting a long scan without redoing it.

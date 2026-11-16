@@ -275,6 +275,10 @@ pub struct App {
     pub scanning: bool,
     /// Read-only: deletion disabled (ncdu `-r`).
     pub read_only: bool,
+    /// The tree was loaded from a dump (`-f`) rather than scanned. Its paths describe whatever
+    /// machine and moment the dump was taken on, not the local filesystem as it is now, so
+    /// nothing may act on them: no delete, shell, open, rescan or stat. ncdu does the same.
+    pub imported: bool,
     pub quit: bool,
     pub modal: Modal,
     /// Transient one-line message shown in the footer until the next key press.
@@ -325,6 +329,7 @@ impl App {
             show_item_count: false,
             scanning,
             read_only,
+            imported: false,
             quit: false,
             modal: Modal::None,
             status: None,
@@ -436,13 +441,25 @@ impl App {
             .is_some_and(|d| self.tree.is_within(sel, d) || self.tree.is_within(d, sel))
     }
 
+    /// While browsing an imported dump, refuse an action that would touch the filesystem:
+    /// sets the status and returns true when `what` must not run.
+    fn refused_for_import(&mut self, what: &str) -> bool {
+        if self.imported {
+            self.status = Some(format!("{what} is disabled when browsing an imported dump"));
+        }
+        self.imported
+    }
+
     /// Rescan the selected directory in place: the model tears its subtree down and a new
     /// scanner generation re-reads it from disk, grafting back into the same node. Browsing
     /// stays live the whole time; totals of surrounding directories stay correct throughout.
     fn request_refresh(&mut self) {
+        if self.refused_for_import("rescan") {
+            return;
+        }
         let Some(sel) = self.selected else { return };
         let Some(opts) = self.scan_opts.as_ref() else {
-            self.status = Some("rescan unavailable: browsing an imported dump".into());
+            self.status = Some("rescan unavailable: no scan is attached".into());
             return;
         };
         if self.refreshing_idx.is_some() {
@@ -624,6 +641,9 @@ impl App {
     /// containing it). The event loop owns the terminal, so it consumes the request and
     /// handles the suspend/resume; nothing happens here but recording it.
     fn request_shell(&mut self) {
+        if self.refused_for_import("the shell") {
+            return;
+        }
         let idx = self.selected.unwrap_or(self.cur);
         let target = if self.tree.nodes[idx].is_dir() {
             idx
@@ -766,6 +786,15 @@ impl App {
         }
         if n.read_error {
             rows.push(("read error".to_string(), "yes".to_string()));
+        }
+        if self.imported {
+            // The path may belong to another machine; a local file of the same name would
+            // show up here as if it were the entry.
+            rows.push((
+                "on disk".to_string(),
+                "not checked (imported dump)".to_string(),
+            ));
+            return rows;
         }
         match self.tree.fs_path_of(idx).map(std::fs::symlink_metadata) {
             Some(Ok(m)) => {
@@ -1112,6 +1141,9 @@ impl App {
     /// app, directories in the file manager. Non-destructive, so unlike delete it also works
     /// in read-only mode and while a scan is still filling in the tree.
     fn open_selected(&mut self) {
+        if self.refused_for_import("open") {
+            return;
+        }
         let Some(sel) = self.selected else { return };
         if self.deleting_idx() == Some(sel) {
             self.status = Some("can't open: this entry is being deleted".into());
@@ -1162,6 +1194,9 @@ impl App {
     }
 
     fn request_delete(&mut self) {
+        if self.refused_for_import("delete") {
+            return;
+        }
         if self.read_only {
             self.status = Some("read-only mode (-r): deletion disabled".into());
             return;
@@ -1771,7 +1806,7 @@ mod tests {
             Excluded::No,
             false,
         );
-        let app = App::new(t, true, false, false);
+        let mut app = App::new(t, true, false, false);
         let rows = app.info_pairs(f);
 
         let perms = rows.iter().find(|(k, _)| k == "permissions").unwrap();
@@ -1789,6 +1824,18 @@ mod tests {
             "no dir-only or error rows for a live file"
         );
 
+        // The same tree as an imported dump: the path exists on this machine, and still must
+        // not be looked at, because the dump may describe another one.
+        app.imported = true;
+        let rows = app.info_pairs(f);
+        assert!(
+            rows.iter()
+                .all(|(k, _)| k != "permissions" && k != "owner" && k != "inode"),
+            "nothing is read from the local disk: {rows:?}"
+        );
+        let on_disk = rows.iter().find(|(k, _)| k == "on disk").unwrap();
+        assert!(on_disk.1.contains("imported"), "got {on_disk:?}");
+
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -1801,6 +1848,31 @@ mod tests {
         app.on_key(KeyAction::Quit);
         assert!(matches!(app.modal, Modal::None));
         assert!(!app.quit, "closing info must not quit");
+    }
+
+    /// A dump describes some machine at some moment, not the local filesystem as it is now.
+    /// While browsing one, every key that would act on a path is refused, as in ncdu.
+    #[test]
+    fn imported_dumps_refuse_filesystem_actions() {
+        let mut app = app_with_entries();
+        app.imported = true;
+        app.selected = Some(idx_named(&app, "gamma")); // a directory
+        for (key, what) in [
+            (KeyAction::Delete, "delete"),
+            (KeyAction::Shell, "shell"),
+            (KeyAction::Open, "open"),
+            (KeyAction::Refresh, "rescan"),
+        ] {
+            app.status = None;
+            app.on_key(key);
+            let status = app.status.clone().unwrap_or_default();
+            assert!(status.contains("imported dump"), "{what}: {status:?}");
+        }
+        assert!(matches!(app.modal, Modal::None), "no delete dialog");
+        assert!(!app.is_deleting());
+        assert_eq!(app.take_shell_request(), None);
+        assert!(app.pending_open.is_empty());
+        assert_eq!(app.refreshing_idx, None);
     }
 
     /// An exported dump is readable again by the importer, with the same totals and children.

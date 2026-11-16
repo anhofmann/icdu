@@ -46,6 +46,8 @@ Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`,
 
 - `Node::unscanned` counts the directories not yet read in a subtree. `Tree::subtree_complete(idx)` (`unscanned == 0`) gates both **delete** (`d`) and **rescan** (`r`). Deleting a partially scanned subtree could remove things the user hasn't seen. Rescanning one could double-count batches still arriving from the original scan.
 - Deletion runs on a background thread (`perform_delete` → `poll_delete`). Only one runs at a time, the subtree being deleted is locked, and quitting during a delete needs two presses (`quit_armed`).
+- An imported dump (`-f`, `App.imported`) is not the local filesystem. Delete, shell, open, rescan and the info popup's `lstat` are refused there (`refused_for_import`); any new action that touches a path needs the same check.
+- Filesystem actions take their path from `Tree::fs_path_of`, which is `None` for a tombstone. `Tree::path_of` is for display only: for a detached node it returns a relative path.
 
 ### In-place rescan (`r`)
 
