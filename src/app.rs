@@ -1194,7 +1194,7 @@ impl App {
             | KeyAction::FindDeleteWord
             | KeyAction::FindScope => {}
             // Handled by the event loop, which owns the terminal.
-            KeyAction::Redraw => {}
+            KeyAction::Redraw | KeyAction::Suspend => {}
         }
     }
 
@@ -1551,6 +1551,9 @@ pub enum KeyAction {
     FindScope,
     /// Repaint the whole screen (Ctrl-L). The event loop does it; the app has nothing to do.
     Redraw,
+    /// Stop the process and give the terminal back to the shell (Ctrl-Z). Also the event
+    /// loop's job.
+    Suspend,
     /// A key whose function moved to another key: the footer says where.
     Moved(&'static str),
 }

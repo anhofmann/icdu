@@ -29,7 +29,7 @@ The TUI needs a real terminal, so check behavior headlessly with `-o -` or throu
 
 Unix only (`std::os::unix::fs::MetadataExt` for dev/ino/blocks/nlink). Platform-specific code uses `#[cfg(target_os = ...)]`, e.g. the three `opener_command` variants in `app.rs`. Anything you change has to build and pass on both Linux and macOS.
 
-Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`, `compact_str`). The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
+Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`, `compact_str`, and `signal-hook`, which crossterm brings into the build anyway). The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
 
 ## Architecture
 
@@ -61,6 +61,7 @@ Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`,
 
 - `main.rs::run` loops: `poll_scans(20_000)` (a cap, so input never starves) → `poll_delete` / `poll_open` → handle any `take_shell_request()` (tear down the TUI, run `$SHELL`, re-init) → draw → `event::poll` with an 80 ms timeout while busy, 250 ms otherwise.
 - Long-running side effects (delete, open) go to background threads and are polled once per frame through channels. Keep the UI thread non-blocking.
+- `signals.rs`: SIGTERM, SIGHUP, SIGTSTP and SIGCONT only set flags, which the loop checks at the top of every iteration. It restores the terminal before the signal takes effect (`die_by`, `suspend`). Ctrl-Z is a key press in raw mode and takes the same `suspend` path. Always enter and leave the TUI through `init_terminal` / `restore_terminal` (they also switch bracketed paste).
 - `App.selected` tracks node **identity** (`NodeIdx`), not row position, so the highlight stays on the same entry as live updates re-sort the list.
 - `App.status` is a one-line footer message that clears on the next key press. `App.modal` holds popups (help, confirm, top files, info).
 

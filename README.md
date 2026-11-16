@@ -115,10 +115,14 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `q` | quit |
 | `Esc` | close a popup (it never quits) |
 | `Ctrl-l` | redraw the screen |
+| `Ctrl-z` | suspend to the shell; `fg` brings the UI back |
 
 A letter typed with Ctrl or Alt is never taken for the plain letter: `Ctrl-e` does not export and
 `Alt-d` does not delete. The only such combinations that do anything are `Ctrl-c`, `Ctrl-d`,
-`Ctrl-u` and `Ctrl-l`.
+`Ctrl-u`, `Ctrl-l` and `Ctrl-z`.
+
+When icdu is ended from outside (`kill`, a closed terminal window), it gives the terminal back
+in a usable state first.
 
 Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` excluded · `!` read error.
 

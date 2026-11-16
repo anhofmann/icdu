@@ -176,6 +176,7 @@ dependencies = [
  "crossbeam-channel",
  "ratatui",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

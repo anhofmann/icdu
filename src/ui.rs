@@ -645,7 +645,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Ctrl-C        quit (during a delete: press twice to abort it)"),
         Line::from("  Esc               close a popup"),
-        Line::from("  C-l               redraw the screen"),
+        Line::from("  C-l / C-z         redraw the screen / suspend to the shell"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  indicators: / dir   @ link   H hard-link dup   < excluded   ! error",

@@ -6,6 +6,7 @@ mod dump;
 mod glob;
 mod model;
 mod scan;
+mod signals;
 mod ui;
 
 use std::io::{BufReader, BufWriter, Write};
@@ -23,6 +24,7 @@ use ratatui::crossterm::execute;
 use app::{App, InputMode, KeyAction};
 use model::Tree;
 use scan::Opts;
+use signals::Signals;
 
 struct Args {
     path: PathBuf,
@@ -201,7 +203,8 @@ KEYS:
     E               export JSON   b               shell in this directory
     x / !           next error    ?               help    q  quit
     Home/End, G     top/bottom    c               item counts
-    C-l             redraw        (in the search: C-u clear, C-w delete word)",
+    C-l             redraw        C-z             suspend (fg resumes)
+    in the search:  C-u clear the line, C-w delete a word",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -398,21 +401,60 @@ fn run_ui(app: &mut App) {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         default_hook(info);
     }));
+    let signals = unwrap_or_die(Signals::install(), "cannot install signal handlers");
     let mut terminal = init_terminal();
-    let result = run(&mut terminal, app);
+    let result = run(&mut terminal, app, &signals);
     restore_terminal();
-    if let Err(e) = result {
-        eprintln!("icdu: {e}");
-        std::process::exit(1);
+    match result {
+        // Asked to end by a signal: now that the terminal is back, let it take effect.
+        Ok(Some(signal)) => signals::die_by(signal),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("icdu: {e}");
+            std::process::exit(1);
+        }
     }
+}
+
+/// Give the terminal back and stop the process (Ctrl-Z, or SIGTSTP from outside). Returns
+/// once the process is continued, with the TUI set up again. The scan threads stop and
+/// continue with the process.
+fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::io::Result<()> {
+    restore_terminal();
+    signals::stop_process();
+    // Running again. The SIGCONT that woke us needs no second answer.
+    signals.take_cont();
+    *terminal = init_terminal();
+    terminal.clear()
 }
 
 /// Nodes the whole-tree search looks at per frame: a few milliseconds of work, so input stays
 /// responsive while a pass over a 10M-entry tree finishes in well under a second.
 const FIND_SLICE: usize = 200_000;
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<()> {
+/// The event loop. Returns `Ok(None)` when the user quits, and `Ok(Some(signal))` when
+/// SIGTERM or SIGHUP asked the process to end.
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    signals: &Signals,
+) -> std::io::Result<Option<i32>> {
     loop {
+        // Signals only set flags (see `signals.rs`); this is where they take effect, at most
+        // one poll interval later.
+        if let Some(signal) = signals.terminated() {
+            return Ok(Some(signal));
+        }
+        if signals.take_stop() {
+            suspend(terminal, signals)?;
+        } else if signals.take_cont() {
+            // Stopped and continued behind our back (SIGSTOP cannot be caught): whatever
+            // ran in between may have changed the terminal. Set it up again.
+            restore_terminal();
+            *terminal = init_terminal();
+            terminal.clear()?;
+        }
+
         // Drain whatever the scanners produced since the last frame. `poll_scans` caps the
         // batch so a huge filesystem can't starve input handling between redraws, and folds
         // stream completion (initial scan, subtree rescans) into the app state.
@@ -459,8 +501,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
                         .map(|s| (s.height.saturating_sub(5) as usize).max(1))
                         .unwrap_or(20);
                     match decode_key(key.code, key.modifiers, app.input_mode(), page) {
-                        // The one action that needs the terminal: repaint everything.
+                        // The actions that need the terminal itself.
                         Some(KeyAction::Redraw) => terminal.clear()?,
+                        Some(KeyAction::Suspend) => suspend(terminal, signals)?,
                         Some(action) => app.on_key(action),
                         None => {}
                     }
@@ -472,7 +515,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         app.tick = app.tick.wrapping_add(1);
 
         if app.quit {
-            return Ok(());
+            return Ok(None);
         }
     }
 }
@@ -519,6 +562,8 @@ fn decode_key(
             // Ctrl-C quits even while a search query is being typed.
             'c' => Some(KeyAction::Quit),
             'l' => Some(KeyAction::Redraw),
+            // In raw mode Ctrl-Z is a key press, not SIGTSTP.
+            'z' => Some(KeyAction::Suspend),
             // Some terminals send ^H for the Backspace key.
             'h' if find => Some(KeyAction::FindBackspace),
             'h' => Some(KeyAction::Leave),
@@ -782,7 +827,9 @@ mod tests {
         // Terminals that send ^H for the Backspace key.
         assert_eq!(dec('h', ctrl), Some(Leave));
 
-        let harmless = [Quit, PageDown(10), PageUp(10), Redraw, Leave];
+        assert_eq!(dec('z', ctrl), Some(Suspend));
+
+        let harmless = [Quit, PageDown(10), PageUp(10), Redraw, Leave, Suspend];
         let letters = ('a'..='z').chain('A'..='Z').chain("/?!<".chars());
         for c in letters {
             for mods in [
@@ -809,7 +856,7 @@ mod tests {
             ('E', ctrl),
             ('r', ctrl),
             ('d', alt),
-            ('z', ctrl),
+            ('z', alt),
         ] {
             assert_eq!(dec(c, mods), None, "{c:?} with {mods:?}");
         }
@@ -831,13 +878,12 @@ mod tests {
         assert_eq!(dec('h', ctrl), Some(FindBackspace));
         assert_eq!(dec('l', ctrl), Some(Redraw));
         assert_eq!(dec('c', ctrl), Some(Quit));
-        for (c, mods) in [
-            ('d', ctrl),
-            ('z', ctrl),
-            ('a', ctrl),
-            ('x', alt),
-            ('u', alt),
-        ] {
+        assert_eq!(
+            dec('z', ctrl),
+            Some(Suspend),
+            "Ctrl-Z suspends, not types z"
+        );
+        for (c, mods) in [('d', ctrl), ('a', ctrl), ('x', alt), ('u', alt)] {
             assert_eq!(dec(c, mods), None, "{c:?} with {mods:?}");
         }
         assert_eq!(dec('U', KeyModifiers::SHIFT), Some(FindChar('U')));
