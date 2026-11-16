@@ -432,7 +432,16 @@ impl Tree {
         parts.join("/")
     }
 
-    /// Build a filesystem path for a node, walking back to the root (whose name is absolute).
+    /// The path of a node for acting on the filesystem (delete, open, shell, rescan, stat), or
+    /// `None` if the node is no longer part of the tree. A tombstone's parent chain ends
+    /// before the root, so [`Tree::path_of`] gives a *relative* path for it, which the OS
+    /// would resolve against the working directory and so reach an unrelated file.
+    pub fn fs_path_of(&self, idx: NodeIdx) -> Option<String> {
+        self.is_attached(idx).then(|| self.path_of(idx))
+    }
+
+    /// Build the path of a node for display, walking back to the root (whose name is
+    /// absolute). Anything that touches the filesystem goes through [`Tree::fs_path_of`].
     pub fn path_of(&self, idx: NodeIdx) -> String {
         let mut parts = Vec::new();
         let mut cur = Some(idx);
@@ -627,6 +636,26 @@ mod tests {
         }
         assert!(t.is_attached(idx_of(&t, "b")), "sibling stays");
         assert!(t.is_attached(t.root));
+    }
+
+    /// A tombstone has no filesystem path. The display path built from it is relative, which
+    /// is exactly why nothing may act on it.
+    #[test]
+    fn tombstones_have_no_filesystem_path() {
+        let mut t = small_tree();
+        let (a, y, b) = (idx_of(&t, "a"), idx_of(&t, "y"), idx_of(&t, "b"));
+        assert_eq!(t.fs_path_of(y).as_deref(), Some("/r/a/sub/y"));
+        assert_eq!(t.fs_path_of(t.root).as_deref(), Some("/r"));
+
+        t.delete_subtree(a);
+        assert_eq!(t.path_of(y), "a/sub/y", "relative: the chain ends at `a`");
+        assert_eq!(t.fs_path_of(y), None);
+        assert_eq!(t.fs_path_of(a), None);
+        assert_eq!(
+            t.fs_path_of(b).as_deref(),
+            Some("/r/b"),
+            "sibling keeps its path"
+        );
     }
 
     /// A rescan tears down the subtree below the refreshed directory, which itself stays.

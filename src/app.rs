@@ -37,6 +37,9 @@ pub struct TopFiles {
 /// How many rows the top-files popup shows.
 const TOP_FILES_LIMIT: usize = 100;
 
+/// Status shown when an action is asked of a node that a delete or rescan has since removed.
+const GONE: &str = "that entry is no longer in the tree";
+
 /// How long the whole-tree search waits after the last keystroke before it runs.
 pub const FIND_DEBOUNCE: Duration = Duration::from_millis(100);
 /// The most hits the whole-tree search keeps. Broad queries (`e`) can match half the tree;
@@ -360,7 +363,10 @@ impl App {
         if !self.scanning {
             return;
         }
-        let focus = Some(PathBuf::from(self.tree.path_of(self.cur)));
+        let Some(path) = self.tree.fs_path_of(self.cur) else {
+            return;
+        };
+        let focus = Some(PathBuf::from(path));
         for ctrl in &self.controls {
             ctrl.set_focus(focus.clone());
         }
@@ -460,9 +466,12 @@ impl App {
             self.status = Some("cannot rescan: directory is still being scanned".into());
             return;
         }
+        let Some(path) = self.tree.fs_path_of(sel) else {
+            self.status = Some(GONE.into());
+            return;
+        };
         let id_base = self.next_scan_base * SCAN_ID_STRIDE;
         self.next_scan_base += 1;
-        let path = self.tree.path_of(sel);
         self.tree.begin_refresh(sel, id_base);
         let scan = start_at(PathBuf::from(&path), opts.clone(), id_base);
         self.prune_find();
@@ -581,23 +590,28 @@ impl App {
         }
         let anchor = self.selected.unwrap_or(self.cur);
         let pos = order.iter().position(|&i| i == anchor).unwrap_or(0);
+        let mut locked = false;
         for step in 1..=order.len() {
             let idx = order[(pos + step) % order.len()];
             if !self.tree.nodes[idx].read_error {
                 continue;
             }
-            if idx == self.tree.root {
-                self.cur = self.tree.root;
-                self.selected = None;
-            } else {
-                self.cur = self.tree.nodes[idx].parent.unwrap();
-                self.selected = Some(idx);
+            // Errors inside a subtree that is being deleted are about to disappear, and the
+            // subtree is locked: pass over them.
+            if self.deletion_covers(idx) {
+                locked = true;
+                continue;
             }
-            self.refocus();
-            self.status = Some(format!("read error: {}", self.tree.path_of(idx)));
+            if self.jump_to(idx) {
+                self.status = Some(format!("read error: {}", self.tree.path_of(idx)));
+            }
             return;
         }
-        self.status = Some("no read errors".into());
+        self.status = Some(if locked {
+            "no read errors outside the directory being deleted".into()
+        } else {
+            "no read errors".into()
+        });
     }
 
     /// Request a shell in the selected directory (or, for a file/symlink, the directory
@@ -610,7 +624,10 @@ impl App {
         } else {
             self.cur
         };
-        self.shell_request = Some(self.tree.path_of(target));
+        match self.tree.fs_path_of(target) {
+            Some(path) => self.shell_request = Some(path),
+            None => self.status = Some(GONE.into()),
+        }
     }
 
     /// Consume a pending shell request, if any.
@@ -744,8 +761,8 @@ impl App {
         if n.read_error {
             rows.push(("read error".to_string(), "yes".to_string()));
         }
-        match std::fs::symlink_metadata(self.tree.path_of(idx)) {
-            Ok(m) => {
+        match self.tree.fs_path_of(idx).map(std::fs::symlink_metadata) {
+            Some(Ok(m)) => {
                 rows.push((
                     "permissions".to_string(),
                     format!("{:o}", m.mode() & 0o7777),
@@ -755,7 +772,7 @@ impl App {
                 rows.push(("inode".to_string(), m.ino().to_string()));
                 rows.push(("links".to_string(), m.nlink().to_string()));
             }
-            Err(_) => rows.push((
+            _ => rows.push((
                 "on disk".to_string(),
                 "unavailable (deleted since scanning, or dump paths are gone)".to_string(),
             )),
@@ -809,17 +826,31 @@ impl App {
         }
     }
 
-    /// Move the view to a search hit: its parent directory, with the hit selected.
-    fn jump_to_hit(&mut self, idx: NodeIdx) {
+    /// Move the view to `idx`: its parent directory, with `idx` selected (the root is shown
+    /// itself, with nothing selected). Every jump goes through here: search hit, top file,
+    /// next error. Refused with a status message when `idx` is no longer part of the tree or
+    /// lies in a subtree that is being deleted, which is locked. Returns whether the view moved.
+    fn jump_to(&mut self, idx: NodeIdx) -> bool {
         if !self.tree.is_attached(idx) {
-            self.status = Some("that entry is no longer in the tree".into());
-        } else if self.deletion_covers(idx) {
-            self.status = Some("can't go there: it is being deleted".into());
-        } else if let Some(parent) = self.tree.nodes[idx].parent {
-            self.cur = parent;
-            self.selected = Some(idx);
-            self.refocus();
+            self.status = Some(GONE.into());
+            return false;
         }
+        if self.deletion_covers(idx) {
+            self.status = Some("can't go there: it is being deleted".into());
+            return false;
+        }
+        match self.tree.nodes[idx].parent {
+            Some(parent) => {
+                self.cur = parent;
+                self.selected = Some(idx);
+            }
+            None => {
+                self.cur = idx;
+                self.selected = None;
+            }
+        }
+        self.refocus();
+        true
     }
 
     pub fn on_key(&mut self, action: KeyAction) {
@@ -849,16 +880,10 @@ impl App {
                     KeyAction::Top => tf.selected = 0,
                     KeyAction::Bottom => tf.selected = last,
                     KeyAction::Enter => {
-                        let idx = tf.items[tf.selected].idx;
                         // The tree may have changed since the popup opened (deletions and
-                        // rescans tombstone nodes): only jump if the entry is still attached.
-                        if self.tree.is_attached(idx) {
-                            self.cur = self.tree.nodes[idx].parent.unwrap();
-                            self.selected = Some(idx);
-                            self.refocus();
-                        } else {
-                            self.status = Some("that entry is no longer in the tree".into());
-                        }
+                        // rescans tombstone nodes, a running deletion locks its subtree):
+                        // `jump_to` refuses those and says why.
+                        self.jump_to(tf.items[tf.selected].idx);
                     }
                     // q / Esc / h / ? close the popup without changing the view.
                     KeyAction::Quit | KeyAction::Leave | KeyAction::Cancel | KeyAction::Help => {}
@@ -909,7 +934,7 @@ impl App {
                     }
                     KeyAction::Enter => match f.selected {
                         Some(idx) => {
-                            self.jump_to_hit(idx);
+                            self.jump_to(idx);
                             false
                         }
                         // Nothing to jump to yet.
@@ -1086,7 +1111,10 @@ impl App {
             self.status = Some("can't open: this entry is being deleted".into());
             return;
         }
-        let path = self.tree.path_of(sel);
+        let Some(path) = self.tree.fs_path_of(sel) else {
+            self.status = Some(GONE.into());
+            return;
+        };
         let (tx, rx) = unbounded();
         let p = path.clone();
         // Waiting happens off the UI thread: openers normally return at once, but a wedged
@@ -1153,7 +1181,10 @@ impl App {
     }
 
     fn perform_delete(&mut self, idx: NodeIdx) {
-        let path = self.tree.path_of(idx);
+        let Some(path) = self.tree.fs_path_of(idx) else {
+            self.status = Some(GONE.into());
+            return;
+        };
         let is_dir = self.tree.nodes[idx].is_dir();
         // Double-check the gate at the moment of action (scan may have advanced).
         if is_dir && !self.tree.subtree_complete(idx) {
@@ -1200,13 +1231,23 @@ impl App {
                 // on a neighbour; if they browsed elsewhere, leave their selection untouched.
                 let kids = self.sorted_children();
                 let pos = kids.iter().position(|&k| k == pd.idx);
+                let parent = self.tree.nodes[pd.idx].parent;
                 // A node that is no longer part of the tree has already been taken out of
                 // every total; removing it again would subtract it a second time.
                 if self.tree.is_attached(pd.idx) {
                     self.tree.delete_subtree(pd.idx);
                 }
                 self.prune_find();
-                if let Some(p) = pos {
+                if !self.tree.is_attached(self.cur) {
+                    // The view was inside what just disappeared. Step out to the directory
+                    // that contained it: staying would show entries that no longer exist,
+                    // with no way back up.
+                    self.cur = parent
+                        .filter(|&p| self.tree.is_attached(p))
+                        .unwrap_or(self.tree.root);
+                    self.selected = self.sorted_children().first().copied();
+                    self.refocus();
+                } else if let Some(p) = pos {
                     let kids = self.sorted_children();
                     self.selected = (!kids.is_empty()).then(|| kids[p.min(kids.len() - 1)]);
                 }
@@ -2285,6 +2326,111 @@ mod tests {
         app.poll_delete();
         assert!(!app.is_deleting());
         assert_eq!((app.tree.total_dirs, app.tree.total_files), (dirs, files));
+    }
+
+    /// A subtree that is being removed from disk is locked. The top-files popup lists files
+    /// from everywhere below the viewed directory, so its jump must respect the lock too.
+    #[test]
+    fn top_files_jump_does_not_enter_a_subtree_being_deleted() {
+        let mut app = app_for_find();
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        let _worker = start_fake_delete(&mut app, sub);
+
+        // Viewing docs/: its largest file is sub/README.txt, inside the directory being
+        // deleted, so it is the first row of the popup.
+        app.cur = docs;
+        app.selected = None;
+        app.on_key(KeyAction::TopFiles);
+        app.on_key(KeyAction::Enter);
+        assert_eq!(app.cur, docs, "the view did not move into sub/");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("being deleted")));
+    }
+
+    /// The next-error jump walks the whole tree; it skips errors inside a locked subtree.
+    #[test]
+    fn next_error_skips_a_subtree_being_deleted() {
+        let mut app = app_for_find();
+        let (docs, inside, outside) = (
+            idx_named(&app, "docs"),
+            idx_named(&app, "README.txt"),
+            idx_named(&app, "readme"),
+        );
+        app.tree.nodes[inside].read_error = true;
+        app.tree.nodes[outside].read_error = true;
+        let _worker = start_fake_delete(&mut app, docs);
+
+        for _ in 0..3 {
+            app.on_key(KeyAction::NextError);
+            assert_eq!(app.cur, app.tree.root);
+            assert_eq!(app.selected, Some(outside), "only the error outside docs/");
+        }
+
+        // With nothing but locked errors left, the view stays put and the footer says why.
+        app.tree.nodes[outside].read_error = false;
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.cur, app.tree.root);
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("being deleted")));
+    }
+
+    /// When a deletion completes while the view is inside the deleted subtree, the view moves
+    /// out to the surviving parent instead of staying on nodes that no longer exist.
+    #[test]
+    fn view_leaves_a_subtree_when_its_deletion_completes() {
+        let mut app = app_for_find();
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        let worker = start_fake_delete(&mut app, docs);
+        // However the view got there: it is inside the subtree when the worker reports.
+        app.cur = sub;
+        app.selected = Some(idx_named(&app, "README.txt"));
+
+        worker.send(Ok(())).unwrap();
+        app.poll_delete();
+        assert_eq!(
+            app.cur, app.tree.root,
+            "moved to the parent of the deleted directory"
+        );
+        assert!(
+            app.selected.is_some_and(|s| app.tree.is_attached(s)),
+            "an entry that still exists is selected"
+        );
+        assert_eq!(app.tree.fs_path_of(app.cur).as_deref(), Some("/r"));
+    }
+
+    /// A node that is no longer part of the tree has no usable path: the one built from it is
+    /// relative and would resolve against the working directory. No action may run on it.
+    #[test]
+    fn actions_refuse_entries_that_left_the_tree() {
+        let mut app = app_for_find();
+        app.scan_opts = Some(test_opts());
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        app.tree.delete_subtree(docs);
+        // The state the view could be left in before: looking at the deleted directory.
+        app.cur = docs;
+        app.selected = Some(sub);
+
+        app.perform_delete(sub);
+        assert!(!app.is_deleting(), "delete");
+        app.on_key(KeyAction::Open);
+        assert!(app.pending_open.is_empty(), "open");
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request(), None, "shell");
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None, "rescan");
+        assert_eq!(app.status.as_deref(), Some(GONE));
+
+        let on_disk = app.info_pairs(sub);
+        assert!(
+            on_disk
+                .iter()
+                .any(|(k, v)| k == "on disk" && v.starts_with("unavailable")),
+            "info does not stat a relative path"
+        );
     }
 
     /// Past the cap the count can't be fixed up from the kept hits: the pass starts over.
