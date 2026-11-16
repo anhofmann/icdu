@@ -326,7 +326,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         let dev = meta.dev();
         let ino = meta.ino();
         let apparent = meta.len();
-        let disk = meta.blocks() * 512;
+        let disk = meta.blocks().saturating_mul(512);
         let mtime = meta.mtime();
         let hlink = matches!(kind, NodeKind::File) && meta.nlink() > 1;
 

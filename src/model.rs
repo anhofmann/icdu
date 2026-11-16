@@ -191,8 +191,8 @@ impl Tree {
 
             let counts = !nn.shared && nn.excluded == Excluded::No;
             if counts {
-                sum_apparent += nn.apparent;
-                sum_disk += nn.disk;
+                sum_apparent = sum_apparent.saturating_add(nn.apparent);
+                sum_disk = sum_disk.saturating_add(nn.disk);
             }
             if let Some(raw) = nn.raw_name {
                 self.raw_names.insert(idx, raw);
@@ -254,8 +254,8 @@ impl Tree {
         let mut cur = Some(start);
         while let Some(i) = cur {
             let n = &mut self.nodes[i];
-            n.apparent += apparent;
-            n.disk += disk;
+            n.apparent = n.apparent.saturating_add(apparent);
+            n.disk = n.disk.saturating_add(disk);
             n.items = n.items.saturating_add(items);
             if !n.counts() {
                 (apparent, disk) = (0, 0);
@@ -292,23 +292,21 @@ impl Tree {
     /// (`apparent` of a node equals its own size plus the counted sizes of its children.)
     pub fn own_apparent(&self, idx: NodeIdx) -> u64 {
         let n = &self.nodes[idx];
-        let kids: u64 = n
+        let kids = n
             .children
             .iter()
             .filter(|&&c| self.nodes[c].counts())
-            .map(|&c| self.nodes[c].apparent)
-            .sum();
+            .fold(0u64, |sum, &c| sum.saturating_add(self.nodes[c].apparent));
         n.apparent.saturating_sub(kids)
     }
 
     pub fn own_disk(&self, idx: NodeIdx) -> u64 {
         let n = &self.nodes[idx];
-        let kids: u64 = n
+        let kids = n
             .children
             .iter()
             .filter(|&&c| self.nodes[c].counts())
-            .map(|&c| self.nodes[c].disk)
-            .sum();
+            .fold(0u64, |sum, &c| sum.saturating_add(self.nodes[c].disk));
         n.disk.saturating_sub(kids)
     }
 
@@ -1183,6 +1181,58 @@ mod tests {
         assert_eq!(t.nodes[a].items, 4);
         assert_eq!(t.nodes[t.root].items, 6);
         assert_eq!(t.nodes[t.root].items, entries_below(&t, t.root));
+    }
+
+    /// Sizes saturate instead of wrapping. Apparent sizes near 2^63 are legal (a sparse file
+    /// made with `truncate -s 8E`), and two of them in one tree exceed a `u64`.
+    #[test]
+    fn sizes_saturate() {
+        let huge = u64::MAX / 2 + 1;
+        let big = |name: &str, ino| NewNode {
+            apparent: huge,
+            disk: huge,
+            ..file(name, ino)
+        };
+        // Two in one batch, into a directory that sits below the root.
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("a", 1)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![big("x", 10), big("y", 11)],
+            error: None,
+        });
+        let a = idx_of(&t, "a");
+        for idx in [a, t.root] {
+            assert_eq!(t.nodes[idx].apparent, u64::MAX);
+            assert_eq!(t.nodes[idx].disk, u64::MAX);
+        }
+        // The derived own size stays within bounds as well.
+        assert_eq!(t.own_apparent(a), 0);
+        assert_eq!(t.own_disk(a), 0);
+
+        // One by one, as an import adds them.
+        let mut t = Tree::new_imported("/r".into(), 100, 100, 1, 1);
+        for (name, ino) in [("x", 10), ("y", 11)] {
+            t.import_child(
+                t.root,
+                name.into(),
+                NodeKind::File,
+                huge,
+                huge,
+                1,
+                ino,
+                false,
+                false,
+                Excluded::No,
+                false,
+            );
+        }
+        assert_eq!(t.nodes[t.root].apparent, u64::MAX);
+        assert_eq!(t.nodes[t.root].disk, u64::MAX);
     }
 
     /// Counts saturate instead of wrapping.

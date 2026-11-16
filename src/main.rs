@@ -302,7 +302,7 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
     let mut tree = Tree::new(
         root_name.into(),
         meta.len(),
-        meta.blocks() * 512,
+        meta.blocks().saturating_mul(512),
         meta.dev(),
         meta.ino(),
     );

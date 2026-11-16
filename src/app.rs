@@ -428,12 +428,11 @@ impl App {
                     Ok(batch) => {
                         // Count the batch's counted bytes before `apply` moves it, for the
                         // footer's throughput display.
-                        self.bytes_seen += batch
+                        self.bytes_seen = batch
                             .nodes
                             .iter()
                             .filter(|n| !n.shared && n.excluded == Excluded::No)
-                            .map(|n| n.apparent)
-                            .sum::<u64>();
+                            .fold(self.bytes_seen, |sum, n| sum.saturating_add(n.apparent));
                         self.tree.apply(batch);
                         applied += 1;
                         if applied >= cap {
@@ -2448,6 +2447,43 @@ mod tests {
         assert_eq!(f.hits.len(), FIND_CAP);
         assert_eq!(f.total, FIND_CAP + 5);
         assert!(f.capped());
+    }
+
+    /// The footer's byte counter saturates like the totals do.
+    #[test]
+    fn bytes_seen_saturates() {
+        use crate::scan::NewNode;
+        let huge = |name: &str, ino| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind: NodeKind::File,
+            apparent: u64::MAX / 2 + 1,
+            disk: 4096,
+            dev: 1,
+            ino,
+            hlink: false,
+            shared: false,
+            excluded: Excluded::No,
+            read_error: false,
+            dir_id: None,
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), false, false, true);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.scans.push(ScanHandle {
+            rx,
+            refresh: false,
+            alive: true,
+        });
+        tx.send(Batch {
+            parent_id: 0,
+            nodes: vec![huge("x", 2), huge("y", 3)],
+            error: None,
+        })
+        .unwrap();
+        drop(tx);
+        app.poll_scans(100);
+        assert_eq!(app.bytes_seen, u64::MAX);
+        assert_eq!(app.size_of(app.tree.root), u64::MAX);
     }
 
     /// Entries a running scan adds after the pass are picked up by later ticks.
