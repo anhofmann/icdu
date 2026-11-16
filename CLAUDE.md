@@ -62,7 +62,8 @@ Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `compact_str`
 - `main.rs::run` loops: `poll_scans(20_000)` (a cap, so input never starves) → `poll_delete` / `poll_open` → handle any `take_shell_request()` (tear down the TUI, run `$SHELL`, re-init) → draw → `event::poll` with an 80 ms timeout while busy, 250 ms otherwise.
 - Long-running side effects (delete, open) go to background threads and are polled once per frame through channels. Keep the UI thread non-blocking.
 - `signals.rs`: SIGTERM, SIGHUP, SIGTSTP and SIGCONT only set flags, which the loop checks at the top of every iteration. It restores the terminal before the signal takes effect (`die_by`, `suspend`). Ctrl-Z is a key press in raw mode and takes the same `suspend` path. Always enter and leave the TUI through `init_terminal` / `restore_terminal` (they also switch bracketed paste).
-- `App.selected` tracks node **identity** (`NodeIdx`), not row position, so the highlight stays on the same entry as live updates re-sort the list.
+- `App.selected` tracks node **identity** (`NodeIdx`), not row position, so the highlight stays on the same entry as live updates re-sort the list. The loop calls `settle_selection` before every frame, so a row is highlighted as soon as there is one and keys never act on an unhighlighted row.
+- Every list (directory listing, search hits, largest files) keeps its scroll position in a `Cell<usize>` and runs it through `app::scroll_offset` when it is drawn. Do not build a fresh `ListState` with offset 0: that pins the highlight to the bottom edge.
 - `App.status` is a one-line footer message that clears on the next key press. `App.modal` holds popups (help, confirm, top files, info).
 
 ### Adding a key binding

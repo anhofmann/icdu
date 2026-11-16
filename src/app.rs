@@ -3,6 +3,7 @@
 //! Selection tracks a node's *identity*, not its row position, so the highlight stays glued to
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
+use std::cell::Cell;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,40 @@ pub struct TopEntry {
 pub struct TopFiles {
     pub items: Vec<TopEntry>,
     pub selected: usize,
+    /// First row on screen; see [`scroll_offset`].
+    pub offset: Cell<usize>,
+}
+
+/// Rows a list keeps between the highlighted row and its top or bottom edge while there is
+/// more to scroll to, so the user sees what comes next.
+const SCROLL_MARGIN: usize = 2;
+
+/// Where a list has to be scrolled to: the index of the first row to show.
+///
+/// `offset` is where it is scrolled to now, `selected` the highlighted row, `len` the number
+/// of rows in the list and `rows` the number that fit on screen. The list moves only when it
+/// has to: when the highlighted row would otherwise come within [`SCROLL_MARGIN`] of an edge
+/// (or off screen), and then by as little as possible. Inside the page the highlight moves and
+/// the list stands still. Every list keeps the offset this returns and passes it back in on
+/// the next frame; starting from 0 each time would pin the highlight to the bottom edge.
+pub fn scroll_offset(offset: usize, selected: Option<usize>, len: usize, rows: usize) -> usize {
+    if rows == 0 {
+        return offset;
+    }
+    let last_offset = len.saturating_sub(rows);
+    let mut offset = offset.min(last_offset);
+    let Some(selected) = selected else {
+        return offset;
+    };
+    // A window of one or two rows has no room for a margin.
+    let margin = SCROLL_MARGIN.min((rows - 1) / 2);
+    if selected < offset + margin {
+        offset = selected.saturating_sub(margin);
+    } else if selected + margin >= offset + rows {
+        offset = selected + margin + 1 - rows;
+    }
+    // No margin is kept past the ends of the list.
+    offset.min(last_offset)
 }
 
 /// How many rows the top-files popup shows.
@@ -77,6 +112,8 @@ pub struct Find {
     pub total: usize,
     /// Highlighted hit, by identity, so re-sorts and live inserts don't move the highlight.
     pub selected: Option<NodeIdx>,
+    /// First hit on screen; see [`scroll_offset`].
+    pub offset: Cell<usize>,
     sort_dirty: bool,
     last_sort: Option<Instant>,
 }
@@ -94,6 +131,7 @@ impl Find {
             hits: Vec::new(),
             total: 0,
             selected: None,
+            offset: Cell::new(0),
             sort_dirty: false,
             last_sort: None,
         }
@@ -348,6 +386,9 @@ pub struct App {
     /// How many hard-linked files the entry in the delete dialog is or contains, counted
     /// when the dialog opens (a walk of the subtree, too slow to repeat every frame).
     pub confirm_hard_links: u32,
+    /// First row of the directory listing on screen; see [`scroll_offset`]. Drawing updates
+    /// it, because only drawing knows how many rows fit.
+    pub list_offset: Cell<usize>,
     /// Spinner animation frame.
     pub tick: usize,
 }
@@ -386,6 +427,7 @@ impl App {
             shell_request: None,
             export_dir: None,
             confirm_hard_links: 0,
+            list_offset: Cell::new(0),
             tick: 0,
             tree,
         }
@@ -773,6 +815,19 @@ impl App {
         }
     }
 
+    /// Make sure a row of the viewed directory is selected, if it has any: the first row
+    /// when nothing is selected yet or the selected entry has left the directory. The event
+    /// loop calls this before every frame, so what Enter and `d` would act on is always the
+    /// row the user sees highlighted, from the first batch on.
+    pub fn settle_selection(&mut self) {
+        let in_view = self
+            .selected
+            .is_some_and(|sel| self.tree.nodes[sel].parent == Some(self.cur));
+        if !in_view {
+            self.selected = self.sorted_children().first().copied();
+        }
+    }
+
     /// Open the top-files popup for the directory currently being viewed.
     fn open_top_files(&mut self) {
         let items = self.top_files(self.cur, TOP_FILES_LIMIT);
@@ -780,7 +835,11 @@ impl App {
             self.status = Some("no files under this directory".into());
             return;
         }
-        self.modal = Modal::TopFiles(Box::new(TopFiles { items, selected: 0 }));
+        self.modal = Modal::TopFiles(Box::new(TopFiles {
+            items,
+            selected: 0,
+            offset: Cell::new(0),
+        }));
     }
 
     /// The largest regular files under `from`, largest first, with paths relative to it.
@@ -1249,6 +1308,7 @@ impl App {
             }
             if self.tree.nodes[sel].is_dir() {
                 self.cur = sel;
+                self.list_offset.set(0);
                 self.selected = self.sorted_children().first().copied();
                 // Prioritize scanning the directory we just entered.
                 self.refocus();
@@ -1771,6 +1831,157 @@ mod tests {
         );
         assert_eq!(top[0].size, 900);
         assert_eq!(app.top_files(app.tree.root, 1).len(), 1, "limit applies");
+    }
+
+    /// A list that fits on the screen never scrolls.
+    #[test]
+    fn scroll_offset_stays_at_the_top_when_everything_fits() {
+        for sel in [None, Some(0), Some(4), Some(9)] {
+            assert_eq!(scroll_offset(0, sel, 10, 10), 0);
+            assert_eq!(scroll_offset(0, sel, 10, 40), 0);
+            assert_eq!(
+                scroll_offset(7, sel, 10, 40),
+                0,
+                "a stale offset is dropped"
+            );
+        }
+        assert_eq!(scroll_offset(3, None, 0, 10), 0, "empty list");
+    }
+
+    /// Inside the page the cursor moves and the list stands still. The list only scrolls
+    /// when the cursor comes within the margin of an edge, and then by as little as needed.
+    #[test]
+    fn scroll_offset_moves_the_list_only_near_an_edge() {
+        let (len, rows) = (100, 10);
+        // Going down from the top: rows 0..=7 are free, row 8 is in the bottom margin.
+        for sel in 0..=7 {
+            assert_eq!(scroll_offset(0, Some(sel), len, rows), 0, "row {sel}");
+        }
+        assert_eq!(scroll_offset(0, Some(8), len, rows), 1);
+        assert_eq!(scroll_offset(1, Some(9), len, rows), 2);
+        // Going up again from there moves the cursor, not the list. This is what a fresh
+        // offset on every frame got wrong: it pinned the cursor to the bottom edge.
+        for sel in (4..=9).rev() {
+            assert_eq!(scroll_offset(2, Some(sel), len, rows), 2, "row {sel}");
+        }
+        assert_eq!(
+            scroll_offset(2, Some(3), len, rows),
+            1,
+            "top margin reached"
+        );
+        assert_eq!(scroll_offset(1, Some(2), len, rows), 0);
+        // The ends of the list are reachable: no margin is kept beyond them.
+        assert_eq!(scroll_offset(0, Some(99), len, rows), 90);
+        assert_eq!(scroll_offset(90, Some(98), len, rows), 90);
+        assert_eq!(scroll_offset(90, Some(0), len, rows), 0);
+        // A jump lands with the margin on the side it came from.
+        assert_eq!(scroll_offset(0, Some(50), len, rows), 43);
+        assert_eq!(scroll_offset(90, Some(50), len, rows), 48);
+    }
+
+    /// The offset stays valid when the list or the window changes under it.
+    #[test]
+    fn scroll_offset_copes_with_shrinking_lists_and_tiny_windows() {
+        assert_eq!(scroll_offset(90, Some(5), 20, 10), 3, "list got shorter");
+        assert_eq!(
+            scroll_offset(90, None, 20, 10),
+            10,
+            "nothing selected: clamp only"
+        );
+        // Windows too small for the margin still show the selection.
+        for rows in 1..=4 {
+            for sel in 0..30 {
+                let offset = scroll_offset(0, Some(sel), 30, rows);
+                assert!(
+                    offset <= sel && sel < offset + rows,
+                    "rows {rows}, row {sel}: offset {offset}"
+                );
+            }
+        }
+        assert_eq!(
+            scroll_offset(4, Some(9), 30, 0),
+            4,
+            "no rows: nothing to do"
+        );
+    }
+
+    /// Whatever the starting point, the selected row ends up on screen, and the offset never
+    /// runs past the end of the list.
+    #[test]
+    fn scroll_offset_always_shows_the_selection() {
+        for len in [1usize, 5, 12, 50] {
+            for rows in [1usize, 3, 10, 60] {
+                for start in [0usize, 3, 49, 500] {
+                    for sel in 0..len {
+                        let offset = scroll_offset(start, Some(sel), len, rows);
+                        assert!(offset <= sel && sel < offset + rows);
+                        assert!(offset <= len.saturating_sub(rows));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first row is highlighted as soon as there is one, without a key press, and the
+    /// first Enter then acts on what the user can see.
+    #[test]
+    fn selection_settles_before_the_first_key() {
+        use crate::scan::NewNode;
+        let node = |name: &str, kind, size, dir_id| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind,
+            apparent: size,
+            disk: size,
+            dev: 1,
+            ino: size,
+            hlink: false,
+            excluded: Excluded::No,
+            error: None,
+            dir_id,
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.settle_selection();
+        assert_eq!(app.selected, None, "nothing to select yet");
+
+        app.tree.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                node("small", NodeKind::File, 10, None),
+                node("big", NodeKind::Dir, 500, Some(1)),
+            ],
+            error: None,
+        });
+        app.settle_selection();
+        let big = idx_named(&app, "big");
+        assert_eq!(app.selected, Some(big), "the first row in display order");
+
+        // It is a selection like any other: later frames leave it alone...
+        app.selected = Some(idx_named(&app, "small"));
+        app.settle_selection();
+        assert_eq!(app.selected, Some(idx_named(&app, "small")));
+        // ...and the first `j` moves on from the row that was highlighted.
+        app.selected = Some(big);
+        app.on_key(KeyAction::Down);
+        assert_eq!(app.selected, Some(idx_named(&app, "small")));
+    }
+
+    /// A selection that no longer points into the viewed directory is replaced.
+    #[test]
+    fn selection_settles_again_when_its_entry_is_gone() {
+        let mut app = app_with_entries();
+        app.settle_selection();
+        let first = app.selected.expect("first row");
+        assert_eq!(app.tree.nodes[first].name, "Beta");
+        app.tree.delete_subtree(first);
+        app.settle_selection();
+        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "banner");
+
+        // In an empty directory there is nothing to select.
+        let gamma = idx_named(&app, "gamma");
+        app.cur = gamma;
+        app.settle_selection();
+        assert_eq!(app.selected, None);
     }
 
     /// The row highlighted in the open top-files popup.

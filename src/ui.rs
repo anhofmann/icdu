@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{find_ci, indicator, App, Find, Modal, SortKey, TopFiles};
+use crate::app::{find_ci, indicator, scroll_offset, App, Find, Modal, SortKey, TopFiles};
 use crate::model::{Excluded, Node, NodeKind};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -158,8 +158,16 @@ fn render_top_files(f: &mut Frame, app: &App, tf: &TopFiles) {
             ]))
         })
         .collect();
-    let mut state = ListState::default();
-    state.select(Some(tf.selected));
+    let offset = scroll_offset(
+        tf.offset.get(),
+        Some(tf.selected),
+        tf.items.len(),
+        list_area.height as usize,
+    );
+    tf.offset.set(offset);
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(tf.selected));
     f.render_stateful_widget(
         List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
         list_area,
@@ -314,8 +322,13 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
         );
     } else {
         let rows = (list_area.height as usize).max(1);
-        let pos = find.selected_pos().unwrap_or(0);
-        let offset = pos.saturating_sub(rows - 1);
+        let offset = scroll_offset(
+            find.offset.get(),
+            find.selected_pos(),
+            find.hits.len(),
+            rows,
+        );
+        find.offset.set(offset);
         let q = find.active.as_deref().unwrap_or("");
         // Size column (10 + 2 spaces) and the rest for the path.
         let path_width = (list_area.width as usize).saturating_sub(12).max(8);
@@ -355,7 +368,12 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
             })
             .collect();
         let mut state = ListState::default();
-        state.select(find.selected_pos().map(|p| p - offset));
+        // Only the rows on screen were built, so the highlight is relative to the offset.
+        state.select(
+            find.selected_pos()
+                .and_then(|p| p.checked_sub(offset))
+                .filter(|&p| p < rows),
+        );
         f.render_stateful_widget(
             List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
             list_area,
@@ -489,12 +507,14 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         items.push(ListItem::new(Line::from(spans)));
     }
 
-    let mut state = ListState::default();
-    if let Some(sel) = app.selected {
-        if let Some(pos) = kids.iter().position(|&k| k == sel) {
-            state.select(Some(pos));
-        }
-    }
+    let pos = app
+        .selected
+        .and_then(|sel| kids.iter().position(|&k| k == sel));
+    // The list has a border line above and below.
+    let rows = area.height.saturating_sub(2) as usize;
+    let offset = scroll_offset(app.list_offset.get(), pos, kids.len(), rows);
+    app.list_offset.set(offset);
+    let mut state = ListState::default().with_offset(offset).with_selected(pos);
 
     let title = if app.tree.nodes[app.cur].children.is_empty() {
         if app.scanning {
