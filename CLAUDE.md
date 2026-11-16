@@ -29,7 +29,7 @@ The TUI needs a real terminal, so check behavior headlessly with `-o -` or throu
 
 Unix only (`std::os::unix::fs::MetadataExt` for dev/ino/blocks/nlink). Platform-specific code uses `#[cfg(target_os = ...)]`, e.g. the three `opener_command` variants in `app.rs`. Anything you change has to build and pass on both Linux and macOS.
 
-Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`, `compact_str`, and `signal-hook`, which crossterm brings into the build anyway). The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
+Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `compact_str`, and `signal-hook`, which crossterm brings into the build anyway). There is no JSON library: `dump.rs` writes and parses the dump format itself. The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
 
 ## Architecture
 
@@ -76,7 +76,7 @@ Touch all of these in one change:
 
 ### ncdu compatibility
 
-`dump.rs` reads and writes ncdu JSON format version 1.2 (`[1, 2, {meta}, <root>]`). On import, hard-link dedup is re-derived from `(dev, ino)` so totals match a live scan. CLI flags mirror ncdu's (`-x`, `-r`, `-o`, `-f`, `-X`, `--exclude`), so keep new flags consistent with ncdu where an equivalent exists. Arguments are parsed by hand in `main.rs::parse_args`; there is no clap.
+`dump.rs` reads and writes ncdu JSON format version 1.2 (`[1, 2, {meta}, <root>]`). On import, hard-link dedup is re-derived from `(dev, ino)` so totals match a live scan. The importer is a pull parser for exactly this format (`dump::Parser`), not a general JSON parser: it streams from the reader into the tree, treats strings as bytes (names need not be UTF-8), keeps open directories on a heap stack instead of recursing, skips unknown fields, and is strict about the types of the fields it knows. A new field is one more arm in `Parser::field`. CLI flags mirror ncdu's (`-x`, `-r`, `-o`, `-f`, `-X`, `--exclude`), so keep new flags consistent with ncdu where an equivalent exists. Arguments are parsed by hand in `main.rs::parse_args`; there is no clap.
 
 ## Tests
 

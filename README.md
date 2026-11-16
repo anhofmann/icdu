@@ -275,8 +275,13 @@ leaves the rest on disk. Any other key disarms the prompt.
 `-o` writes the ncdu export format (`[1, 2, {meta}, <root>]`, per-item `asize`/`dsize`, `hlnkc`,
 `notreg`, `excluded`, `read_error`), readable by ncdu and other tools. `-f` reads the same format
 (including dumps produced by ncdu itself), re-deriving hard-link dedup so totals match a live scan.
-Names are written byte for byte, as ncdu does; reading a dump that contains a name that is not
-valid UTF-8 does not work yet.
+Names are read and written byte for byte, as ncdu does, so a name that is not valid UTF-8
+survives an import and a re-export unchanged.
+
+A dump is parsed while it is read: memory use is that of the resulting tree, whatever the size
+of the file, and directories can be nested to any depth. Fields icdu does not know are skipped.
+A file that is not a dump (truncated, wrong types, anything after the end) is refused with the
+byte position of the problem.
 
 A dump describes the machine and the moment it was taken on, not the local filesystem as it is
 now. While browsing one, delete, the shell, open and rescan are therefore disabled, and the
@@ -339,7 +344,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, counts each hard-linked inode once, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
 | `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
 | `glob.rs` | `fnmatch`-style globbing for `--exclude`. |
-| `dump.rs` | ncdu-compatible JSON import/export. |
+| `dump.rs` | ncdu-compatible JSON import/export, both streaming: a hand-written writer, and a pull parser for exactly this format. |
 | `app.rs` | App state + key handling, modals (help/confirm), background delete and open. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
 | `ui.rs` | ratatui rendering: size bars, percentages, type indicators, popups. |
 | `main.rs` | Args, modes (scan / import / export), terminal lifecycle, event loop. |

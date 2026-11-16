@@ -38,8 +38,9 @@ pub enum NodeKind {
 }
 
 /// Why an entry was not descended into (and excluded from totals).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Excluded {
+    #[default]
     No,
     /// Matched a `--exclude` pattern.
     Pattern,
