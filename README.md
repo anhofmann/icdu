@@ -173,14 +173,19 @@ counts, derived on load. The info popup (`i`) shows the count as `total items`.
 Press `r` to rescan the directory you are viewing from disk without restarting (as in ncdu; at
 the top level this reads the whole tree again). Its entries are replaced as the new scan streams
 back in, the footer shows a spinner until it completes, and the totals of surrounding directories
-stay correct throughout. Navigation keeps
-steering the rescan, so the directory you're viewing fills in first. The same guards as delete
-apply: the directory must have finished scanning, only one rescan runs at a time, and while a
-deletion is running, neither the directory being deleted nor any directory around or above it
-can be rescanned. Excluded directories (`--exclude`, `-x`, the mtime filters) are not rescanned
-either: they were left out on purpose. One limitation: hard links that cross the rescan
-boundary (one link inside, another outside the rescanned subtree) are each counted, so totals
-can slightly overcount until a full restart.
+stay correct throughout. Navigation keeps steering the rescan, so the directory you're viewing
+fills in first.
+
+The same guards as delete apply: the directory must have finished scanning, only one rescan runs
+at a time, and while a deletion is running, neither the directory being deleted nor any directory
+around or above it can be rescanned. Excluded directories (`--exclude`, `-x`, the mtime filters)
+are not rescanned either: they were left out on purpose. And the path must still be the
+directory that was scanned: if it has been replaced since, by a symlink or by another directory,
+`r` refuses instead of listing something else in its place.
+
+One limitation: hard links that cross the rescan boundary (one link inside, another outside the
+rescanned subtree) are each counted, so totals can slightly overcount until the whole tree is
+rescanned (`r` at the top level).
 
 ### Entry details
 

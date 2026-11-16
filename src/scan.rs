@@ -161,6 +161,27 @@ struct Shared {
     newer_than: Option<i64>,
     /// (dev, ino) of hard-linked inodes already counted, so duplicates can be flagged.
     seen_hardlinks: Mutex<HashSet<(u64, u64)>>,
+    /// A rescan's starting directory: its job id and what it must still be when it is read.
+    start_check: Option<(u64, Identity)>,
+}
+
+/// Device and inode of a directory, as the tree recorded them when it was scanned.
+pub type Identity = (u64, u64);
+
+/// The message for a path that no longer names the directory the tree has for it.
+pub const NOT_THE_SCANNED_DIR: &str = "this is no longer the directory that was scanned";
+
+/// Check that `path` still names the directory known by `identity`. The check is an `lstat`,
+/// so a symlink that took the directory's place is seen as a symlink and not followed.
+///
+/// `read_dir` follows a symlink in the last component. Without this check, rescanning a
+/// directory that was replaced by a link would list the link's target as its content.
+pub fn check_identity(path: &Path, identity: Identity) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && (meta.dev(), meta.ino()) == identity => Ok(()),
+        Ok(_) => Err(NOT_THE_SCANNED_DIR.into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 type FrontierArc = Arc<(Mutex<Frontier>, Condvar)>;
@@ -182,13 +203,16 @@ pub const SCAN_ID_STRIDE: u64 = 1 << 40;
 /// Start scanning `root` (already assigned tree id 0).
 /// The event channel disconnects when the scan is done.
 pub fn start(root: PathBuf, opts: Opts) -> Scan {
-    start_at(root, opts, 0)
+    start_at(root, opts, 0, None)
 }
 
 /// Start scanning `root`, treating it as tree id `id_base`: a whole-tree scan passes 0, while
 /// a subtree rescan passes its generation's base (a multiple of [`SCAN_ID_STRIDE`]) so its ids
 /// never collide with another scan streaming into the same tree.
-pub fn start_at(root: PathBuf, opts: Opts, id_base: u64) -> Scan {
+///
+/// A rescan also passes the `identity` the tree has for `root`. If the path names something
+/// else by the time it is read, nothing is listed and the directory gets a read error.
+pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identity>) -> Scan {
     let (ev_tx, ev_rx) = unbounded::<Batch>();
 
     let frontier: FrontierArc = Arc::new((
@@ -214,6 +238,7 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64) -> Scan {
         older_than: opts.older_than,
         newer_than: opts.newer_than,
         seen_hardlinks: Mutex::new(HashSet::new()),
+        start_check: identity.map(|identity| (id_base, identity)),
     });
 
     for _ in 0..opts.threads {
@@ -263,17 +288,26 @@ fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
 }
 
 fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
+    let failed = |error: String| {
+        let _ = shared.ev_tx.send(Batch {
+            parent_id: job.id,
+            nodes: Vec::new(),
+            error: Some(error),
+        });
+    };
     let read = match std::fs::read_dir(&job.path) {
         Ok(r) => r,
-        Err(e) => {
-            let _ = shared.ev_tx.send(Batch {
-                parent_id: job.id,
-                nodes: Vec::new(),
-                error: Some(e.to_string()),
-            });
-            return;
-        }
+        Err(e) => return failed(e.to_string()),
     };
+    // Checked after the directory is open: had the path been a symlink when it was opened,
+    // it would have to be swapped back within this instant to pass.
+    if let Some((id, identity)) = shared.start_check {
+        if job.id == id {
+            if let Err(e) = check_identity(&job.path, identity) {
+                return failed(e);
+            }
+        }
+    }
 
     let mut nodes = Vec::new();
     let mut child_jobs = Vec::new();
@@ -740,7 +774,15 @@ mod tests {
             "ancestor total stays consistent across the reset"
         );
 
-        let rx = start_at(base.join("target"), opts(4, meta.dev()), id_base).events;
+        let target_meta = fs::symlink_metadata(base.join("target")).unwrap();
+        let identity = (target_meta.dev(), target_meta.ino());
+        let rx = start_at(
+            base.join("target"),
+            opts(4, meta.dev()),
+            id_base,
+            Some(identity),
+        )
+        .events;
         for batch in rx.iter() {
             tree.apply(batch);
         }
@@ -876,6 +918,49 @@ mod tests {
         assert_eq!(tree.nodes[tree.root].items, entries_on_disk(&base) - 2);
         assert_eq!(tree.nodes[tree.root].items, 10);
 
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A scan that is told what its starting directory must be lists nothing when the path
+    /// names something else: a symlink to another directory, or a different directory.
+    #[test]
+    fn start_check_refuses_a_replaced_directory() {
+        let base = std::env::temp_dir().join(format!("icdu_ident_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("real")).unwrap();
+        fs::write(base.join("real/file"), b"x").unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        fs::write(base.join("other/foreign"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("other"), base.join("link")).unwrap();
+
+        let meta = fs::symlink_metadata(base.join("real")).unwrap();
+        let identity = (meta.dev(), meta.ino());
+        assert!(check_identity(&base.join("real"), identity).is_ok());
+        for wrong in ["link", "other"] {
+            assert_eq!(
+                check_identity(&base.join(wrong), identity).unwrap_err(),
+                NOT_THE_SCANNED_DIR,
+                "{wrong}"
+            );
+        }
+        assert!(check_identity(&base.join("missing"), identity).is_err());
+
+        let scan = |name: &str| -> Vec<Batch> {
+            start_at(base.join(name), opts(2, meta.dev()), 0, Some(identity))
+                .events
+                .iter()
+                .collect()
+        };
+        let batches = scan("real");
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].error.is_none());
+        assert_eq!(batches[0].nodes.len(), 1);
+        for wrong in ["link", "other"] {
+            let batches = scan(wrong);
+            assert_eq!(batches.len(), 1, "{wrong}");
+            assert_eq!(batches[0].error.as_deref(), Some(NOT_THE_SCANNED_DIR));
+            assert!(batches[0].nodes.is_empty(), "{wrong}: nothing is listed");
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 

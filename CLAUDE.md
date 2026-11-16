@@ -54,7 +54,7 @@ Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`,
 
 ### In-place rescan (`r`)
 
-`Tree::begin_refresh` detaches the subtree and resets its aggregates. `scan::start_at(path, opts, id_base)` then starts a new scanner **generation**. Each generation gets a disjoint id range (`id_base = n × SCAN_ID_STRIDE`, where `SCAN_ID_STRIDE` is 2⁴⁰) so it can stream into the same tree alongside the original scan. `App` keeps a `Vec<ScanHandle>` plus a `Vec<ScanControl>`, and `poll_scans` drains all of them. Each generation has its own hard-link `seen` set, so hard links crossing the rescan boundary can be overcounted (a known limitation, documented in the README).
+`Tree::begin_refresh` detaches the subtree and resets its aggregates. `scan::start_at(path, opts, id_base, identity)` then starts a new scanner **generation**. `identity` is the directory's device and inode from the tree: `read_dir` follows a symlink in the last path component, so both `request_refresh` and the scanner's first job check with `scan::check_identity` (an `lstat`) that the path still names that directory. Each generation gets a disjoint id range (`id_base = n × SCAN_ID_STRIDE`, where `SCAN_ID_STRIDE` is 2⁴⁰) so it can stream into the same tree alongside the original scan. `App` keeps a `Vec<ScanHandle>` plus a `Vec<ScanControl>`, and `poll_scans` drains all of them. Each generation has its own hard-link `seen` set, so hard links crossing the rescan boundary can be overcounted (a known limitation, documented in the README).
 
 ### UI / event loop
 

@@ -13,7 +13,9 @@ use crossbeam_channel::{unbounded, Receiver};
 
 use crate::delete::{Plan, Report};
 use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
-use crate::scan::{start_at, Batch, Opts, Scan, ScanControl, SCAN_ID_STRIDE};
+use crate::scan::{
+    check_identity, start_at, Batch, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SortKey {
@@ -527,6 +529,23 @@ impl App {
             self.status = Some("cannot rescan: directory is still being scanned".into());
             return;
         }
+        // Last, the disk: the path must still name the directory that was scanned. If it was
+        // replaced (by a symlink, or by another directory), reading it would list something
+        // else as this directory's content.
+        let Some(path) = self.tree.fs_path_of(sel) else {
+            self.status = Some(GONE.into());
+            return;
+        };
+        let node = &self.tree.nodes[sel];
+        if let Err(why) = check_identity(&path, (node.dev, node.ino)) {
+            let hint = match (why == NOT_THE_SCANNED_DIR, node.parent) {
+                (true, Some(_)) => " — go up and rescan from there",
+                (true, None) => " — restart icdu to scan it",
+                (false, _) => "",
+            };
+            self.status = Some(format!("can't rescan: {why}{hint}"));
+            return;
+        }
         self.status = Some(match self.start_rescan(sel) {
             Some(path) => format!("rescanning {path}…"),
             None => GONE.into(),
@@ -542,8 +561,10 @@ impl App {
         let path = self.tree.fs_path_of(idx)?;
         let id_base = self.next_scan_base * SCAN_ID_STRIDE;
         self.next_scan_base += 1;
+        let node = &self.tree.nodes[idx];
+        let identity = (node.dev, node.ino);
         self.tree.begin_refresh(idx, id_base);
-        let scan = start_at(path, opts, id_base);
+        let scan = start_at(path, opts, id_base, Some(identity));
         self.prune_find();
         self.scans.push(ScanHandle {
             rx: scan.events,
@@ -2181,30 +2202,35 @@ mod tests {
     /// `r` reads the directory on screen again, not the selected entry (as ncdu does).
     #[test]
     fn rescan_reads_the_viewed_directory() {
-        let mut app = app_for_find();
-        app.scan_opts = Some(test_opts());
-        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
-        app.cur = docs;
-        app.selected = Some(sub);
+        let (root, mut app) = tree_with_a_decoy("rescan_viewed");
+        let dir = node_at(&app, &root.join("d"));
+        let file = node_at(&app, &root.join("d/own.txt"));
+        app.cur = dir;
+        app.selected = Some(file);
         app.on_key(KeyAction::Refresh);
-        assert_eq!(app.refreshing_idx, Some(docs));
+        assert_eq!(app.refreshing_idx, Some(dir));
         assert!(
-            !app.tree.is_attached(sub),
+            !app.tree.is_attached(file),
             "everything below it is read again"
         );
-        assert!(app.tree.is_attached(docs));
+        assert!(app.tree.is_attached(dir));
+        pump(&mut app, "the rescan", |a| !a.scanning);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// At the top level, `r` reads the whole tree again.
     #[test]
     fn rescan_at_the_top_reads_the_whole_tree() {
-        let mut app = app_for_find();
-        app.scan_opts = Some(test_opts());
-        let root = app.tree.root;
+        let (root, mut app) = tree_with_a_decoy("rescan_top");
+        let top = app.tree.root;
+        let items = app.tree.nodes[top].items;
         app.on_key(KeyAction::Refresh);
-        assert_eq!(app.refreshing_idx, Some(root));
-        assert!(app.tree.nodes[root].children.is_empty());
-        assert_eq!(app.tree.nodes[root].items, 0);
+        assert_eq!(app.refreshing_idx, Some(top));
+        assert!(app.tree.nodes[top].children.is_empty());
+        assert_eq!(app.tree.nodes[top].items, 0);
+        pump(&mut app, "the rescan", |a| !a.scanning);
+        assert_eq!(app.tree.nodes[top].items, items, "and finds it all again");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Esc closes popups and nothing else. It used to quit, so a second tap on the key that
@@ -2999,6 +3025,82 @@ mod tests {
         pump(&mut app, "the rescan", |a| !a.scanning);
         assert!(!app.tree.nodes[dir].read_error, "the rescan found it");
         assert_eq!(app.tree.nodes[dir].items, 1, "and read it again");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A directory tree for the rescan identity tests: `d/` with one file, and `elsewhere/`
+    /// with files that must never show up below `d`.
+    fn tree_with_a_decoy(tag: &str) -> (PathBuf, App) {
+        let root = real_dir(tag);
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("d/own.txt"), b"x").unwrap();
+        std::fs::create_dir(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join("elsewhere/foreign-1"), b"x").unwrap();
+        std::fs::write(root.join("elsewhere/foreign-2"), b"x").unwrap();
+        let app = scanned_app(&root, &[]);
+        (root, app)
+    }
+
+    /// The outcome every refused rescan must have: nothing started, the tree as it was, and
+    /// a message that names the reason.
+    fn assert_rescan_refused(app: &App, dir: NodeIdx) {
+        assert_eq!(app.refreshing_idx, None, "no rescan was started");
+        let names: Vec<&str> = app.tree.nodes[dir]
+            .children
+            .iter()
+            .map(|&c| app.tree.nodes[c].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["own.txt"], "the tree is unchanged");
+        let status = app.status.as_deref().unwrap_or_default();
+        assert!(
+            status.contains("no longer the directory that was scanned"),
+            "{status}"
+        );
+    }
+
+    /// `read_dir` follows a symlink in the last component. A directory that was replaced by a
+    /// link to another one must not be rescanned: the link's target would be listed, and
+    /// counted, as the content of the original directory.
+    #[test]
+    fn rescan_is_refused_when_the_directory_became_a_symlink() {
+        let (root, mut app) = tree_with_a_decoy("rescan_symlink");
+        let dir = node_at(&app, &root.join("d"));
+        std::fs::remove_dir_all(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("d")).unwrap();
+
+        app.cur = dir;
+        app.on_key(KeyAction::Refresh);
+        assert_rescan_refused(&app, dir);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The same for a directory that was replaced by a different directory.
+    #[test]
+    fn rescan_is_refused_when_the_directory_was_replaced() {
+        let (root, mut app) = tree_with_a_decoy("rescan_replaced");
+        let dir = node_at(&app, &root.join("d"));
+        // Rename instead of remove-and-create, so the old inode number cannot be reused.
+        std::fs::rename(root.join("d"), root.join("d.old")).unwrap();
+        std::fs::rename(root.join("elsewhere"), root.join("d")).unwrap();
+
+        app.cur = dir;
+        app.on_key(KeyAction::Refresh);
+        assert_rescan_refused(&app, dir);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A directory that is still itself is rescanned as before.
+    #[test]
+    fn rescan_of_an_unchanged_directory_still_works() {
+        let (root, mut app) = tree_with_a_decoy("rescan_same");
+        let dir = node_at(&app, &root.join("d"));
+        std::fs::write(root.join("d/later.txt"), b"x").unwrap();
+
+        app.cur = dir;
+        app.on_key(KeyAction::Refresh);
+        pump(&mut app, "the rescan", |a| !a.scanning);
+        assert!(!app.tree.nodes[dir].read_error);
+        assert_eq!(app.tree.nodes[dir].items, 2);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
