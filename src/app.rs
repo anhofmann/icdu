@@ -3,11 +3,12 @@
 //! Selection tracks a node's *identity*, not its row position, so the highlight stays glued to
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver};
@@ -38,6 +39,31 @@ pub struct TopFiles {
     pub selected: usize,
     /// First row on screen; see [`scroll_offset`].
     pub offset: Cell<usize>,
+}
+
+/// The shortest interval between two sorts of the viewed directory while a scan keeps changing
+/// the tree. A sort that takes long stretches it (see [`App::sorted_children`]).
+pub const RESORT_EVERY: Duration = Duration::from_millis(250);
+
+/// The rows of the viewed directory in display order, kept between frames. Sorting a
+/// directory with a million entries takes a noticeable part of a second; doing it for every
+/// frame and every key press made such directories unusable.
+struct RowOrder {
+    // What the order was computed for.
+    cur: NodeIdx,
+    sort: SortKey,
+    disk_usage: bool,
+    /// `Tree::generation` at that moment: equal means nothing has changed since.
+    generation: u64,
+    /// `Tree::detached` at that moment: a difference means entries were removed.
+    detached: u64,
+    rows: Rc<[NodeIdx]>,
+    /// The largest size among the rows, which scales the size bars.
+    max_size: u64,
+    /// The frame it was computed in, if the event loop is keeping time.
+    at: Option<Instant>,
+    /// How long the sort took.
+    took: Duration,
 }
 
 /// Rows a list keeps between the highlighted row and its top or bottom edge while there is
@@ -389,6 +415,11 @@ pub struct App {
     /// First row of the directory listing on screen; see [`scroll_offset`]. Drawing updates
     /// it, because only drawing knows how many rows fit.
     pub list_offset: Cell<usize>,
+    /// The sorted rows of the viewed directory, reused while they are still good.
+    row_order: RefCell<Option<RowOrder>>,
+    /// When the frame being prepared started. The event loop sets it; without it (in tests)
+    /// the rows are sorted again after every change, with it at most every `RESORT_EVERY`.
+    frame_time: Option<Instant>,
     /// Spinner animation frame.
     pub tick: usize,
 }
@@ -428,6 +459,8 @@ impl App {
             export_dir: None,
             confirm_hard_links: 0,
             list_offset: Cell::new(0),
+            row_order: RefCell::new(None),
+            frame_time: None,
             tick: 0,
             tree,
         }
@@ -724,22 +757,101 @@ impl App {
         }
     }
 
+    /// Tell the app when the frame it is about to prepare started. With a frame clock, the
+    /// rows of the viewed directory are not sorted again for every change a running scan
+    /// makes, only every so often.
+    pub fn begin_frame(&mut self, now: Instant) {
+        self.frame_time = Some(now);
+    }
+
     /// Children of the current directory, sorted for display (largest first, or by name).
-    pub fn sorted_children(&self) -> Vec<NodeIdx> {
-        self.order_children(self.tree.nodes[self.cur].children.clone())
+    ///
+    /// The order is cached. It is computed again when the user changed what it depends on
+    /// (directory, sort key, size metric) and when entries were removed. Changes that only
+    /// a running scan makes (new entries, growing sizes) arrive with every frame; for those
+    /// the rows are refreshed at most every [`RESORT_EVERY`], or every ten sort durations if
+    /// that is longer, so sorting never takes more than a tenth of the time.
+    pub fn sorted_children(&self) -> Rc<[NodeIdx]> {
+        self.with_row_order(|order| Rc::clone(&order.rows))
+    }
+
+    /// The largest size among the rows of the viewed directory (0 if it has none).
+    pub fn max_row_size(&self) -> u64 {
+        self.with_row_order(|order| order.max_size)
+    }
+
+    fn with_row_order<T>(&self, read: impl FnOnce(&RowOrder) -> T) -> T {
+        let mut cache = self.row_order.borrow_mut();
+        let order = match cache.take() {
+            Some(order) if self.row_order_is_good(&order) => order,
+            _ => self.compute_row_order(),
+        };
+        read(cache.insert(order))
+    }
+
+    fn row_order_is_good(&self, order: &RowOrder) -> bool {
+        let same_view = order.cur == self.cur
+            && order.sort == self.sort
+            && order.disk_usage == self.disk_usage
+            && order.detached == self.tree.detached;
+        if !same_view {
+            return false;
+        }
+        if order.generation == self.tree.generation {
+            return true;
+        }
+        // Only sizes and new entries differ. Good enough for a little while.
+        match (self.frame_time, order.at) {
+            (Some(now), Some(at)) => {
+                now.saturating_duration_since(at) < RESORT_EVERY.max(order.took * 10)
+            }
+            _ => false,
+        }
+    }
+
+    fn compute_row_order(&self) -> RowOrder {
+        let started = Instant::now();
+        let rows: Rc<[NodeIdx]> = self
+            .order_children(self.tree.nodes[self.cur].children.clone())
+            .into();
+        let max_size = match self.sort {
+            SortKey::Size => rows.first().map_or(0, |&first| self.size_of(first)),
+            SortKey::Name => rows.iter().map(|&k| self.size_of(k)).max().unwrap_or(0),
+        };
+        RowOrder {
+            cur: self.cur,
+            sort: self.sort,
+            disk_usage: self.disk_usage,
+            generation: self.tree.generation,
+            detached: self.tree.detached,
+            rows,
+            max_size,
+            at: self.frame_time,
+            took: started.elapsed(),
+        }
     }
 
     /// Sort children the way every view presents them (largest first, or by name), so
     /// traversals like the next-error jump match what the user sees on screen.
     fn order_children(&self, mut kids: Vec<NodeIdx>) -> Vec<NodeIdx> {
+        let name = |k: NodeIdx| self.tree.nodes[k].name.as_str();
         match self.sort {
-            SortKey::Size => kids.sort_by(|&a, &b| {
-                self.size_of(b)
-                    .cmp(&self.size_of(a))
-                    .then_with(|| self.tree.nodes[a].name.cmp(&self.tree.nodes[b].name))
-            }),
+            SortKey::Size => {
+                // The sizes are fetched once, next to each other, instead of from two nodes
+                // somewhere in memory for every comparison.
+                let mut keyed: Vec<(u64, NodeIdx)> =
+                    kids.iter().map(|&k| (self.size_of(k), k)).collect();
+                keyed.sort_unstable_by(|&(size_a, a), &(size_b, b)| {
+                    size_b
+                        .cmp(&size_a)
+                        .then_with(|| name(a).cmp(name(b)))
+                        .then_with(|| a.cmp(&b))
+                });
+                kids.clear();
+                kids.extend(keyed.into_iter().map(|(_, k)| k));
+            }
             SortKey::Name => {
-                kids.sort_by(|&a, &b| self.tree.nodes[a].name.cmp(&self.tree.nodes[b].name))
+                kids.sort_unstable_by(|&a, &b| name(a).cmp(name(b)).then_with(|| a.cmp(&b)))
             }
         }
         kids
@@ -803,16 +915,14 @@ impl App {
         }
     }
 
+    /// True while a shell request waits for the event loop.
+    pub fn shell_requested(&self) -> bool {
+        self.shell_request.is_some()
+    }
+
     /// Consume a pending shell request, if any: the directory to start the shell in.
     pub fn take_shell_request(&mut self) -> Option<PathBuf> {
         self.shell_request.take()
-    }
-
-    fn ensure_selection(&mut self, kids: &[NodeIdx]) {
-        match self.selected {
-            Some(sel) if kids.contains(&sel) => {}
-            _ => self.selected = kids.first().copied(),
-        }
     }
 
     /// Make sure a row of the viewed directory is selected, if it has any: the first row
@@ -1043,6 +1153,8 @@ impl App {
                 self.selected = None;
             }
         }
+        // The target may be newer than the cached rows; it has to be among them now.
+        *self.row_order.borrow_mut() = None;
         self.refocus();
         true
     }
@@ -1224,8 +1336,8 @@ impl App {
             self.quit_armed = false;
         }
 
+        self.settle_selection();
         let kids = self.sorted_children();
-        self.ensure_selection(&kids);
         match action {
             KeyAction::Quit => {
                 if self.is_deleting() {
@@ -1831,6 +1943,158 @@ mod tests {
         );
         assert_eq!(top[0].size, 900);
         assert_eq!(app.top_files(app.tree.root, 1).len(), 1, "limit applies");
+    }
+
+    fn row_names(app: &App) -> Vec<String> {
+        app.sorted_children()
+            .iter()
+            .map(|&k| app.tree.nodes[k].name.to_string())
+            .collect()
+    }
+
+    /// A batch for the root with one file, as a running scan would deliver it.
+    fn file_batch(name: &str, size: u64) -> Batch {
+        Batch {
+            parent_id: 0,
+            nodes: vec![crate::scan::NewNode {
+                name: name.into(),
+                raw_name: None,
+                kind: NodeKind::File,
+                apparent: size,
+                disk: size,
+                dev: 1,
+                ino: size,
+                hlink: false,
+                excluded: Excluded::No,
+                error: None,
+                dir_id: None,
+            }],
+            error: None,
+        }
+    }
+
+    /// The display order is kept between frames and only computed again when something it
+    /// depends on has changed. Without a frame clock (as in every other test) it is exact.
+    #[test]
+    fn row_order_is_cached_until_something_changes() {
+        let mut app = app_with_entries();
+        let first = app.sorted_children();
+        assert_eq!(row_names(&app), vec!["Beta", "banner", "alpha", "gamma"]);
+        assert!(
+            Rc::ptr_eq(&first, &app.sorted_children()),
+            "nothing changed: the same list is handed out"
+        );
+
+        // A sort change.
+        app.on_key(KeyAction::ToggleSort);
+        assert_eq!(row_names(&app), vec!["Beta", "alpha", "banner", "gamma"]);
+        app.on_key(KeyAction::ToggleSort);
+
+        // A deletion.
+        let banner = idx_named(&app, "banner");
+        app.tree.delete_subtree(banner);
+        assert_eq!(row_names(&app), vec!["Beta", "alpha", "gamma"]);
+
+        // The size metric.
+        let alpha = idx_named(&app, "alpha");
+        app.tree.nodes[alpha].apparent = 1_000;
+        app.on_key(KeyAction::ToggleUsage);
+        assert_eq!(row_names(&app), vec!["alpha", "Beta", "gamma"]);
+        app.on_key(KeyAction::ToggleUsage);
+
+        // Navigation: another directory has another list.
+        app.selected = Some(idx_named(&app, "gamma"));
+        app.on_key(KeyAction::Enter);
+        assert!(row_names(&app).is_empty());
+        app.on_key(KeyAction::Leave);
+        assert_eq!(row_names(&app), vec!["Beta", "alpha", "gamma"]);
+    }
+
+    /// New entries from a scan show up at once when no frame clock throttles the sorting.
+    #[test]
+    fn row_order_follows_new_batches() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        assert!(row_names(&app).is_empty());
+        app.tree.apply(file_batch("first", 10));
+        assert_eq!(row_names(&app), vec!["first"]);
+    }
+
+    /// While a scan runs, every batch changes sizes somewhere. Sorting a huge directory on
+    /// every frame would stall the UI, so with a frame clock the order is refreshed at most
+    /// every `RESORT_EVERY`. Deletions are never held back: a removed entry must not linger.
+    #[test]
+    fn row_order_is_refreshed_at_most_every_interval_during_a_scan() {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                file_batch("small", 10).nodes.remove(0),
+                file_batch("large", 500).nodes.remove(0),
+            ],
+            error: None,
+        });
+        let mut app = App::new(t, true, false, true);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        app.begin_frame(t0);
+        assert_eq!(row_names(&app), vec!["large", "small"]);
+
+        // A change shortly after: the rows stay as they are.
+        let small = idx_named(&app, "small");
+        app.tree.apply(file_batch("newcomer", 100));
+        app.tree.nodes[small].disk = 9_999;
+        app.begin_frame(t0 + ms(80));
+        assert_eq!(row_names(&app), vec!["large", "small"], "too early");
+        app.begin_frame(t0 + RESORT_EVERY - ms(1));
+        assert_eq!(row_names(&app), vec!["large", "small"], "still too early");
+
+        // Once the interval has passed, the order is brought up to date.
+        app.begin_frame(t0 + RESORT_EVERY);
+        assert_eq!(row_names(&app), vec!["small", "large", "newcomer"]);
+
+        // A deletion counts at once, inside the interval.
+        let large = idx_named(&app, "large");
+        app.tree.delete_subtree(large);
+        app.begin_frame(t0 + RESORT_EVERY + ms(1));
+        assert_eq!(row_names(&app), vec!["small", "newcomer"]);
+
+        // So does anything the user asks for: a sort change, a jump.
+        app.tree.apply(file_batch("zz-last", 1));
+        app.on_key(KeyAction::ToggleSort);
+        assert_eq!(row_names(&app), vec!["newcomer", "small", "zz-last"]);
+    }
+
+    /// A jump to an entry that arrived after the rows were last sorted still lands on it.
+    #[test]
+    fn jump_reaches_an_entry_newer_than_the_cached_order() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(file_batch("old", 10));
+        let t0 = Instant::now();
+        app.begin_frame(t0);
+        assert_eq!(row_names(&app), vec!["old"]);
+
+        app.tree.apply(file_batch("new", 5));
+        app.begin_frame(t0 + Duration::from_millis(10));
+        let new = idx_named(&app, "new");
+        assert!(app.jump_to(new));
+        assert_eq!(app.selected, Some(new));
+        app.on_key(KeyAction::Help); // any key: the selection must survive it
+        assert_eq!(app.selected, Some(new));
+        assert!(row_names(&app).contains(&"new".to_string()));
+    }
+
+    /// The largest size among the rows scales the bars; it comes with the cached order.
+    #[test]
+    fn largest_row_size_is_known_without_a_scan_of_the_rows() {
+        let mut app = app_with_entries();
+        assert_eq!(app.max_row_size(), 30);
+        app.on_key(KeyAction::ToggleSort); // by name: the largest is no longer first
+        assert_eq!(app.max_row_size(), 30);
+        app.tree.delete_subtree(idx_named(&app, "Beta"));
+        assert_eq!(app.max_row_size(), 20);
+        app.cur = idx_named(&app, "gamma");
+        assert_eq!(app.max_row_size(), 0, "an empty directory");
     }
 
     /// A list that fits on the screen never scrolls.

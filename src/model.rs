@@ -122,6 +122,10 @@ pub struct Tree {
     /// How many times a subtree has been detached (deleted or torn down for a rescan). While
     /// this is 0 every node is attached, so callers can skip [`Tree::is_attached`].
     pub detached: u64,
+    /// Counts every change to the tree's entries or sizes. Whatever is derived from the tree
+    /// and kept between frames (the sorted rows of the viewed directory) compares this to
+    /// know whether it is still up to date.
+    pub generation: u64,
 }
 
 impl Tree {
@@ -155,6 +159,7 @@ impl Tree {
             raw_names: HashMap::new(),
             errors: HashMap::new(),
             links: HashMap::new(),
+            generation: 0,
             total_dirs: 1,
             total_files: 0,
             detached: 0,
@@ -179,6 +184,7 @@ impl Tree {
     }
 
     fn graft(&mut self, parent_idx: NodeIdx, batch: Batch) {
+        self.generation += 1;
         if !self.nodes[parent_idx].scanned {
             self.nodes[parent_idx].scanned = true;
             // This directory is now read: one fewer unscanned dir in every ancestor's subtree.
@@ -364,6 +370,7 @@ impl Tree {
     /// Remove a fully-scanned subtree from the tree (after it has been removed from disk).
     /// Returns the number of (dirs, files) removed.
     pub fn delete_subtree(&mut self, idx: NodeIdx) -> (u64, u64) {
+        self.generation += 1;
         // Detach from parent and subtract its counted size and its items (the node itself plus
         // everything below it) from all ancestors.
         if let Some(parent) = self.nodes[idx].parent {
@@ -488,6 +495,7 @@ impl Tree {
     /// the subtree is marked unscanned again. `id_base` registers the node as the root of a new
     /// scan generation (see `scan::start_at`); batches from that scan graft back into this node.
     pub fn begin_refresh(&mut self, idx: NodeIdx, id_base: u64) {
+        self.generation += 1;
         debug_assert!(self.nodes[idx].is_dir());
         debug_assert!(
             self.subtree_complete(idx),
@@ -698,6 +706,7 @@ impl Tree {
         excluded: Excluded,
         read_error: bool,
     ) -> NodeIdx {
+        self.generation += 1;
         let idx = self.nodes.len();
         if matches!(kind, NodeKind::Dir) {
             self.total_dirs += 1;

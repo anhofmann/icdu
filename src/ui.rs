@@ -433,15 +433,21 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 fn render_list(f: &mut Frame, app: &App, area: Rect) {
     let kids = app.sorted_children();
     let parent_total = app.size_of(app.cur).max(1);
-    let max_child = kids
-        .iter()
-        .map(|&k| app.size_of(k))
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let max_child = app.max_row_size().max(1);
 
-    let mut items: Vec<ListItem> = Vec::with_capacity(kids.len());
-    for &k in &kids {
+    // Where the list is scrolled to. Rows are built only for the part on screen: a directory
+    // can have millions of entries, and a few dozen are visible.
+    let pos = app
+        .selected
+        .and_then(|sel| kids.iter().position(|&k| k == sel));
+    // The list has a border line above and below.
+    let rows = area.height.saturating_sub(2) as usize;
+    let offset = scroll_offset(app.list_offset.get(), pos, kids.len(), rows);
+    app.list_offset.set(offset);
+    let visible = &kids[offset.min(kids.len())..(offset + rows).min(kids.len())];
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
+    for &k in visible {
         let n = &app.tree.nodes[k];
         let size = app.size_of(k);
         let pct = size as f64 / parent_total as f64 * 100.0;
@@ -507,14 +513,11 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         items.push(ListItem::new(Line::from(spans)));
     }
 
-    let pos = app
-        .selected
-        .and_then(|sel| kids.iter().position(|&k| k == sel));
-    // The list has a border line above and below.
-    let rows = area.height.saturating_sub(2) as usize;
-    let offset = scroll_offset(app.list_offset.get(), pos, kids.len(), rows);
-    app.list_offset.set(offset);
-    let mut state = ListState::default().with_offset(offset).with_selected(pos);
+    // The highlight is relative to the rows that were built.
+    let mut state = ListState::default().with_selected(
+        pos.and_then(|p| p.checked_sub(offset))
+            .filter(|&p| p < visible.len()),
+    );
 
     let title = if app.tree.nodes[app.cur].children.is_empty() {
         if app.scanning {
@@ -837,6 +840,84 @@ mod tests {
         item_cell, truncate_left, ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
+
+    /// How long one key press plus one frame takes in a directory with a million entries.
+    /// Not a pass/fail test: timing asserts are flaky on shared CI machines. Run it with
+    ///
+    /// ```sh
+    /// cargo test --release frame_time_in_a_huge_directory -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn frame_time_in_a_huge_directory() {
+        use crate::app::{App, KeyAction};
+        use ratatui::{backend::TestBackend, Terminal};
+        use std::time::Instant;
+
+        const ENTRIES: usize = 1_000_000;
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for i in 0..ENTRIES {
+            // Sizes in no particular order, so the sort has work to do.
+            let size = (i as u64).wrapping_mul(2_654_435_761) % 1_000_000_007;
+            t.import_child(
+                t.root,
+                format!("entry-{i:07}.dat").into(),
+                NodeKind::File,
+                size,
+                size,
+                1,
+                i as u64 + 2,
+                false,
+                false,
+                Excluded::No,
+                false,
+            );
+        }
+        let mut app = App::new(t, true, false, false);
+        let mut terminal = Terminal::new(TestBackend::new(120, 50)).unwrap();
+        let mut frame = |app: &mut App| {
+            app.settle_selection();
+            terminal.draw(|f| super::render(f, app)).unwrap();
+        };
+
+        let start = Instant::now();
+        frame(&mut app);
+        println!("first frame:        {:>8.2?}", start.elapsed());
+
+        let mut worst = std::time::Duration::ZERO;
+        let start = Instant::now();
+        const KEYS: u32 = 20;
+        for _ in 0..KEYS {
+            let one = Instant::now();
+            app.on_key(KeyAction::Down);
+            frame(&mut app);
+            worst = worst.max(one.elapsed());
+        }
+        println!(
+            "key press + frame:  {:>8.2?} on average, {:>8.2?} at worst",
+            start.elapsed() / KEYS,
+            worst
+        );
+
+        // The same at the far end of the list, where finding the highlighted row is slowest.
+        app.on_key(KeyAction::Bottom);
+        frame(&mut app);
+        let start = Instant::now();
+        for _ in 0..KEYS {
+            app.on_key(KeyAction::Up);
+            frame(&mut app);
+        }
+        println!(
+            "at the end of it:   {:>8.2?} on average",
+            start.elapsed() / KEYS
+        );
+
+        // A change of the sort key is the one thing that sorts on a key press.
+        let start = Instant::now();
+        app.on_key(KeyAction::ToggleSort);
+        frame(&mut app);
+        println!("sort by name:       {:>8.2?}", start.elapsed());
+    }
 
     /// The delete dialog warns that deleting a hard link may free nothing.
     #[test]

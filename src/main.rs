@@ -428,6 +428,9 @@ fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::i
     terminal.clear()
 }
 
+/// The most input events handled between two frames.
+const MAX_EVENTS_PER_FRAME: usize = 256;
+
 /// Nodes the whole-tree search looks at per frame: a few milliseconds of work, so input stays
 /// responsive while a pass over a 10M-entry tree finishes in well under a second.
 const FIND_SLICE: usize = 200_000;
@@ -480,6 +483,7 @@ fn run(
         }
 
         // What the keys act on must be what is highlighted, from the first frame on.
+        app.begin_frame(Instant::now());
         app.settle_selection();
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -493,7 +497,13 @@ fn run(
         } else if let Some(due) = app.find_due() {
             timeout = timeout.min(due.saturating_duration_since(Instant::now()));
         }
-        if event::poll(timeout)? {
+        // Handle everything that is waiting before drawing again. With one event per frame,
+        // a held key filled a queue faster than slow frames emptied it, and the cursor kept
+        // moving after the key was released. The cap keeps the screen alive under a flood.
+        let mut waiting = event::poll(timeout)?;
+        let mut handled = 0;
+        while waiting && handled < MAX_EVENTS_PER_FRAME {
+            handled += 1;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Page height = list rows (total minus header, footer, and the list's two
@@ -513,6 +523,11 @@ fn run(
                 Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             }
+            // Quitting and the shell take effect before anything typed after them.
+            if app.quit || app.shell_requested() {
+                break;
+            }
+            waiting = event::poll(Duration::ZERO)?;
         }
         app.tick = app.tick.wrapping_add(1);
 
