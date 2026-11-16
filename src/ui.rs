@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{find_ci, indicator, scroll_offset, App, Find, Modal, SortKey, TopFiles};
-use crate::model::{Excluded, Node, NodeKind};
+use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -348,9 +348,10 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
                     path.push('/');
                 }
                 let cut = truncate_left(&path, path_width);
+                let incomplete = n.unscanned > 0;
                 let mut spans = vec![Span::styled(
-                    format!("{:>10}  ", fmt_size(app.size_of(idx))),
-                    Style::default().fg(Color::Green),
+                    format!("{} ", size_cell(app.size_of(idx), incomplete)),
+                    size_style(incomplete),
                 )];
                 if cut > 0 {
                     spans.push(Span::styled("…", dim));
@@ -402,6 +403,80 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
     );
 }
 
+/// How far the listing of a directory has come. This is about the directory itself, not about
+/// what lies below it and not about the scan as a whole.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Listing {
+    /// Not read yet: its entries are still to come.
+    Reading,
+    /// Read to the end.
+    Complete,
+    /// Could not be read, or not to the end.
+    Unreadable,
+    /// Left out on purpose (`--exclude`, `-x`, the age filters); it will not be read.
+    Excluded,
+}
+
+fn listing_state(tree: &Tree, dir: NodeIdx) -> Listing {
+    let n = &tree.nodes[dir];
+    if n.excluded != Excluded::No {
+        Listing::Excluded
+    } else if n.read_error {
+        Listing::Unreadable
+    } else if !n.scanned {
+        Listing::Reading
+    } else {
+        Listing::Complete
+    }
+}
+
+/// The title of the directory listing: how many entries it shows, and what an empty or
+/// unfinished listing means.
+fn list_title(state: Listing, items: usize) -> String {
+    let count = match items {
+        1 => "1 item".to_string(),
+        n => format!("{} items", fmt_count(n)),
+    };
+    match (state, items) {
+        (Listing::Excluded, _) => " (excluded, not scanned) ".into(),
+        (Listing::Reading, 0) => " reading… ".into(),
+        (Listing::Reading, _) => format!(" {count} · reading… "),
+        (Listing::Unreadable, 0) => " (unreadable) ".into(),
+        (Listing::Unreadable, _) => format!(" {count} · could not be read completely "),
+        (Listing::Complete, 0) => " (empty) ".into(),
+        (Listing::Complete, _) => format!(" {count} "),
+    }
+}
+
+/// The size column of a row, with the character that follows it. A directory whose subtree
+/// is not fully read gets `…` there: its size is still growing. The mark is deliberately
+/// not one of ncdu's flag characters.
+fn size_cell(size: u64, incomplete: bool) -> String {
+    let mark = if incomplete { '…' } else { ' ' };
+    format!("{:>10}{mark}", fmt_size(size))
+}
+
+/// The style that goes with [`size_cell`]: dimmed while the size is not final.
+fn size_style(incomplete: bool) -> Style {
+    if incomplete {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Green)
+    }
+}
+
+/// What the header says about the part of the viewed directory the scan has not reached.
+fn left_to_read(unscanned: u32) -> Option<String> {
+    match unscanned {
+        0 => None,
+        1 => Some("1 directory left to read".into()),
+        n => Some(format!(
+            "{} directories left to read",
+            fmt_count(n as usize)
+        )),
+    }
+}
+
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let path = app.tree.path_of(app.cur);
     let total = app.size_of(app.cur);
@@ -421,13 +496,21 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(path, Style::default().add_modifier(Modifier::BOLD)),
     ]);
     let own = app.own_size_of(app.cur);
-    let l2 = Line::from(format!(
+    let mut l2 = vec![Span::raw(format!(
         "  total: {}  ({})   own: {}",
         fmt_size(total).trim_start(),
         metric,
         fmt_size(own).trim_start(),
-    ));
-    f.render_widget(Paragraph::new(vec![l1, l2]), area);
+    ))];
+    // While the scan has not been everywhere below this directory, the total is a lower
+    // bound. The count shrinks towards zero, which also shows that the scan is getting there.
+    if let Some(left) = left_to_read(app.tree.nodes[app.cur].unscanned) {
+        l2.push(Span::styled(
+            format!("   {left}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    f.render_widget(Paragraph::new(vec![l1, Line::from(l2)]), area);
 }
 
 fn render_list(f: &mut Frame, app: &App, area: Rect) {
@@ -495,11 +578,9 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             (name_style, suffix)
         };
 
+        let incomplete = n.unscanned > 0;
         let mut spans = vec![
-            Span::styled(
-                format!("{:>10} ", fmt_size(size)),
-                Style::default().fg(Color::Green),
-            ),
+            Span::styled(size_cell(size, incomplete), size_style(incomplete)),
             Span::styled(
                 format!("[{}] ", bar(frac, 10)),
                 Style::default().fg(Color::DarkGray),
@@ -519,15 +600,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             .filter(|&p| p < visible.len()),
     );
 
-    let title = if app.tree.nodes[app.cur].children.is_empty() {
-        if app.scanning {
-            " reading… ".to_string()
-        } else {
-            " (empty) ".to_string()
-        }
-    } else {
-        format!(" {} items ", kids.len())
-    };
+    let title = list_title(listing_state(&app.tree, app.cur), kids.len());
 
     let list = List::new(items)
         .block(
@@ -837,7 +910,8 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 mod tests {
     use super::{
         confirm_export_text, dir_label, find_title, fmt_count, fmt_items, hard_link_note,
-        item_cell, truncate_left, ITEMS_WIDTH,
+        item_cell, left_to_read, list_title, listing_state, size_cell, truncate_left, Listing,
+        ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
 
@@ -917,6 +991,106 @@ mod tests {
         app.on_key(KeyAction::ToggleSort);
         frame(&mut app);
         println!("sort by name:       {:>8.2?}", start.elapsed());
+    }
+
+    /// The four states a directory's listing can be in, each built the way a scan does.
+    #[test]
+    fn listing_state_tells_the_four_states_apart() {
+        use crate::scan::{Batch, NewNode};
+        let dir = |name: &str, id: u64, excluded| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind: NodeKind::Dir,
+            apparent: 0,
+            disk: 0,
+            dev: 1,
+            ino: id,
+            hlink: false,
+            excluded,
+            error: None,
+            dir_id: (excluded == Excluded::No).then_some(id),
+        };
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        assert_eq!(
+            listing_state(&t, t.root),
+            Listing::Reading,
+            "nothing read yet"
+        );
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                dir("pending", 1, Excluded::No),
+                dir("empty", 2, Excluded::No),
+                dir("locked", 3, Excluded::No),
+                dir("skipped", 4, Excluded::Pattern),
+                dir("mount", 5, Excluded::OtherFs),
+            ],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 2,
+            nodes: Vec::new(),
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 3,
+            nodes: Vec::new(),
+            error: Some("Permission denied".into()),
+        });
+        let state =
+            |name: &str| listing_state(&t, t.nodes.iter().position(|n| n.name == name).unwrap());
+        assert_eq!(listing_state(&t, t.root), Listing::Complete);
+        assert_eq!(state("pending"), Listing::Reading);
+        assert_eq!(state("empty"), Listing::Complete);
+        assert_eq!(state("locked"), Listing::Unreadable);
+        assert_eq!(state("skipped"), Listing::Excluded);
+        assert_eq!(state("mount"), Listing::Excluded);
+
+        // An imported tree was read in full when the dump was made.
+        let imported = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        assert_eq!(listing_state(&imported, imported.root), Listing::Complete);
+    }
+
+    /// The title describes the directory on screen, not the scan as a whole: an empty
+    /// directory that was read says so even while the scan is busy elsewhere.
+    #[test]
+    fn list_title_reflects_the_directory_itself() {
+        assert_eq!(list_title(Listing::Reading, 0), " reading… ");
+        assert_eq!(list_title(Listing::Complete, 0), " (empty) ");
+        assert_eq!(list_title(Listing::Unreadable, 0), " (unreadable) ");
+        assert_eq!(
+            list_title(Listing::Excluded, 0),
+            " (excluded, not scanned) "
+        );
+        assert_eq!(list_title(Listing::Complete, 1), " 1 item ");
+        assert_eq!(list_title(Listing::Complete, 12_345), " 12,345 items ");
+        // Entries are there, but the listing is not the whole story.
+        assert_eq!(list_title(Listing::Reading, 40), " 40 items · reading… ");
+        assert_eq!(
+            list_title(Listing::Unreadable, 3),
+            " 3 items · could not be read completely "
+        );
+    }
+
+    /// A size that is still growing is marked, in the same width as one that is final.
+    #[test]
+    fn size_cell_marks_sizes_that_are_not_final() {
+        assert_eq!(size_cell(1536, false), "   1.5 KiB ");
+        assert_eq!(size_cell(1536, true), "   1.5 KiB…");
+        assert_eq!(
+            size_cell(0, true).chars().count(),
+            size_cell(5 << 40, false).chars().count()
+        );
+    }
+
+    #[test]
+    fn left_to_read_counts_down_to_nothing() {
+        assert_eq!(left_to_read(0), None);
+        assert_eq!(left_to_read(1).as_deref(), Some("1 directory left to read"));
+        assert_eq!(
+            left_to_read(12_345).as_deref(),
+            Some("12,345 directories left to read")
+        );
     }
 
     /// The delete dialog warns that deleting a hard link may free nothing.
