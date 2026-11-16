@@ -1,14 +1,17 @@
 #!/bin/sh
-# rcdu installer — downloads a portable binary from GitHub Releases.
+# icdu installer — downloads a portable binary from GitHub Releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/anhofmann/rcdu/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/anhofmann/icdu/main/install.sh | sh
 #
 # Environment overrides:
-#   RCDU_VERSION=v0.1.0    install a specific release instead of the latest
-#   RCDU_INSTALL_DIR=...   install location (default: ~/.local/bin)
+#   ICDU_VERSION=v0.5.0    install a specific release instead of the latest
+#   ICDU_INSTALL_DIR=...   install location (default: ~/.local/bin)
+#
+# Releases up to v0.4.1 were published under the project's former name, rcdu. Asked for one of
+# those, the script installs it as `rcdu`, which is what that binary is.
 set -eu
 
-REPO="anhofmann/rcdu"
+REPO="anhofmann/icdu"
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -29,8 +32,9 @@ case "$ARCH" in
   *) die "unsupported architecture '$ARCH' — prebuilt binaries cover x86_64 and aarch64" ;;
 esac
 
-ASSET="rcdu-portable-$os-$arch"
-VERSION="${RCDU_VERSION:-latest}"
+NAME=icdu
+ASSET="$NAME-portable-$os-$arch"
+VERSION="${ICDU_VERSION:-latest}"
 if [ "$VERSION" = "latest" ]; then
   BASE="https://github.com/$REPO/releases/latest/download"
 else
@@ -42,18 +46,24 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 log "fetching $ASSET from $REPO $VERSION ..."
-curl -fsSL --retry 3 -o "$TMP/rcdu" "$BASE/$ASSET" ||
-  die "download failed — does release $VERSION exist? (see https://github.com/$REPO/releases)"
+if ! curl -fsSL --retry 3 -o "$TMP/bin" "$BASE/$ASSET" 2>/dev/null; then
+  # No such asset: either the release does not exist, or it predates the rename.
+  NAME=rcdu
+  ASSET="$NAME-portable-$os-$arch"
+  curl -fsSL --retry 3 -o "$TMP/bin" "$BASE/$ASSET" ||
+    die "download failed — does release $VERSION exist? (see https://github.com/$REPO/releases)"
+  warn "that release predates the rename to icdu: installing it under its old name, $NAME"
+fi
 curl -fsSL --retry 3 -o "$TMP/sha256sums.txt" "$BASE/sha256sums.txt" ||
   die "could not download checksums for release $VERSION"
 
 # --- verify -------------------------------------------------------------
 if have sha256sum; then
-  actual=$(sha256sum "$TMP/rcdu" | awk '{print $1}')
+  actual=$(sha256sum "$TMP/bin" | awk '{print $1}')
 elif have shasum; then
-  actual=$(shasum -a 256 "$TMP/rcdu" | awk '{print $1}')
+  actual=$(shasum -a 256 "$TMP/bin" | awk '{print $1}')
 elif have openssl; then
-  actual=$(openssl dgst -sha256 "$TMP/rcdu" | awk '{print $NF}')
+  actual=$(openssl dgst -sha256 "$TMP/bin" | awk '{print $NF}')
 else
   die "no sha256 tool found (need one of: sha256sum, shasum, openssl)"
 fi
@@ -63,14 +73,14 @@ expected=$(awk -v a="$ASSET" '$2 == a { print $1 }' "$TMP/sha256sums.txt")
   die "checksum mismatch for $ASSET (expected $expected, got $actual) — aborting"
 
 # --- install ------------------------------------------------------------
-DEST="${RCDU_INSTALL_DIR:-$HOME/.local/bin}"
-mkdir -p "$DEST" 2>/dev/null || die "cannot create $DEST (try sudo, or set RCDU_INSTALL_DIR)"
-[ -w "$DEST" ] || die "$DEST is not writable (try sudo, or set RCDU_INSTALL_DIR)"
-install -m 0755 "$TMP/rcdu" "$DEST/rcdu"
+DEST="${ICDU_INSTALL_DIR:-$HOME/.local/bin}"
+mkdir -p "$DEST" 2>/dev/null || die "cannot create $DEST (try sudo, or set ICDU_INSTALL_DIR)"
+[ -w "$DEST" ] || die "$DEST is not writable (try sudo, or set ICDU_INSTALL_DIR)"
+install -m 0755 "$TMP/bin" "$DEST/$NAME"
 
 case ":$PATH:" in
   *":$DEST:"*) ;;
   *) warn "$DEST is not on your PATH. Add it:  export PATH=\"$DEST:\$PATH\"" ;;
 esac
 
-log "installed $("$DEST/rcdu" --version) to $DEST"
+log "installed $("$DEST/$NAME" --version) to $DEST"

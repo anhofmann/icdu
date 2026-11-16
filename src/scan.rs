@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn aggregates_full_tree() {
         // Build a deterministic temp tree (no external deps).
-        let base = std::env::temp_dir().join(format!("rcdu_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("a/b/c")).unwrap();
         fs::create_dir_all(base.join("d")).unwrap();
@@ -504,7 +504,7 @@ mod tests {
     /// `--exclude` keeps an entry visible but stops recursion and zeroes its contribution.
     #[test]
     fn exclude_pattern_stops_recursion() {
-        let base = std::env::temp_dir().join(format!("rcdu_excl_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_excl_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("keep")).unwrap();
         fs::create_dir_all(base.join("node_modules/deep")).unwrap();
@@ -547,7 +547,7 @@ mod tests {
     /// Hard-linked files are counted once; the duplicate is flagged `shared`.
     #[test]
     fn hardlinks_counted_once() {
-        let base = std::env::temp_dir().join(format!("rcdu_hl_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_hl_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("orig"), vec![b'x'; 5000]).unwrap();
@@ -623,7 +623,7 @@ mod tests {
     /// makes its subtree finish scanning before `slow/` does.
     #[test]
     fn focus_prioritizes_navigated_subtree() {
-        let base = std::env::temp_dir().join(format!("rcdu_prio_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_prio_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         // A big branch that takes a while, and a small branch we'll "navigate into".
         for d in 0..150 {
@@ -685,7 +685,7 @@ mod tests {
     /// base re-scans it in place, picking up on-disk changes and restoring totals.
     #[test]
     fn subtree_rescan_restores_totals_and_picks_up_changes() {
-        let base = std::env::temp_dir().join(format!("rcdu_rescan_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_rescan_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("target/inner")).unwrap();
         fs::create_dir_all(base.join("other")).unwrap();
@@ -813,7 +813,7 @@ mod tests {
     /// consistent with the global totals after every batch, not just at the end.
     #[test]
     fn item_counts_match_entries_on_disk() {
-        let base = std::env::temp_dir().join(format!("rcdu_items_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_items_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("a/b/c")).unwrap();
         fs::create_dir_all(base.join("d")).unwrap();
@@ -885,7 +885,7 @@ mod tests {
     fn age_filters_exclude_entries_at_scan_time() {
         use std::time::{Duration, SystemTime};
 
-        let base = std::env::temp_dir().join(format!("rcdu_age_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_age_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("olddir")).unwrap();
         fs::write(base.join("oldfile"), vec![b'x'; 1000]).unwrap();

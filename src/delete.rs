@@ -272,7 +272,7 @@ mod tests {
 
     /// A fresh directory under its canonical path.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rcdu_plan_{tag}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("icdu_plan_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::canonicalize(dir).unwrap()

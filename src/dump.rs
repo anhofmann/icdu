@@ -29,7 +29,7 @@ pub fn export<W: Write>(tree: &Tree, w: &mut W) -> io::Result<()> {
         .unwrap_or(0);
     write!(
         w,
-        "[{MAJOR},{MINOR},{{\"progname\":\"rcdu\",\"progver\":\"{}\",\"timestamp\":{ts}}},",
+        "[{MAJOR},{MINOR},{{\"progname\":\"icdu\",\"progver\":\"{}\",\"timestamp\":{ts}}},",
         env!("CARGO_PKG_VERSION")
     )?;
     write_node(tree, tree.root, w)?;
@@ -357,6 +357,25 @@ mod tests {
 
     /// The format stores no item counts; they are derived on import, counting hard-link
     /// duplicates and excluded entries like a live scan does.
+    /// Dumps name this program in their header, and a dump written under any other program
+    /// name (ncdu, or rcdu as this project was called up to 0.4.1) loads all the same.
+    #[test]
+    fn header_names_icdu_and_any_progname_is_accepted() {
+        let t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let mut out = Vec::new();
+        export(&t, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with(r#"[1,2,{"progname":"icdu","progver":""#),
+            "{text}"
+        );
+
+        for prog in ["icdu", "rcdu", "ncdu", "something else"] {
+            let json = format!(r#"[1,2,{{"progname":"{prog}"}},[{{"name":"/r"}}]]"#);
+            assert!(import(json.as_bytes()).is_ok(), "{prog}");
+        }
+    }
+
     #[test]
     fn import_derives_item_counts() {
         let json = r#"[1,2,{"progname":"ncdu"},

@@ -1,4 +1,4 @@
-# rcdu
+# icdu
 
 An [ncdu](https://dev.yorhel.nl/ncdu)-style interactive disk usage explorer, in Rust — with two
 differences that matter:
@@ -21,28 +21,43 @@ It is a **drop-in ncdu replacement**: the common ncdu flags work, and it reads a
 ncdu JSON export format, so existing dumps and scripts keep working.
 
 <p align="center">
-  <img src=".github/assets/screenshot.png" alt="rcdu browsing a scanned directory" width="97%">
+  <img src=".github/assets/screenshot.png" alt="icdu browsing a scanned directory" width="97%">
 </p>
 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/anhofmann/rcdu/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anhofmann/icdu/main/install.sh | sh
 ```
 
 The script detects your platform (macOS Apple Silicon/Intel, Linux x86-64/ARM64), downloads the
-static binary from [Releases](https://github.com/anhofmann/rcdu/releases), verifies its
+static binary from [Releases](https://github.com/anhofmann/icdu/releases), verifies its
 SHA-256 checksum, and installs it to `~/.local/bin`. Override the destination with
-`RCDU_INSTALL_DIR=...` or pin a version with `RCDU_VERSION=v0.1.0`. From source with a Rust
-toolchain instead: `cargo install --git https://github.com/anhofmann/rcdu`.
+`ICDU_INSTALL_DIR=...` or pin a version with `ICDU_VERSION=v0.5.0`. From source with a Rust
+toolchain instead: `cargo install --git https://github.com/anhofmann/icdu`.
 
 To upgrade, run the install script again: it replaces the binary with the latest release. There
-is no built-in updater, and rcdu itself never connects to the network.
+is no built-in updater, and icdu itself never connects to the network.
+
+### Upgrading from rcdu
+
+Up to version 0.4.1 this program was called rcdu. Coming from it:
+
+- Install icdu with the script above, then remove the old binary (`rm ~/.local/bin/rcdu`).
+  `rcdu update` cannot do this step: it does not find releases published under the new name.
+- The self-update command is gone. Upgrade by running the install script again.
+- The install script reads `ICDU_VERSION` and `ICDU_INSTALL_DIR`. Releases up to v0.4.1 stay
+  available: asked for one of them, the script installs it under its old name.
+- Some keys changed to match ncdu: `Esc` no longer quits, `/` is the only search key (the
+  filter is part of the search now), export is on `E`, the largest files on `T`, and `r` and `b`
+  act on the directory you are viewing. The full list is under [Keys](#keys).
+- Exports written from the UI are named `icdu-dump.json`, and dumps carry `icdu` as the program
+  name. Dumps written by rcdu load as before.
 
 ## Usage
 
 ```
-rcdu [PATH] [OPTIONS]
+icdu [PATH] [OPTIONS]
 
 ARGS:
     PATH                     directory to scan (default: current directory)
@@ -67,12 +82,12 @@ OPTIONS:
 Examples:
 
 ```sh
-rcdu /                          # browse / live, on-disk usage
-rcdu ~ --exclude .cache --exclude node_modules
-rcdu / -x -o backup.json        # headless scan of the root filesystem only → JSON
-rcdu -f backup.json             # browse a previous dump, no scanning
-ncdu -o - / | rcdu -f -         # pipe an ncdu scan straight into rcdu
-rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/dedup)
+icdu /                          # browse / live, on-disk usage
+icdu ~ --exclude .cache --exclude node_modules
+icdu / -x -o backup.json        # headless scan of the root filesystem only → JSON
+icdu -f backup.json             # browse a previous dump, no scanning
+ncdu -o - / | icdu -f -         # pipe an ncdu scan straight into icdu
+icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/dedup)
 ```
 
 ### Keys
@@ -105,7 +120,7 @@ Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` exclude
 ### Shelling out
 
 Press `b` to suspend the TUI and run `$SHELL` interactively in the directory you are viewing
-(as ncdu does) — find it here, fix it there, `exit` to come straight back into rcdu. The scan keeps running in the background while you're away and catches up when you
+(as ncdu does) — find it here, fix it there, `exit` to come straight back into icdu. The scan keeps running in the background while you're away and catches up when you
 return.
 
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
@@ -180,7 +195,7 @@ details are unavailable. For an imported dump (`-f`) nothing is read from disk a
 
 Press `d` to delete the selected file or directory; a confirmation dialog appears first.
 
-**Only what the scan listed is deleted.** rcdu does not hand the directory to a recursive
+**Only what the scan listed is deleted.** icdu does not hand the directory to a recursive
 remove, which would take whatever is on disk at that moment. It walks the entries it scanned,
 checks each one against what the scan recorded (same type, device and inode), unlinks the files
 and removes each directory once it is empty. So:
@@ -198,7 +213,7 @@ Further guards:
 
 - **Read-only** (`-r`) disables deletion entirely, and so does browsing an imported dump (`-f`).
 - A directory **cannot be deleted until its whole subtree has finished scanning**. Because the
-  scan is live, a directory's size and contents may still be growing; rcdu refuses to delete one
+  scan is live, a directory's size and contents may still be growing; icdu refuses to delete one
   until every descendant has been read, so you never delete something whose true extent isn't yet
   known. Files are always deletable immediately.
 
@@ -222,7 +237,7 @@ leaves the rest on disk. Any other key disarms the prompt.
   traversed.
 - `--older-than DUR` / `--newer-than DUR` exclude entries by modification time (durations:
   `s`/`m`/`h`/`d`/`w`/`y`, bare numbers = days). Filtered entries stay visible (marked
-  `<mtime filter>`) but are not descended into and don't count — e.g. `rcdu ~ --newer-than 1y`
+  `<mtime filter>`) but are not descended into and don't count — e.g. `icdu ~ --newer-than 1y`
   surfaces the data you haven't touched in a year.
 - **Names that are not valid UTF-8** are shown with the replacement character (`�`) in place of
   the bytes that cannot be displayed. Everything that touches the entry (delete, open, the
@@ -238,21 +253,21 @@ valid UTF-8 does not work yet.
 
 A dump describes the machine and the moment it was taken on, not the local filesystem as it is
 now. While browsing one, delete, the shell, open and rescan are therefore disabled, and the
-info popup reads nothing from disk, as in ncdu. So `ssh host ncdu -o- / | rcdu -f -` can never
+info popup reads nothing from disk, as in ncdu. So `ssh host ncdu -o- / | icdu -f -` can never
 touch a local file that happens to have the same path. Independently of that, `-f` refuses a
 dump whose entry names aren't single path components (empty, `.`, `..`, or containing `/` or
 NUL), or whose root path contains a `..` component.
 
 Press `E` in the UI to write the currently browsed tree — including deletions made this session —
-to `rcdu-dump.json` in the working directory (`rcdu-dump-2.json` and so on if one already
+to `icdu-dump.json` in the working directory (`icdu-dump-2.json` and so on if one already
 exists), in the same format as `-o`: handy for snapshotting a long scan without redoing it.
 While the scan is still running, `E` asks first, because the dump will be partial. Directories
-that have not been read yet are then written with the read-error flag, so rcdu and ncdu show
+that have not been read yet are then written with the read-error flag, so icdu and ncdu show
 them as incomplete (`!`) instead of as empty.
 
 ## Portable, dependency-free binaries
 
-`rcdu`'s core — scan, sort, delete, JSON import/export — makes **no external process calls**: no
+`icdu`'s core — scan, sort, delete, JSON import/export — makes **no external process calls**: no
 `du`, no coreutils, nothing; it's pure Rust `std`. Two features deliberately start another
 program: `o` hands the selected entry to the platform's default handler, and `b` opens your
 shell. The binaries are self-contained:
@@ -266,12 +281,12 @@ shell. The binaries are self-contained:
 Build all three with the bundled script:
 
 ```sh
-./build-portable.sh        # outputs dist/rcdu-portable-{linux-x86_64,linux-aarch64,macos-<arch>}
+./build-portable.sh        # outputs dist/icdu-portable-{linux-x86_64,linux-aarch64,macos-<arch>}
 ```
 
 Prebuilt binaries for every release (Linux x86_64/ARM64 static musl, macOS
 Apple Silicon/Intel, plus SHA-256 checksums) are attached to the
-[GitHub Releases](https://github.com/anhofmann/rcdu/releases) page.
+[GitHub Releases](https://github.com/anhofmann/icdu/releases) page.
 
 The Linux targets are cross-compiled straight from macOS using the toolchain's bundled
 `rust-lld` — **no Docker, no zig, no external linker required**.

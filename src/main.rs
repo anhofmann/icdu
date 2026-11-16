@@ -1,4 +1,4 @@
-//! rcdu — an ncdu-like disk usage explorer that is interactive while it scans.
+//! icdu — an ncdu-like disk usage explorer that is interactive while it scans.
 
 mod app;
 mod delete;
@@ -62,7 +62,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "-v" | "--version" => {
-                println!("rcdu {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", version_line());
                 std::process::exit(0);
             }
             "-t" | "--threads" => {
@@ -156,12 +156,17 @@ fn parse_duration(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("duration '{s}' overflows"))
 }
 
+/// What `--version` prints: the program name and its version, as ncdu does.
+fn version_line() -> String {
+    format!("icdu {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn print_help() {
     println!(
-        "rcdu {} — interactive, SSD-optimized disk usage explorer (ncdu-compatible)
+        "icdu {} — interactive, SSD-optimized disk usage explorer (ncdu-compatible)
 
 USAGE:
-    rcdu [PATH] [OPTIONS]
+    icdu [PATH] [OPTIONS]
 
 ARGS:
     PATH                     directory to scan (default: current directory)
@@ -201,7 +206,7 @@ fn main() {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("rcdu: {e}\nTry 'rcdu --help'.");
+            eprintln!("icdu: {e}\nTry 'icdu --help'.");
             std::process::exit(2);
         }
     };
@@ -216,7 +221,7 @@ fn main() {
             scan_to_completion(tree, root, opts)
         };
         if let Err(e) = write_export(&tree, &dest) {
-            eprintln!("rcdu: export failed: {e}");
+            eprintln!("icdu: export failed: {e}");
             std::process::exit(1);
         }
         return;
@@ -245,7 +250,7 @@ fn main() {
     ratatui::restore();
 
     if let Err(e) = result {
-        eprintln!("rcdu: {e}");
+        eprintln!("icdu: {e}");
         std::process::exit(1);
     }
 }
@@ -254,7 +259,7 @@ fn unwrap_or_die<T>(res: std::io::Result<T>, ctx: &str) -> T {
     match res {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("rcdu: {ctx}: {e}");
+            eprintln!("icdu: {ctx}: {e}");
             std::process::exit(1);
         }
     }
@@ -265,19 +270,19 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
     let root = match std::fs::canonicalize(&args.path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("rcdu: {}: {e}", args.path.display());
+            eprintln!("icdu: {}: {e}", args.path.display());
             std::process::exit(1);
         }
     };
     let meta = match std::fs::symlink_metadata(&root) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("rcdu: {}: {e}", root.display());
+            eprintln!("icdu: {}: {e}", root.display());
             std::process::exit(1);
         }
     };
     if !meta.is_dir() {
-        eprintln!("rcdu: {} is not a directory", root.display());
+        eprintln!("icdu: {} is not a directory", root.display());
         std::process::exit(1);
     }
     // One path form everywhere: the tree's names, the scanner's queued jobs, and what we hand
@@ -347,7 +352,7 @@ fn scan_to_completion(mut tree: Tree, root: PathBuf, opts: Opts) -> Tree {
     }
     tree.finish_scan();
     eprintln!(
-        "rcdu: scanned {} dirs, {} files",
+        "icdu: scanned {} dirs, {} files",
         tree.total_dirs, tree.total_files
     );
     tree
@@ -379,7 +384,7 @@ fn run_ui(app: &mut App) {
     let result = run(&mut terminal, app);
     ratatui::restore();
     if let Err(e) = result {
-        eprintln!("rcdu: {e}");
+        eprintln!("icdu: {e}");
         std::process::exit(1);
     }
 }
@@ -546,7 +551,7 @@ mod tests {
 
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    use super::{decode_key, parse_args, parse_duration, plain_path, Args};
+    use super::{decode_key, parse_args, parse_duration, plain_path, version_line, Args};
     use crate::app::{InputMode, KeyAction};
 
     #[test]
@@ -565,6 +570,16 @@ mod tests {
         );
     }
 
+    /// The program, the crate and the binary carry one name.
+    #[test]
+    fn the_program_is_called_icdu() {
+        assert_eq!(env!("CARGO_PKG_NAME"), "icdu");
+        assert_eq!(
+            version_line(),
+            format!("icdu {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     /// `update` used to be a subcommand that downloaded a release. It is a path like any other.
     #[test]
     fn update_is_an_ordinary_path() {
@@ -578,7 +593,7 @@ mod tests {
     }
 
     /// The repository this build's releases are published from.
-    const REPO: &str = "anhofmann/rcdu";
+    const REPO: &str = "anhofmann/icdu";
 
     /// The project this one started from. The README credits it with a link to the repository
     /// itself; nothing may be fetched from there.

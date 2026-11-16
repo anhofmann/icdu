@@ -394,7 +394,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     };
     let l1 = Line::from(vec![
         Span::styled(
-            "rcdu",
+            "icdu",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -616,7 +616,7 @@ fn wrapped_height(lines: &[Line], inner_width: u16) -> u16 {
 fn render_help(f: &mut Frame) {
     let lines = vec![
         Line::from(vec![Span::styled(
-            "rcdu — keys",
+            "icdu — keys",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

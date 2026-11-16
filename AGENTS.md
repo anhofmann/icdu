@@ -5,7 +5,7 @@ Instructions for coding agents working on this repository.
 ## Workflow
 
 - Always work in a git worktree, never directly in an existing checkout:
-  `git worktree add ../rcdu-<topic> -b <branch>` — then work inside that directory.
+  `git worktree add ../icdu-<topic> -b <branch>` — then work inside that directory.
 - Do all feature and bug-fix work on feature branches. Never commit directly to `main`.
 - Branch names should say what they are: `feature/<topic>` for features, `fix/<topic>` for bug fixes.
 - Make small, incremental commits. Each commit should compile and pass `cargo test` on its own — never leave the tree broken mid-series.

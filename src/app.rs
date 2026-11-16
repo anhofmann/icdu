@@ -588,7 +588,7 @@ impl App {
     }
 
     /// Export the whole tree as it is right now (including deletions made this session) to the
-    /// next free `rcdu-dump*.json` in the working directory, in the same ncdu format as `-o`.
+    /// next free `icdu-dump*.json` in the working directory, in the same ncdu format as `-o`.
     /// Synchronous: dumps write fast relative to scanning, and the outcome lands in the
     /// status line.
     ///
@@ -1486,15 +1486,15 @@ pub enum KeyAction {
     Moved(&'static str),
 }
 
-/// Create the first free `rcdu-dump*.json` in `dir`, so consecutive exports never clobber each
+/// Create the first free `icdu-dump*.json` in `dir`, so consecutive exports never clobber each
 /// other (or an unrelated file that happens to share the name). `create_new` (`O_EXCL`) makes
 /// the check and the create one atomic step that fails on anything already at the name,
 /// including a planted symlink, so the write can never be redirected elsewhere.
 fn create_export_file(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     for n in 1u32.. {
         let path = match n {
-            1 => dir.join("rcdu-dump.json"),
-            n => dir.join(format!("rcdu-dump-{n}.json")),
+            1 => dir.join("icdu-dump.json"),
+            n => dir.join(format!("icdu-dump-{n}.json")),
         };
         match std::fs::OpenOptions::new()
             .write(true)
@@ -1506,7 +1506,7 @@ fn create_export_file(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::other("no free rcdu-dump*.json name"))
+    Err(std::io::Error::other("no free icdu-dump*.json name"))
 }
 
 /// Split Unix seconds into UTC civil date/time (Howard Hinnant's civil-from-days).
@@ -1813,7 +1813,7 @@ mod tests {
     #[test]
     fn info_rows_stat_live_files() {
         use std::fs;
-        let base = std::env::temp_dir().join(format!("rcdu_info_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("icdu_info_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("f"), b"0123456789").unwrap();
@@ -1911,7 +1911,7 @@ mod tests {
     #[test]
     fn export_writes_an_importable_dump() {
         let app = app_with_entries();
-        let dir = std::env::temp_dir().join(format!("rcdu_export_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("icdu_export_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dump.json");
@@ -1927,10 +1927,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Consecutive exports pick the first free `rcdu-dump*.json` name instead of clobbering.
+    /// Consecutive exports pick the first free `icdu-dump*.json` name instead of clobbering.
     #[test]
     fn export_paths_avoid_clobbering() {
-        let dir = std::env::temp_dir().join(format!("rcdu_export_name_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("icdu_export_name_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let name = |dir: &Path| {
@@ -1941,13 +1941,13 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        assert_eq!(name(&dir), "rcdu-dump.json");
-        assert_eq!(name(&dir), "rcdu-dump-2.json");
-        std::fs::write(dir.join("rcdu-dump-4.json"), b"x").unwrap();
-        assert_eq!(name(&dir), "rcdu-dump-3.json");
-        assert_eq!(name(&dir), "rcdu-dump-5.json");
+        assert_eq!(name(&dir), "icdu-dump.json");
+        assert_eq!(name(&dir), "icdu-dump-2.json");
+        std::fs::write(dir.join("icdu-dump-4.json"), b"x").unwrap();
+        assert_eq!(name(&dir), "icdu-dump-3.json");
+        assert_eq!(name(&dir), "icdu-dump-5.json");
         assert_eq!(
-            std::fs::read(dir.join("rcdu-dump-4.json")).unwrap(),
+            std::fs::read(dir.join("icdu-dump-4.json")).unwrap(),
             b"x",
             "an existing file is never truncated"
         );
@@ -1958,24 +1958,24 @@ mod tests {
     /// absent) must not redirect the write: the export skips the name instead (issue #3).
     #[test]
     fn export_never_writes_through_a_symlink() {
-        let dir = std::env::temp_dir().join(format!("rcdu_export_link_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("icdu_export_link_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let victim = dir.join("victim");
-        std::os::unix::fs::symlink(&victim, dir.join("rcdu-dump.json")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("icdu-dump.json")).unwrap();
 
         let mut app = app_with_entries();
         app.export_into(&dir);
 
         assert!(!victim.exists(), "the symlink target must not be created");
-        let link = std::fs::symlink_metadata(dir.join("rcdu-dump.json")).unwrap();
+        let link = std::fs::symlink_metadata(dir.join("icdu-dump.json")).unwrap();
         assert!(
             link.file_type().is_symlink(),
             "the planted link is left alone"
         );
-        let out = dir.join("rcdu-dump-2.json");
+        let out = dir.join("icdu-dump-2.json");
         assert!(
-            app.status.as_deref().unwrap().ends_with("rcdu-dump-2.json"),
+            app.status.as_deref().unwrap().ends_with("icdu-dump-2.json"),
             "{:?}",
             app.status
         );
@@ -2020,7 +2020,7 @@ mod tests {
 
     /// An empty directory of its own for a test to export into.
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rcdu_{tag}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("icdu_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2066,7 +2066,7 @@ mod tests {
         assert!(status.contains("partial"), "{status:?}");
 
         let dump =
-            crate::dump::import(std::fs::File::open(dir.join("rcdu-dump.json")).unwrap()).unwrap();
+            crate::dump::import(std::fs::File::open(dir.join("icdu-dump.json")).unwrap()).unwrap();
         let named = |name: &str| dump.nodes.iter().find(|n| n.name == name).unwrap();
         assert!(named("pending").read_error, "unread: shown as incomplete");
         assert!(!named("done").read_error, "read: not flagged");
@@ -2093,7 +2093,7 @@ mod tests {
             "{status:?}"
         );
         let dump =
-            crate::dump::import(std::fs::File::open(dir.join("rcdu-dump.json")).unwrap()).unwrap();
+            crate::dump::import(std::fs::File::open(dir.join("icdu-dump.json")).unwrap()).unwrap();
         assert!(dump.nodes.iter().all(|n| !n.read_error));
         std::fs::remove_dir_all(&dir).unwrap();
     }
