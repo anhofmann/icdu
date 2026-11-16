@@ -1029,21 +1029,49 @@ impl App {
             }
             Modal::TopFiles(mut tf) => {
                 let last = tf.items.len().saturating_sub(1);
-                match action {
-                    KeyAction::Down => tf.selected = (tf.selected + 1).min(last),
-                    KeyAction::Up => tf.selected = tf.selected.saturating_sub(1),
-                    KeyAction::Top => tf.selected = 0,
-                    KeyAction::Bottom => tf.selected = last,
+                // Whether the popup stays open after this key. It was taken out of `modal`
+                // above, so staying open means putting it back.
+                let keep_open = match action {
+                    KeyAction::Down => {
+                        tf.selected = (tf.selected + 1).min(last);
+                        true
+                    }
+                    KeyAction::Up => {
+                        tf.selected = tf.selected.saturating_sub(1);
+                        true
+                    }
+                    KeyAction::PageDown(page) => {
+                        tf.selected = tf.selected.saturating_add(page).min(last);
+                        true
+                    }
+                    KeyAction::PageUp(page) => {
+                        tf.selected = tf.selected.saturating_sub(page);
+                        true
+                    }
+                    KeyAction::Top => {
+                        tf.selected = 0;
+                        true
+                    }
+                    KeyAction::Bottom => {
+                        tf.selected = last;
+                        true
+                    }
                     KeyAction::Enter => {
                         // The tree may have changed since the popup opened (deletions and
                         // rescans tombstone nodes, a running deletion locks its subtree):
                         // `jump_to` refuses those and says why.
                         self.jump_to(tf.items[tf.selected].idx);
+                        false
                     }
                     // q / Esc / h / ? close the popup without changing the view.
-                    KeyAction::Quit | KeyAction::Leave | KeyAction::Cancel | KeyAction::Help => {}
+                    KeyAction::Quit | KeyAction::Leave | KeyAction::Cancel | KeyAction::Help => {
+                        false
+                    }
                     // Anything else: keep the popup open exactly as it was.
-                    _ => self.modal = Modal::TopFiles(tf),
+                    _ => true,
+                };
+                if keep_open {
+                    self.modal = Modal::TopFiles(tf);
                 }
                 return;
             }
@@ -1745,25 +1773,107 @@ mod tests {
         assert_eq!(app.top_files(app.tree.root, 1).len(), 1, "limit applies");
     }
 
+    /// The row highlighted in the open top-files popup.
+    fn top_selected(app: &App) -> usize {
+        match &app.modal {
+            Modal::TopFiles(tf) => tf.selected,
+            _ => panic!("the top-files popup is not open"),
+        }
+    }
+
+    /// Every navigation key moves the highlight and leaves the popup open. (They used to
+    /// close it: the popup is taken out of `modal` for the key and was not put back.)
+    #[test]
+    fn top_files_popup_navigation_keeps_it_open() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let dir = t.import_child(
+            t.root,
+            "many".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            2,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        // f00 is the largest, f29 the smallest.
+        for i in 0..30u64 {
+            file_under(&mut t, dir, &format!("f{i:02}"), 1000 - i);
+        }
+        let mut app = App::new(t, true, false, false);
+        app.on_key(KeyAction::TopFiles);
+        assert_eq!(top_selected(&app), 0);
+
+        for (key, want) in [
+            (KeyAction::Down, 1),
+            (KeyAction::Down, 2),
+            (KeyAction::Up, 1),
+            (KeyAction::PageDown(10), 11),
+            (KeyAction::PageDown(10), 21),
+            (KeyAction::PageDown(10), 29),
+            (KeyAction::PageUp(10), 19),
+            (KeyAction::Top, 0),
+            (KeyAction::Up, 0),
+            (KeyAction::PageUp(10), 0),
+            (KeyAction::Bottom, 29),
+            (KeyAction::Down, 29),
+        ] {
+            app.on_key(key);
+            assert_eq!(top_selected(&app), want, "after {key:?}");
+        }
+        // A key that means nothing here changes nothing.
+        app.on_key(KeyAction::ToggleSort);
+        assert_eq!(top_selected(&app), 29);
+    }
+
+    /// Enter jumps to the highlighted file. The second row is used, in a tree where a plain
+    /// Enter in the browser would have led somewhere else, so a popup that closed early
+    /// cannot pass.
     #[test]
     fn top_files_popup_navigation_and_jump() {
-        let mut app = app_with_tree_for_top_files();
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let add_dir = |t: &mut Tree, name: &str, ino| {
+            t.import_child(
+                t.root,
+                name.into(),
+                NodeKind::Dir,
+                0,
+                0,
+                1,
+                ino,
+                false,
+                false,
+                Excluded::No,
+                false,
+            )
+        };
+        let big = add_dir(&mut t, "big", 2);
+        let small = add_dir(&mut t, "small", 3);
+        file_under(&mut t, big, "largest.bin", 900);
+        file_under(&mut t, big, "filler.bin", 100);
+        file_under(&mut t, small, "second.bin", 500);
+        let mut app = App::new(t, true, false, false);
+
         app.on_key(KeyAction::TopFiles);
-        let items = match &app.modal {
-            Modal::TopFiles(tf) => tf.items.len(),
+        let rows: Vec<String> = match &app.modal {
+            Modal::TopFiles(tf) => tf.items.iter().map(|e| e.path.clone()).collect(),
             _ => panic!("top-files popup did not open"),
         };
-        assert_eq!(items, 2);
-        app.on_key(KeyAction::Down); // select the second row (sub/mid.bin)
+        assert_eq!(
+            rows,
+            vec!["big/largest.bin", "small/second.bin", "big/filler.bin"]
+        );
+        app.on_key(KeyAction::Down); // small/second.bin
+        assert_eq!(top_selected(&app), 1);
         app.on_key(KeyAction::Enter);
         assert!(matches!(app.modal, Modal::None), "jump closes the popup");
-        assert_eq!(
-            app.tree.nodes[app.cur].name, "sub",
-            "landed in the parent dir"
-        );
+        assert_eq!(app.cur, small, "landed in the file's directory");
         assert_eq!(
             app.tree.nodes[app.selected.unwrap()].name,
-            "mid.bin",
+            "second.bin",
             "file is selected"
         );
     }
