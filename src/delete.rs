@@ -20,7 +20,10 @@
 //! What could not be removed is returned in the [`Report`], so the caller can say so and read
 //! the directory again.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +64,9 @@ impl Entry {
 pub struct Plan {
     target: PathBuf,
     entries: Vec<Entry>,
+    /// The on-disk bytes of the names that are not valid UTF-8, by entry index. `Entry::name`
+    /// is their display form and would name another path.
+    raw_names: HashMap<usize, Box<[u8]>>,
 }
 
 /// What a deletion did.
@@ -103,7 +109,7 @@ impl Report {
 impl Plan {
     /// Copy the subtree at `idx` out of the tree. `None` if `idx` is no longer part of it.
     pub fn of(tree: &Tree, idx: NodeIdx) -> Option<Plan> {
-        let target = PathBuf::from(tree.fs_path_of(idx)?);
+        let target = tree.fs_path_of(idx)?;
         let entry = |i: NodeIdx| {
             let n = &tree.nodes[i];
             Entry {
@@ -119,6 +125,7 @@ impl Plan {
         };
 
         let mut entries = vec![entry(idx)];
+        let mut raw_names = HashMap::new();
         // (node, next child to visit, index of the node's entry)
         let mut stack = vec![(idx, 0usize, 0usize)];
         while let Some(top) = stack.last_mut() {
@@ -127,6 +134,9 @@ impl Plan {
             if entries[at].descend && next < children.len() {
                 top.1 += 1;
                 let child = children[next];
+                if let Some(raw) = tree.raw_name(child) {
+                    raw_names.insert(entries.len(), Box::from(raw));
+                }
                 entries.push(entry(child));
                 stack.push((child, 0, entries.len() - 1));
             } else {
@@ -134,7 +144,19 @@ impl Plan {
                 stack.pop();
             }
         }
-        Some(Plan { target, entries })
+        Some(Plan {
+            target,
+            entries,
+            raw_names,
+        })
+    }
+
+    /// The name of entry `at` as a path component, in the bytes the filesystem has.
+    fn component(&self, at: usize) -> &OsStr {
+        match self.raw_names.get(&at) {
+            Some(raw) => OsStr::from_bytes(raw),
+            None => OsStr::new(self.entries[at].name.as_str()),
+        }
     }
 
     /// Number of entries the plan covers, the target included.
@@ -195,7 +217,7 @@ impl Plan {
         if entry.descend {
             let mut child = at + 1;
             while child < entry.end {
-                path.push(self.entries[child].name.as_str());
+                path.push(self.component(child));
                 emptied &= self.remove(child, path, report);
                 path.pop();
                 child = self.entries[child].end;

@@ -54,7 +54,7 @@ fn write_node<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> 
 fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> {
     let n = &tree.nodes[idx];
     write!(w, "{{\"name\":")?;
-    write_json_string(&n.name, w)?;
+    write_json_string(tree.name_bytes(idx), w)?;
     write!(
         w,
         ",\"asize\":{},\"dsize\":{},\"ino\":{},\"dev\":{}",
@@ -84,19 +84,32 @@ fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> 
     w.write_all(b"}")
 }
 
-fn write_json_string<W: Write>(s: &str, w: &mut W) -> io::Result<()> {
+/// Write a name as a JSON string. The format stores names "in the same encoding as reported
+/// by the filesystem": the bytes go out as they are, with only the characters JSON reserves
+/// escaped. A name that is not valid UTF-8 therefore produces a string that is not valid
+/// UTF-8 either, exactly as ncdu writes it.
+fn write_json_string<W: Write>(name: &[u8], w: &mut W) -> io::Result<()> {
     w.write_all(b"\"")?;
-    for c in s.chars() {
-        match c {
-            '"' => w.write_all(b"\\\"")?,
-            '\\' => w.write_all(b"\\\\")?,
-            '\n' => w.write_all(b"\\n")?,
-            '\r' => w.write_all(b"\\r")?,
-            '\t' => w.write_all(b"\\t")?,
-            c if (c as u32) < 0x20 => write!(w, "\\u{:04x}", c as u32)?,
-            c => write!(w, "{c}")?,
+    // Runs of ordinary bytes are written in one go.
+    let mut plain = 0;
+    for (i, &byte) in name.iter().enumerate() {
+        let escape: Option<&[u8]> = match byte {
+            b'"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            b'\n' => Some(b"\\n"),
+            b'\r' => Some(b"\\r"),
+            b'\t' => Some(b"\\t"),
+            byte if byte < 0x20 => None,
+            _ => continue,
+        };
+        w.write_all(&name[plain..i])?;
+        match escape {
+            Some(escape) => w.write_all(escape)?,
+            None => write!(w, "\\u{byte:04x}")?,
         }
+        plain = i + 1;
     }
+    w.write_all(&name[plain..])?;
     w.write_all(b"\"")
 }
 
@@ -251,6 +264,40 @@ fn bad(msg: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names go out byte for byte: a name that is not valid UTF-8 keeps its real bytes, as in
+    /// a dump written by ncdu, and only what JSON reserves is escaped.
+    #[test]
+    fn export_writes_names_byte_for_byte() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let add = |t: &mut Tree, name: &str| {
+            t.import_child(
+                t.root,
+                name.into(),
+                NodeKind::File,
+                1,
+                1,
+                1,
+                1,
+                false,
+                false,
+                Excluded::No,
+                false,
+            )
+        };
+        let raw = add(&mut t, "bad_\u{FFFD}name");
+        t.set_raw_name(raw, Box::from(&b"bad_\xffname"[..]));
+        add(&mut t, "q\"uote\\back\nline\u{1}ctl");
+        add(&mut t, "ünï");
+
+        let mut buf = Vec::new();
+        export(&t, &mut buf).unwrap();
+        let has = |needle: &[u8]| buf.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"\"name\":\"bad_\xffname\""), "the raw byte");
+        assert!(!has("\u{FFFD}".as_bytes()), "not the replacement character");
+        assert!(has(br#""name":"q\"uote\\back\nline\u0001ctl""#), "escapes");
+        assert!(has("\"name\":\"ünï\"".as_bytes()), "UTF-8 passes through");
+    }
 
     #[test]
     fn export_then_import_roundtrips_totals() {

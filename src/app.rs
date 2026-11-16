@@ -239,7 +239,8 @@ pub enum Modal {
 /// a spinner while a large directory is removed.
 struct PendingDelete {
     idx: NodeIdx,
-    path: String,
+    /// The real path being removed; the worker reports what it could not remove below it.
+    path: PathBuf,
     rx: Receiver<Report>,
 }
 
@@ -316,7 +317,7 @@ pub struct App {
     scan_started: Option<Instant>,
     /// A pending request to suspend the TUI and spawn `$SHELL` in this directory, consumed
     /// once per frame by the event loop (which owns the terminal).
-    shell_request: Option<String>,
+    shell_request: Option<PathBuf>,
     /// Where the export key writes its dump; `None` means the working directory at that
     /// moment. Tests point it at a scratch directory.
     export_dir: Option<PathBuf>,
@@ -387,7 +388,7 @@ impl App {
         let Some(path) = self.tree.fs_path_of(self.cur) else {
             return;
         };
-        let focus = Some(PathBuf::from(path));
+        let focus = Some(path);
         for ctrl in &self.controls {
             ctrl.set_focus(focus.clone());
         }
@@ -519,15 +520,15 @@ impl App {
 
     /// Tear the subtree below `idx` down and start a scanner generation that reads it again.
     /// The caller has checked the gates: `idx` is a fully scanned directory, no other rescan
-    /// is running, no deletion touches it. Returns the path being read, or `None` when `idx`
-    /// has left the tree or no scan options are attached.
+    /// is running, no deletion touches it. Returns the path being read, for display, or `None`
+    /// when `idx` has left the tree or no scan options are attached.
     fn start_rescan(&mut self, idx: NodeIdx) -> Option<String> {
         let opts = self.scan_opts.clone()?;
         let path = self.tree.fs_path_of(idx)?;
         let id_base = self.next_scan_base * SCAN_ID_STRIDE;
         self.next_scan_base += 1;
         self.tree.begin_refresh(idx, id_base);
-        let scan = start_at(PathBuf::from(&path), opts, id_base);
+        let scan = start_at(path, opts, id_base);
         self.prune_find();
         self.scans.push(ScanHandle {
             rx: scan.events,
@@ -541,7 +542,7 @@ impl App {
         // original scan already brought in.
         self.bytes_seen = 0;
         self.scan_started = Some(Instant::now());
-        Some(path)
+        Some(self.tree.path_of(idx))
     }
 
     /// Bring the tree below `idx` back in step with the disk after a deletion that left
@@ -727,8 +728,8 @@ impl App {
         }
     }
 
-    /// Consume a pending shell request, if any.
-    pub fn take_shell_request(&mut self) -> Option<String> {
+    /// Consume a pending shell request, if any: the directory to start the shell in.
+    pub fn take_shell_request(&mut self) -> Option<PathBuf> {
         self.shell_request.take()
     }
 
@@ -1235,14 +1236,14 @@ impl App {
             return;
         };
         let (tx, rx) = unbounded();
-        let p = path.clone();
         // Waiting happens off the UI thread: openers normally return at once, but a wedged
         // handler must not take the TUI down with it. Waiting here still reaps the child.
         std::thread::spawn(move || {
-            let _ = tx.send(open_path(&p));
+            let _ = tx.send(open_path(&path));
         });
-        self.status = Some(format!("opening {path}"));
-        self.pending_open.push(PendingOpen { path, rx });
+        let shown = self.tree.path_of(sel);
+        self.status = Some(format!("opening {shown}"));
+        self.pending_open.push(PendingOpen { path: shown, rx });
     }
 
     /// Check whether a background open has finished and surface its result. Called once per
@@ -1380,7 +1381,7 @@ impl App {
                     self.selected = (!kids.is_empty()).then(|| kids[p.min(kids.len() - 1)]);
                 }
             }
-            self.status = Some(format!("deleted {}", pd.path));
+            self.status = Some(format!("deleted {}", pd.path.display()));
             return;
         }
 
@@ -1434,7 +1435,7 @@ impl App {
 
 /// Launch the platform opener for `path` and wait for it to exit — waiting reaps the child
 /// instead of leaving a zombie. Stdio is disconnected so the opener can't scribble on the TUI.
-fn open_path(path: &str) -> std::io::Result<()> {
+fn open_path(path: &Path) -> std::io::Result<()> {
     let status = opener_command(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1450,22 +1451,22 @@ fn open_path(path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn opener_command(path: &str) -> Command {
+fn opener_command(path: &Path) -> Command {
     let mut cmd = Command::new("open");
     cmd.arg(path);
     cmd
 }
 
 #[cfg(target_os = "windows")]
-fn opener_command(path: &str) -> Command {
+fn opener_command(path: &Path) -> Command {
     // `start` treats its first quoted argument as the window title, so pass an empty one.
     let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "start", "", path]);
+    cmd.args(["/C", "start", ""]).arg(path);
     cmd
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn opener_command(path: &str) -> Command {
+fn opener_command(path: &Path) -> Command {
     let mut cmd = Command::new("xdg-open");
     cmd.arg(path);
     cmd
@@ -2088,6 +2089,7 @@ mod tests {
         use crate::scan::NewNode;
         let node = |name: &str, kind, dir_id| NewNode {
             name: name.into(),
+            raw_name: None,
             kind,
             apparent: 10,
             disk: 10,
@@ -2259,18 +2261,21 @@ mod tests {
         let mut app = app_with_entries();
         // No selection yet: falls back to the current directory.
         app.on_key(KeyAction::Shell);
-        assert_eq!(app.take_shell_request().as_deref(), Some("/r"));
+        assert_eq!(app.take_shell_request().as_deref(), Some(Path::new("/r")));
 
         // "alpha" (two downs from Beta) is a file: the shell goes to its parent, not the file.
         app.on_key(KeyAction::Down);
         app.on_key(KeyAction::Down);
         app.on_key(KeyAction::Shell);
-        assert_eq!(app.take_shell_request().as_deref(), Some("/r"));
+        assert_eq!(app.take_shell_request().as_deref(), Some(Path::new("/r")));
 
         // "gamma" is a directory: the shell opens there.
         app.on_key(KeyAction::Down);
         app.on_key(KeyAction::Shell);
-        assert_eq!(app.take_shell_request().as_deref(), Some("/r/gamma"));
+        assert_eq!(
+            app.take_shell_request().as_deref(),
+            Some(Path::new("/r/gamma"))
+        );
         assert!(app.take_shell_request().is_none(), "request is consumed");
     }
 
@@ -2496,6 +2501,7 @@ mod tests {
         use crate::scan::NewNode;
         let node = |name: &str, kind, dir_id| NewNode {
             name: name.into(),
+            raw_name: None,
             kind,
             apparent: 10,
             disk: 10,
@@ -2608,7 +2614,7 @@ mod tests {
         let (tx, rx) = unbounded();
         app.pending_delete = Some(PendingDelete {
             idx,
-            path: app.tree.path_of(idx),
+            path: app.tree.path_of(idx).into(),
             rx,
         });
         tx
@@ -2730,7 +2736,10 @@ mod tests {
             app.selected.is_some_and(|s| app.tree.is_attached(s)),
             "an entry that still exists is selected"
         );
-        assert_eq!(app.tree.fs_path_of(app.cur).as_deref(), Some("/r"));
+        assert_eq!(
+            app.tree.fs_path_of(app.cur).as_deref(),
+            Some(Path::new("/r"))
+        );
     }
 
     /// A node that is no longer part of the tree has no usable path: the one built from it is
@@ -2918,6 +2927,87 @@ mod tests {
         pump(&mut app, "the deletion", |a| !a.is_deleting());
         assert!(root.join("victim/skipme/secret.txt").exists());
         assert!(!root.join("victim/known.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `dir/<name>`, where the name is `prefix` followed by a byte that is not valid UTF-8.
+    fn non_utf8_path(dir: &Path, prefix: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let mut name = prefix.as_bytes().to_vec();
+        name.push(0xff);
+        dir.join(std::ffi::OsStr::from_bytes(&name))
+    }
+
+    /// Create something at a non-UTF-8 path, or report that this filesystem refuses such
+    /// names (APFS on macOS does), in which case the test has nothing to check.
+    fn create_or_skip(root: &Path, create: impl FnOnce() -> std::io::Result<()>) -> bool {
+        if create().is_ok() {
+            return true;
+        }
+        eprintln!("skipped: this filesystem refuses names that are not valid UTF-8");
+        std::fs::remove_dir_all(root).unwrap();
+        false
+    }
+
+    /// The node the scanner created for the entry at `path`, found by its inode.
+    fn node_at(app: &App, path: &Path) -> NodeIdx {
+        let ino = std::fs::symlink_metadata(path).unwrap().ino();
+        (0..app.tree.nodes.len())
+            .find(|&i| i != app.tree.root && app.tree.nodes[i].ino == ino)
+            .unwrap()
+    }
+
+    /// A name that is not valid UTF-8 is shown with a replacement character, but everything
+    /// that touches the filesystem uses its real bytes. Deleting it removes that file, not a
+    /// sibling whose real name happens to be the displayed one.
+    #[test]
+    fn delete_reaches_a_file_whose_name_is_not_utf8() {
+        let root = real_dir("raw_delete");
+        let raw = non_utf8_path(&root, "bad_");
+        if !create_or_skip(&root, || std::fs::write(&raw, b"x")) {
+            return;
+        }
+        let lookalike = root.join("bad_\u{FFFD}");
+        std::fs::write(&lookalike, b"not the one").unwrap();
+        let mut app = scanned_app(&root, &[]);
+
+        let target = node_at(&app, &raw);
+        assert_eq!(app.tree.nodes[target].name, "bad_\u{FFFD}", "shown lossily");
+        app.selected = Some(target);
+        app.on_key(KeyAction::Delete);
+        app.on_key(KeyAction::Confirm);
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+
+        assert!(std::fs::symlink_metadata(&raw).is_err(), "the file is gone");
+        assert!(lookalike.exists(), "its look-alike is untouched");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("deleted")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The shell and a rescan get the real path of a directory whose name is not valid UTF-8.
+    #[test]
+    fn shell_and_rescan_use_the_real_bytes_of_a_name() {
+        let root = real_dir("raw_dir");
+        let raw = non_utf8_path(&root, "dir_");
+        if !create_or_skip(&root, || std::fs::create_dir(&raw)) {
+            return;
+        }
+        std::fs::write(raw.join("inside.txt"), b"x").unwrap();
+        let mut app = scanned_app(&root, &[]);
+        let dir = node_at(&app, &raw);
+        assert_eq!(app.tree.nodes[dir].items, 1, "the scan read it");
+
+        app.selected = Some(dir);
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request(), Some(raw.clone()));
+
+        app.on_key(KeyAction::Refresh);
+        pump(&mut app, "the rescan", |a| !a.scanning);
+        assert!(!app.tree.nodes[dir].read_error, "the rescan found it");
+        assert_eq!(app.tree.nodes[dir].items, 1, "and read it again");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

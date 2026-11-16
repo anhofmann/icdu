@@ -18,7 +18,9 @@
 //! `dir_index` map is released once scanning finishes.
 
 use std::collections::HashMap;
-use std::path::MAIN_SEPARATOR;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{PathBuf, MAIN_SEPARATOR};
 
 use compact_str::CompactString;
 
@@ -93,6 +95,9 @@ pub struct Tree {
     dir_index: HashMap<u64, NodeIdx>,
     /// Batches whose parent hasn't been created yet, keyed by `parent_id`.
     orphans: HashMap<u64, Vec<Batch>>,
+    /// The on-disk bytes of the few names that are not valid UTF-8. `Node::name` holds their
+    /// lossy form for display; kept here so that `Node` does not grow for a rare case.
+    raw_names: HashMap<NodeIdx, Box<[u8]>>,
     pub total_files: u64,
     pub total_dirs: u64,
     /// How many times a subtree has been detached (deleted or torn down for a rescan). While
@@ -128,6 +133,7 @@ impl Tree {
             root: 0,
             dir_index,
             orphans: HashMap::new(),
+            raw_names: HashMap::new(),
             total_dirs: 1,
             total_files: 0,
             detached: 0,
@@ -187,6 +193,9 @@ impl Tree {
             if counts {
                 sum_apparent += nn.apparent;
                 sum_disk += nn.disk;
+            }
+            if let Some(raw) = nn.raw_name {
+                self.raw_names.insert(idx, raw);
             }
 
             self.nodes.push(Node {
@@ -466,12 +475,48 @@ impl Tree {
         parts.join("/")
     }
 
+    /// The on-disk bytes of a name that is not valid UTF-8; `None` for every other entry.
+    pub fn raw_name(&self, idx: NodeIdx) -> Option<&[u8]> {
+        if self.raw_names.is_empty() {
+            return None;
+        }
+        self.raw_names.get(&idx).map(|raw| &**raw)
+    }
+
+    /// Record the on-disk bytes of a name that `Node::name` can only show lossily.
+    pub fn set_raw_name(&mut self, idx: NodeIdx, raw: Box<[u8]>) {
+        self.raw_names.insert(idx, raw);
+    }
+
+    /// The name of an entry exactly as the filesystem has it.
+    pub fn name_bytes(&self, idx: NodeIdx) -> &[u8] {
+        self.raw_name(idx)
+            .unwrap_or_else(|| self.nodes[idx].name.as_bytes())
+    }
+
     /// The path of a node for acting on the filesystem (delete, open, shell, rescan, stat), or
     /// `None` if the node is no longer part of the tree. A tombstone's parent chain ends
     /// before the root, so [`Tree::path_of`] gives a *relative* path for it, which the OS
     /// would resolve against the working directory and so reach an unrelated file.
-    pub fn fs_path_of(&self, idx: NodeIdx) -> Option<String> {
-        self.is_attached(idx).then(|| self.path_of(idx))
+    ///
+    /// The path is built from the names' on-disk bytes. For a name that is not valid UTF-8,
+    /// the display form would name a path that does not exist, or a different entry.
+    pub fn fs_path_of(&self, idx: NodeIdx) -> Option<PathBuf> {
+        if !self.is_attached(idx) {
+            return None;
+        }
+        let mut parts = Vec::new();
+        let mut cur = Some(idx);
+        while let Some(i) = cur {
+            parts.push(self.name_bytes(i));
+            cur = self.nodes[i].parent;
+        }
+        // The root's name is the absolute path of the scan root; the rest are components.
+        let mut path = PathBuf::from(OsStr::from_bytes(parts.pop()?));
+        for part in parts.iter().rev() {
+            path.push(OsStr::from_bytes(part));
+        }
+        Some(path)
     }
 
     /// Build the path of a node for display, walking back to the root (whose name is
@@ -571,6 +616,7 @@ mod tests {
     fn dir(name: &str, id: u64) -> NewNode {
         NewNode {
             name: name.into(),
+            raw_name: None,
             kind: NodeKind::Dir,
             apparent: 100,
             disk: 100,
@@ -678,18 +724,50 @@ mod tests {
     fn tombstones_have_no_filesystem_path() {
         let mut t = small_tree();
         let (a, y, b) = (idx_of(&t, "a"), idx_of(&t, "y"), idx_of(&t, "b"));
-        assert_eq!(t.fs_path_of(y).as_deref(), Some("/r/a/sub/y"));
-        assert_eq!(t.fs_path_of(t.root).as_deref(), Some("/r"));
+        assert_eq!(t.fs_path_of(y), Some(PathBuf::from("/r/a/sub/y")));
+        assert_eq!(t.fs_path_of(t.root), Some(PathBuf::from("/r")));
 
         t.delete_subtree(a);
         assert_eq!(t.path_of(y), "a/sub/y", "relative: the chain ends at `a`");
         assert_eq!(t.fs_path_of(y), None);
         assert_eq!(t.fs_path_of(a), None);
         assert_eq!(
-            t.fs_path_of(b).as_deref(),
-            Some("/r/b"),
+            t.fs_path_of(b),
+            Some(PathBuf::from("/r/b")),
             "sibling keeps its path"
         );
+    }
+
+    /// A name that is not valid UTF-8 is shown lossily, but the path to act on is built from
+    /// its real bytes, at any depth.
+    #[test]
+    fn filesystem_paths_use_the_real_bytes_of_a_name() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        let raw_dir = NewNode {
+            name: "d\u{FFFD}".into(),
+            raw_name: Some(Box::from(&b"d\xff"[..])),
+            ..dir("", 1)
+        };
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![raw_dir],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("plain", 10)],
+            error: None,
+        });
+        let (d, plain) = (idx_of(&t, "d\u{FFFD}"), idx_of(&t, "plain"));
+
+        assert_eq!(t.path_of(plain), "/r/d\u{FFFD}/plain", "display");
+        assert_eq!(
+            t.fs_path_of(plain),
+            Some(PathBuf::from(OsStr::from_bytes(b"/r/d\xff/plain")))
+        );
+        assert_eq!(t.raw_name(d), Some(&b"d\xff"[..]));
+        assert_eq!(t.raw_name(plain), None);
+        assert_eq!(t.name_bytes(plain), b"plain");
     }
 
     /// A rescan tears down the subtree below the refreshed directory, which itself stays.

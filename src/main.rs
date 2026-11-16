@@ -11,6 +11,7 @@ mod ui;
 mod update;
 
 use std::io::{BufReader, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -298,14 +299,26 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
     // to the OS all speak the plain (non-verbatim) form, so navigation focus, delete and open
     // all agree on the same string.
     let root_name = plain_path(&root);
-    let root = PathBuf::from(&root_name);
-    let tree = Tree::new(
+    // A scan root whose path is not valid UTF-8 keeps its real bytes for everything that
+    // touches the filesystem; `root_name` is then only its display form.
+    let raw_root = root
+        .to_str()
+        .is_none()
+        .then(|| Box::<[u8]>::from(root.as_os_str().as_bytes()));
+    let root = match raw_root {
+        Some(_) => root,
+        None => PathBuf::from(&root_name),
+    };
+    let mut tree = Tree::new(
         root_name.into(),
         meta.len(),
         meta.blocks() * 512,
         meta.dev(),
         meta.ino(),
     );
+    if let Some(raw) = raw_root {
+        tree.set_raw_name(tree.root, raw);
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -456,14 +469,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
 /// Suspend the TUI, run `$SHELL` interactively in `dir`, and rebuild the UI when it exits.
 /// Returns a status line describing the outcome. This is the documented ratatui pattern for
 /// handing the terminal to a child process; the child gets the real tty, keystrokes and all.
-fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &str) -> Option<String> {
+fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<String> {
     let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
     let Some(shell) = shell else {
         return Some("no SHELL set — cannot spawn a shell".into());
     };
     ratatui::restore();
     let outcome = match Command::new(&shell).current_dir(dir).status() {
-        Ok(status) if status.success() => format!("shell exited (was in {dir})"),
+        Ok(status) if status.success() => format!("shell exited (was in {})", dir.display()),
         Ok(status) => format!("shell exited with {status}"),
         Err(e) => format!("shell failed: {e}"),
     };

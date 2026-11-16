@@ -231,12 +231,17 @@ leaves the rest on disk. Any other key disarms the prompt.
   `s`/`m`/`h`/`d`/`w`/`y`, bare numbers = days). Filtered entries stay visible (marked
   `<mtime filter>`) but are not descended into and don't count — e.g. `rcdu ~ --newer-than 1y`
   surfaces the data you haven't touched in a year.
+- **Names that are not valid UTF-8** are shown with the replacement character (`�`) in place of
+  the bytes that cannot be displayed. Everything that touches the entry (delete, open, the
+  shell, rescan) uses its real bytes, and so does `-o`.
 
 ### ncdu JSON compatibility
 
 `-o` writes the ncdu export format (`[1, 2, {meta}, <root>]`, per-item `asize`/`dsize`, `hlnkc`,
 `notreg`, `excluded`, `read_error`), readable by ncdu and other tools. `-f` reads the same format
 (including dumps produced by ncdu itself), re-deriving hard-link dedup so totals match a live scan.
+Names are written byte for byte, as ncdu does; reading a dump that contains a name that is not
+valid UTF-8 does not work yet.
 
 A dump describes the machine and the moment it was taken on, not the local filesystem as it is
 now. While browsing one, delete, the shell, open and rescan are therefore disabled, and the

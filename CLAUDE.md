@@ -50,6 +50,7 @@ Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`,
 - Deletion runs on a background thread (`perform_delete` → `poll_delete`). Only one runs at a time, the subtree being deleted is locked, and quitting during a delete needs two presses (`quit_armed`).
 - An imported dump (`-f`, `App.imported`) is not the local filesystem. Delete, shell, open, rescan and the info popup's `lstat` are refused there (`refused_for_import`); any new action that touches a path needs the same check.
 - Filesystem actions take their path from `Tree::fs_path_of`, which is `None` for a tombstone. `Tree::path_of` is for display only: for a detached node it returns a relative path.
+- `Node::name` is the display form of a name and always valid UTF-8. A name that is not valid UTF-8 on disk also has its real bytes in `Tree::raw_names` (a side table, so `Node` does not grow). `fs_path_of`, the delete plan and the dump export use `Tree::name_bytes`; never build a path to act on from `Node::name`.
 
 ### In-place rescan (`r`)
 

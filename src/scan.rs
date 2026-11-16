@@ -20,6 +20,7 @@
 //! `Sender` and disconnects the channel — the UI's signal that the scan is complete.
 
 use std::collections::{HashSet, VecDeque};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +35,13 @@ use crate::model::{Excluded, NodeKind};
 
 /// A single freshly-discovered filesystem entry, sent to the UI to be grafted into the tree.
 pub struct NewNode {
+    /// The name for display and search. Valid UTF-8 always; if the name on disk is not, the
+    /// offending bytes are shown as U+FFFD and `raw_name` carries the real ones.
     pub name: CompactString,
+    /// The name exactly as the filesystem has it, when it is not valid UTF-8. Everything that
+    /// builds a path to act on uses these bytes; a path built from `name` would not exist, or
+    /// would be another entry.
+    pub raw_name: Option<Box<[u8]>>,
     pub kind: NodeKind,
     /// Logical file size in bytes (`st_size`).
     pub apparent: u64,
@@ -273,7 +280,14 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
 
     for entry in read.flatten() {
         let path = entry.path();
-        let name = CompactString::from(entry.file_name().to_string_lossy());
+        let file_name = entry.file_name();
+        let (name, raw_name) = match file_name.to_str() {
+            Some(valid) => (CompactString::from(valid), None),
+            None => (
+                CompactString::from(file_name.to_string_lossy()),
+                Some(Box::from(file_name.as_bytes())),
+            ),
+        };
 
         // lstat: never follow symlinks, so a symlink to a directory is counted as the link
         // itself and never traversed (matching ncdu's default and avoiding cycles).
@@ -283,6 +297,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                 // Unreadable entry: record it with a read error, zero size.
                 nodes.push(NewNode {
                     name,
+                    raw_name,
                     kind: NodeKind::Other,
                     apparent: 0,
                     disk: 0,
@@ -345,6 +360,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
 
         nodes.push(NewNode {
             name,
+            raw_name,
             kind,
             apparent,
             disk,
