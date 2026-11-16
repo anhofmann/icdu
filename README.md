@@ -302,3 +302,8 @@ binaries.
 Possible future work: in-place refresh (`r`) of a subtree, the ncdu "shared/unique" size
 breakdown column, and a file-info panel. Further memory wins are available if needed (`u32`
 node indices, splitting file/dir storage, a per-tree device table).
+
+## Origin
+
+This project started as a fork of [rcdu](https://github.com/mayankasthana/rcdu) by Mayank Asthana
+and has been developed independently since version 0.4.0.
