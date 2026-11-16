@@ -448,6 +448,12 @@ fn list_title(state: Listing, items: usize) -> String {
     }
 }
 
+/// The size a full bar stands for: the largest size among the rows as last sorted and the
+/// rows now on screen. Never 0, so it can be divided by.
+fn bar_scale(sorted_max: u64, visible: impl Iterator<Item = u64>) -> u64 {
+    visible.fold(sorted_max, u64::max).max(1)
+}
+
 /// The size column of a row, with the character that follows it. A directory whose subtree
 /// is not fully read gets `…` there: its size is still growing. The mark is deliberately
 /// not one of ncdu's flag characters.
@@ -516,7 +522,6 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 fn render_list(f: &mut Frame, app: &App, area: Rect) {
     let kids = app.sorted_children();
     let parent_total = app.size_of(app.cur).max(1);
-    let max_child = app.max_row_size().max(1);
 
     // Where the list is scrolled to. Rows are built only for the part on screen: a directory
     // can have millions of entries, and a few dozen are visible.
@@ -528,6 +533,9 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
     let offset = scroll_offset(app.list_offset.get(), pos, kids.len(), rows);
     app.list_offset.set(offset);
     let visible = &kids[offset.min(kids.len())..(offset + rows).min(kids.len())];
+    // The bars are scaled by the largest row. That value comes with the cached order, which
+    // sizes can outgrow while a scan runs; the rows on screen must never exceed the scale.
+    let max_child = bar_scale(app.max_row_size(), visible.iter().map(|&k| app.size_of(k)));
 
     let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
     for &k in visible {
@@ -909,9 +917,9 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_export_text, dir_label, find_title, fmt_count, fmt_items, hard_link_note,
-        item_cell, left_to_read, list_title, listing_state, size_cell, truncate_left, Listing,
-        ITEMS_WIDTH,
+        bar_scale, confirm_export_text, dir_label, find_title, fmt_count, fmt_items,
+        hard_link_note, item_cell, left_to_read, list_title, listing_state, size_cell,
+        truncate_left, Listing, ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
 
@@ -1081,6 +1089,18 @@ mod tests {
             size_cell(0, true).chars().count(),
             size_cell(5 << 40, false).chars().count()
         );
+    }
+
+    /// No row may be larger than what a full bar stands for.
+    #[test]
+    fn bar_scale_covers_the_rows_on_screen() {
+        assert_eq!(bar_scale(100, [10, 50].into_iter()), 100);
+        assert_eq!(
+            bar_scale(100, [10, 500].into_iter()),
+            500,
+            "a row outgrew it"
+        );
+        assert_eq!(bar_scale(0, std::iter::empty()), 1, "never zero");
     }
 
     #[test]

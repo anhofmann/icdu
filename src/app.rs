@@ -41,9 +41,17 @@ pub struct TopFiles {
     pub offset: Cell<usize>,
 }
 
-/// The shortest interval between two sorts of the viewed directory while a scan keeps changing
-/// the tree. A sort that takes long stretches it (see [`App::sorted_children`]).
-pub const RESORT_EVERY: Duration = Duration::from_millis(250);
+/// While a scan keeps changing the tree, the viewed directory is sorted again only after this
+/// many times the duration of its last sort, so sorting takes at most a tenth of the time. A
+/// small directory sorts in microseconds and is in order on every frame; one with a million
+/// entries is sorted again about once a second.
+const SORT_SHARE: u32 = 10;
+
+/// Whether rows that were sorted `elapsed` ago, in a sort that took `took`, are due for
+/// another sort.
+fn resort_due(elapsed: Duration, took: Duration) -> bool {
+    elapsed >= took * SORT_SHARE
+}
 
 /// The rows of the viewed directory in display order, kept between frames. Sorting a
 /// directory with a million entries takes a noticeable part of a second; doing it for every
@@ -418,7 +426,7 @@ pub struct App {
     /// The sorted rows of the viewed directory, reused while they are still good.
     row_order: RefCell<Option<RowOrder>>,
     /// When the frame being prepared started. The event loop sets it; without it (in tests)
-    /// the rows are sorted again after every change, with it at most every `RESORT_EVERY`.
+    /// the rows are sorted again after every change, with it only when `resort_due` says so.
     frame_time: Option<Instant>,
     /// Spinner animation frame.
     pub tick: usize,
@@ -769,8 +777,8 @@ impl App {
     /// The order is cached. It is computed again when the user changed what it depends on
     /// (directory, sort key, size metric) and when entries were removed. Changes that only
     /// a running scan makes (new entries, growing sizes) arrive with every frame; for those
-    /// the rows are refreshed at most every [`RESORT_EVERY`], or every ten sort durations if
-    /// that is longer, so sorting never takes more than a tenth of the time.
+    /// the rows are sorted again once ten times the duration of the last sort has passed, so
+    /// sorting never takes more than a tenth of the time.
     pub fn sorted_children(&self) -> Rc<[NodeIdx]> {
         self.with_row_order(|order| Rc::clone(&order.rows))
     }
@@ -800,11 +808,9 @@ impl App {
         if order.generation == self.tree.generation {
             return true;
         }
-        // Only sizes and new entries differ. Good enough for a little while.
+        // Only sizes and new entries differ. Good enough until another sort is affordable.
         match (self.frame_time, order.at) {
-            (Some(now), Some(at)) => {
-                now.saturating_duration_since(at) < RESORT_EVERY.max(order.took * 10)
-            }
+            (Some(now), Some(at)) => !resort_due(now.saturating_duration_since(at), order.took),
             _ => false,
         }
     }
@@ -2019,11 +2025,32 @@ mod tests {
         assert_eq!(row_names(&app), vec!["first"]);
     }
 
-    /// While a scan runs, every batch changes sizes somewhere. Sorting a huge directory on
-    /// every frame would stall the UI, so with a frame clock the order is refreshed at most
-    /// every `RESORT_EVERY`. Deletions are never held back: a removed entry must not linger.
+    /// A stale order is kept for ten times as long as the last sort took, and no longer.
     #[test]
-    fn row_order_is_refreshed_at_most_every_interval_during_a_scan() {
+    fn resort_is_due_after_ten_sort_durations() {
+        let ms = Duration::from_millis;
+        assert!(!resort_due(ms(399), ms(40)));
+        assert!(resort_due(ms(400), ms(40)));
+        // A sort that takes no time is due on every frame.
+        assert!(resort_due(Duration::ZERO, Duration::ZERO));
+        assert!(resort_due(ms(80), Duration::from_micros(50)));
+    }
+
+    /// Pretend the last sort of the viewed directory took `took`, as it would in a directory
+    /// with very many entries.
+    fn pretend_the_sort_took(app: &App, took: Duration) {
+        app.row_order
+            .borrow_mut()
+            .as_mut()
+            .expect("rows were sorted")
+            .took = took;
+    }
+
+    /// While a scan runs, every batch changes sizes somewhere. Sorting a huge directory on
+    /// every frame would stall the UI, so with a frame clock a slow sort is not repeated
+    /// until it is due. Deletions are never held back: a removed entry must not linger.
+    #[test]
+    fn a_slow_sort_is_not_repeated_for_every_frame_of_a_scan() {
         let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
         t.apply(Batch {
             parent_id: 0,
@@ -2039,6 +2066,7 @@ mod tests {
 
         app.begin_frame(t0);
         assert_eq!(row_names(&app), vec!["large", "small"]);
+        pretend_the_sort_took(&app, ms(40));
 
         // A change shortly after: the rows stay as they are.
         let small = idx_named(&app, "small");
@@ -2046,23 +2074,41 @@ mod tests {
         app.tree.nodes[small].disk = 9_999;
         app.begin_frame(t0 + ms(80));
         assert_eq!(row_names(&app), vec!["large", "small"], "too early");
-        app.begin_frame(t0 + RESORT_EVERY - ms(1));
+        app.begin_frame(t0 + ms(399));
         assert_eq!(row_names(&app), vec!["large", "small"], "still too early");
 
-        // Once the interval has passed, the order is brought up to date.
-        app.begin_frame(t0 + RESORT_EVERY);
+        // Once ten sort durations have passed, the order is brought up to date.
+        app.begin_frame(t0 + ms(400));
         assert_eq!(row_names(&app), vec!["small", "large", "newcomer"]);
+        pretend_the_sort_took(&app, ms(40));
 
-        // A deletion counts at once, inside the interval.
+        // A deletion counts at once.
         let large = idx_named(&app, "large");
         app.tree.delete_subtree(large);
-        app.begin_frame(t0 + RESORT_EVERY + ms(1));
+        app.begin_frame(t0 + ms(401));
         assert_eq!(row_names(&app), vec!["small", "newcomer"]);
+        pretend_the_sort_took(&app, ms(40));
 
         // So does anything the user asks for: a sort change, a jump.
         app.tree.apply(file_batch("zz-last", 1));
         app.on_key(KeyAction::ToggleSort);
         assert_eq!(row_names(&app), vec!["newcomer", "small", "zz-last"]);
+    }
+
+    /// A directory that sorts in no time is in order on every frame of a scan, as it was
+    /// before the rows were cached.
+    #[test]
+    fn a_fast_sort_keeps_the_rows_in_order_on_every_frame() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(file_batch("a", 10));
+        let t0 = Instant::now();
+        app.begin_frame(t0);
+        assert_eq!(row_names(&app), vec!["a"]);
+        pretend_the_sort_took(&app, Duration::from_micros(20));
+
+        app.tree.apply(file_batch("b", 500));
+        app.begin_frame(t0 + Duration::from_millis(80)); // the next frame of a scan
+        assert_eq!(row_names(&app), vec!["b", "a"]);
     }
 
     /// A jump to an entry that arrived after the rows were last sorted still lands on it.
@@ -2074,8 +2120,14 @@ mod tests {
         app.begin_frame(t0);
         assert_eq!(row_names(&app), vec!["old"]);
 
+        pretend_the_sort_took(&app, Duration::from_secs(1));
         app.tree.apply(file_batch("new", 5));
         app.begin_frame(t0 + Duration::from_millis(10));
+        assert_eq!(
+            row_names(&app),
+            vec!["old"],
+            "the cached rows are still in use"
+        );
         let new = idx_named(&app, "new");
         assert!(app.jump_to(new));
         assert_eq!(app.selected, Some(new));
