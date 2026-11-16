@@ -207,6 +207,36 @@ mod tests {
         );
     }
 
+    /// The project this one started from. The README credits it with a link to the repository
+    /// itself; nothing may be fetched from there.
+    const ORIGIN: &str = "mayankasthana/rcdu";
+
+    /// GitHub links in `text` that point anywhere but the release repo, as `host` + path.
+    fn foreign_links(file: &str, text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for host in ["github.com/", "githubusercontent.com/"] {
+            for (at, _) in text.match_indices(host) {
+                let rest = &text[at + host.len()..];
+                if rest.starts_with('$') {
+                    continue; // install.sh's own `$REPO` expansion
+                }
+                let path: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || "-_./".contains(*c))
+                    .collect();
+                // The README's credit link: the bare repository, never a path below it.
+                if file == "README.md" && path == ORIGIN {
+                    continue;
+                }
+                let repo = path.split('/').take(2).collect::<Vec<_>>().join("/");
+                if repo != REPO {
+                    found.push(format!("{host}{path}"));
+                }
+            }
+        }
+        found
+    }
+
     /// `rcdu update`, `install.sh` and the README must all fetch binaries from the repository
     /// that publishes this build's releases, never from another account (issue #2).
     #[test]
@@ -220,21 +250,21 @@ mod tests {
             ("install.sh", install),
             ("README.md", include_str!("../README.md")),
         ] {
-            for host in ["github.com/", "githubusercontent.com/"] {
-                for (at, _) in text.match_indices(host) {
-                    let rest = &text[at + host.len()..];
-                    if rest.starts_with('$') {
-                        continue; // install.sh's own `$REPO` expansion
-                    }
-                    let path: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || "-_./".contains(*c))
-                        .collect();
-                    let repo = path.split('/').take(2).collect::<Vec<_>>().join("/");
-                    assert_eq!(repo, REPO, "{file} links {host}{path}");
-                }
-            }
+            assert_eq!(foreign_links(file, text), Vec::<String>::new(), "{file}");
         }
+    }
+
+    #[test]
+    fn only_the_bare_origin_link_is_exempt() {
+        let credit = "a fork of [rcdu](https://github.com/mayankasthana/rcdu) by";
+        assert!(foreign_links("README.md", credit).is_empty());
+        // A download path below the original repository is still foreign...
+        let download = "curl https://github.com/mayankasthana/rcdu/releases/latest/download/x";
+        assert_eq!(foreign_links("README.md", download).len(), 1);
+        let raw = "https://raw.githubusercontent.com/mayankasthana/rcdu/main/install.sh";
+        assert_eq!(foreign_links("README.md", raw).len(), 1);
+        // ...and install.sh gets no exemption at all.
+        assert_eq!(foreign_links("install.sh", credit).len(), 1);
     }
 
     #[test]
