@@ -29,7 +29,7 @@ The TUI needs a real terminal, so check behavior headlessly with `-o -` or throu
 
 Unix only (`std::os::unix::fs::MetadataExt` for dev/ino/blocks/nlink). Platform-specific code uses `#[cfg(target_os = ...)]`, e.g. the three `opener_command` variants in `app.rs`. Anything you change has to build and pass on both Linux and macOS.
 
-Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`, `compact_str`). The core never spawns external processes. The only exceptions are `o` (the platform opener), `b` (`$SHELL`) and `rcdu update` (`curl`). SHA-256 is implemented in-tree (`sha256.rs`) to avoid adding a crate.
+Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `serde_json`, `compact_str`). The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
 
 ## Architecture
 

@@ -36,9 +36,8 @@ SHA-256 checksum, and installs it to `~/.local/bin`. Override the destination wi
 `RCDU_INSTALL_DIR=...` or pin a version with `RCDU_VERSION=v0.1.0`. From source with a Rust
 toolchain instead: `cargo install --git https://github.com/anhofmann/rcdu`.
 
-Already installed? `rcdu update` upgrades in place: it checks GitHub Releases, verifies the
-SHA-256 checksum, and atomically replaces the binary (downloads run through `curl`, the same
-tool the install script uses). `rcdu update --check` only reports whether a newer release exists.
+To upgrade, run the install script again: it replaces the binary with the latest release. There
+is no built-in updater, and rcdu itself never connects to the network.
 
 ## Usage
 
@@ -260,9 +259,9 @@ them as incomplete (`!`) instead of as empty.
 ## Portable, dependency-free binaries
 
 `rcdu`'s core — scan, sort, delete, JSON import/export — makes **no external process calls**: no
-`du`, no coreutils, nothing; it's pure Rust `std`. Two features deliberately shell out: `o` hands
-the selected entry to the platform's default handler, and `rcdu update` downloads through `curl`.
-The binaries are self-contained:
+`du`, no coreutils, nothing; it's pure Rust `std`. Two features deliberately start another
+program: `o` hands the selected entry to the platform's default handler, and `b` opens your
+shell. The binaries are self-contained:
 
 - **Linux** builds are **fully static musl** binaries: libc is baked in, there are no `.so`
   dependencies and no dynamic loader. Copy to any x86-64 or ARM64 Linux box — Alpine, Ubuntu,
@@ -307,9 +306,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | `dump.rs` | ncdu-compatible JSON import/export. |
 | `app.rs` | App state + key handling, modals (help/confirm), background delete and open. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
 | `ui.rs` | ratatui rendering: size bars, percentages, type indicators, popups. |
-| `update.rs` | `rcdu update`: self-update from GitHub Releases — fetch latest tag, download the platform asset via `curl`, verify its checksum, atomically replace the binary. |
-| `sha256.rs` | Minimal SHA-256 (FIPS 180-4) so update verification needs no external tools or crates. |
-| `main.rs` | Args, modes (scan / import / export / update), terminal lifecycle, event loop. |
+| `main.rs` | Args, modes (scan / import / export), terminal lifecycle, event loop. |
 
 ## Testing
 
@@ -326,9 +323,8 @@ buffered — verifying the concurrency and size-propagation logic.
 Implemented: live/progressive parallel scan, SSD-tuned threading, **navigation-prioritized
 scanning**, sort, apparent/disk toggle, delete (background, with the still-scanning safety gate,
 `-r`, and a guarded Ctrl-C), hard-link dedup, `--exclude` / `-X`, `-x` one-file-system, ncdu JSON
-import/export, open (`o`, via the platform's default handler), self-update (`rcdu update`, with
-checksum verification), help dialog, a memory-lean node representation, and static portable
-binaries.
+import/export, open (`o`, via the platform's default handler), help dialog, a memory-lean node
+representation, and static portable binaries.
 
 Possible future work: in-place refresh (`r`) of a subtree, the ncdu "shared/unique" size
 breakdown column, and a file-info panel. Further memory wins are available if needed (`u32`

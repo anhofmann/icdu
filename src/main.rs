@@ -6,9 +6,7 @@ mod dump;
 mod glob;
 mod model;
 mod scan;
-mod sha256;
 mod ui;
-mod update;
 
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -164,7 +162,6 @@ fn print_help() {
 
 USAGE:
     rcdu [PATH] [OPTIONS]
-    rcdu update [--check]
 
 ARGS:
     PATH                     directory to scan (default: current directory)
@@ -185,10 +182,6 @@ OPTIONS:
     -h, --help               show this help
     -V, --version            show version
 
-COMMANDS:
-    update [--check]         replace the binary with the latest GitHub release
-                             (downloads via curl, verifies SHA-256; --check only reports)
-
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         PgUp/PgDn,C-d/u page
@@ -205,15 +198,7 @@ KEYS:
 }
 
 fn main() {
-    // `rcdu update` is a subcommand, checked before PATH-style parsing.
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().map(String::as_str) == Some("update") {
-        let check_only = argv.iter().skip(1).any(|a| a == "--check");
-        let code = update::run(check_only);
-        std::process::exit(code);
-    }
-
-    let args = match parse_args(argv) {
+    let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("rcdu: {e}\nTry 'rcdu --help'.");
@@ -576,6 +561,81 @@ mod tests {
             plain_path(Path::new(r"\\?\.\PhysicalDrive0")),
             r"\\?\.\PhysicalDrive0"
         );
+    }
+
+    /// `update` used to be a subcommand that downloaded a release. It is a path like any other.
+    #[test]
+    fn update_is_an_ordinary_path() {
+        let args = parse_args(vec!["update".to_string()]).unwrap();
+        assert_eq!(args.path, PathBuf::from("update"));
+        // What followed the old subcommand is not swallowed either.
+        let Err(err) = parse_args(vec!["update".to_string(), "--check".to_string()]) else {
+            panic!("--check is not an option");
+        };
+        assert!(err.contains("--check"), "{err}");
+    }
+
+    /// The repository this build's releases are published from.
+    const REPO: &str = "anhofmann/rcdu";
+
+    /// The project this one started from. The README credits it with a link to the repository
+    /// itself; nothing may be fetched from there.
+    const ORIGIN: &str = "mayankasthana/rcdu";
+
+    /// GitHub links in `text` that point anywhere but the release repo, as `host` + path.
+    fn foreign_links(file: &str, text: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for host in ["github.com/", "githubusercontent.com/"] {
+            for (at, _) in text.match_indices(host) {
+                let rest = &text[at + host.len()..];
+                if rest.starts_with('$') {
+                    continue; // install.sh's own `$REPO` expansion
+                }
+                let path: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || "-_./".contains(*c))
+                    .collect();
+                // The README's credit link: the bare repository, never a path below it.
+                if file == "README.md" && path == ORIGIN {
+                    continue;
+                }
+                let repo = path.split('/').take(2).collect::<Vec<_>>().join("/");
+                if repo != REPO {
+                    found.push(format!("{host}{path}"));
+                }
+            }
+        }
+        found
+    }
+
+    /// `install.sh` and the README must fetch binaries from the repository that publishes this
+    /// project's releases, never from another account (issue #2).
+    #[test]
+    fn install_paths_name_the_release_repo() {
+        let install = include_str!("../install.sh");
+        assert!(
+            install.contains(&format!("REPO=\"{REPO}\"")),
+            "install.sh REPO="
+        );
+        for (file, text) in [
+            ("install.sh", install),
+            ("README.md", include_str!("../README.md")),
+        ] {
+            assert_eq!(foreign_links(file, text), Vec::<String>::new(), "{file}");
+        }
+    }
+
+    #[test]
+    fn only_the_bare_origin_link_is_exempt() {
+        let credit = "a fork of [rcdu](https://github.com/mayankasthana/rcdu) by";
+        assert!(foreign_links("README.md", credit).is_empty());
+        // A download path below the original repository is still foreign...
+        let download = "curl https://github.com/mayankasthana/rcdu/releases/latest/download/x";
+        assert_eq!(foreign_links("README.md", download).len(), 1);
+        let raw = "https://raw.githubusercontent.com/mayankasthana/rcdu/main/install.sh";
+        assert_eq!(foreign_links("README.md", raw).len(), 1);
+        // ...and install.sh gets no exemption at all.
+        assert_eq!(foreign_links("install.sh", credit).len(), 1);
     }
 
     /// `f` opens the search; inside it letters (even `q`, `j`) go to the query, arrows still
