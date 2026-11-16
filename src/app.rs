@@ -359,6 +359,24 @@ struct ScanHandle {
     rx: Receiver<Batch>,
     refresh: bool,
     alive: bool,
+    /// When this stream started, and the counted bytes it has delivered, in both metrics:
+    /// the footer shows the throughput of the streams that are running.
+    started: Instant,
+    apparent: u64,
+    disk: u64,
+}
+
+impl ScanHandle {
+    fn new(rx: Receiver<Batch>, refresh: bool, started: Instant) -> Self {
+        ScanHandle {
+            rx,
+            refresh,
+            alive: true,
+            started,
+            apparent: 0,
+            disk: 0,
+        }
+    }
 }
 
 pub struct App {
@@ -407,10 +425,6 @@ pub struct App {
     rescan_is_resync: bool,
     /// Generation counter for subtree rescans; each gets a disjoint scanner-id range.
     next_scan_base: u64,
-    /// Counted bytes grafted by live scans, for the footer's throughput display.
-    bytes_seen: u64,
-    /// When the current scan generation started; None until a scan is attached.
-    scan_started: Option<Instant>,
     /// A pending request to suspend the TUI and spawn `$SHELL` in this directory, consumed
     /// once per frame by the event loop (which owns the terminal).
     shell_request: Option<PathBuf>,
@@ -461,8 +475,6 @@ impl App {
             rescan_queued: None,
             rescan_is_resync: false,
             next_scan_base: 1,
-            bytes_seen: 0,
-            scan_started: None,
             shell_request: None,
             export_dir: None,
             confirm_hard_links: 0,
@@ -477,14 +489,10 @@ impl App {
     /// Attach the initial scan: its batch stream, its steering handle, and the options future
     /// subtree rescans should reuse (interactive scan mode only).
     pub fn attach_scan(&mut self, scan: Scan, opts: Opts) {
-        self.scans.push(ScanHandle {
-            rx: scan.events,
-            refresh: false,
-            alive: true,
-        });
+        self.scans
+            .push(ScanHandle::new(scan.events, false, Instant::now()));
         self.controls.push(scan.control);
         self.scan_opts = Some(opts);
-        self.scan_started = Some(Instant::now());
         self.refocus();
     }
 
@@ -515,13 +523,13 @@ impl App {
             loop {
                 match self.scans[i].rx.try_recv() {
                     Ok(batch) => {
-                        // Count the batch's counted bytes before `apply` moves it, for the
-                        // footer's throughput display.
-                        self.bytes_seen = batch
-                            .nodes
-                            .iter()
-                            .filter(|n| n.excluded == Excluded::No)
-                            .fold(self.bytes_seen, |sum, n| sum.saturating_add(n.apparent));
+                        // Count the batch's bytes before `apply` moves it, for the footer's
+                        // throughput display.
+                        let stream = &mut self.scans[i];
+                        for n in batch.nodes.iter().filter(|n| n.excluded == Excluded::No) {
+                            stream.apparent = stream.apparent.saturating_add(n.apparent);
+                            stream.disk = stream.disk.saturating_add(n.disk);
+                        }
                         self.tree.apply(batch);
                         applied += 1;
                         if applied >= cap {
@@ -653,18 +661,11 @@ impl App {
         self.tree.begin_refresh(idx, id_base);
         let scan = start_at(path, opts, id_base, Some(identity));
         self.prune_find();
-        self.scans.push(ScanHandle {
-            rx: scan.events,
-            refresh: true,
-            alive: true,
-        });
+        self.scans
+            .push(ScanHandle::new(scan.events, true, Instant::now()));
         self.controls.push(scan.control);
         self.refreshing_idx = Some(idx);
         self.scanning = true;
-        // A fresh generation: the throughput display reflects this rescan, not the bytes the
-        // original scan already brought in.
-        self.bytes_seen = 0;
-        self.scan_started = Some(Instant::now());
         Some(self.tree.path_of(idx))
     }
 
@@ -684,14 +685,29 @@ impl App {
         self.rescan_is_resync
     }
 
-    /// Counted bytes per second being grafted by the live scan, for the footer. None when no
-    /// scan is running; the first second reports the bytes seen so far.
+    /// Bytes per second the running scans are bringing in, for the footer, in the size
+    /// metric on screen. None when no scan is running.
     pub fn scan_rate(&self) -> Option<u64> {
-        if !self.scanning {
-            return None;
-        }
-        let started = self.scan_started?;
-        Some(self.bytes_seen / started.elapsed().as_secs().max(1))
+        self.scan_rate_at(Instant::now())
+    }
+
+    /// [`App::scan_rate`] at a given moment: the bytes of every stream that is still running,
+    /// over the time since the oldest of them started (at least one second, so the first
+    /// second reports what has been seen so far). Each stream keeps its own count, so a
+    /// rescan neither resets the figure of a scan that is still running nor inherits the
+    /// bytes of one that has finished.
+    fn scan_rate_at(&self, now: Instant) -> Option<u64> {
+        let running = || self.scans.iter().filter(|s| s.alive);
+        let started = running().map(|s| s.started).min()?;
+        let bytes = running().fold(0u64, |sum, s| {
+            sum.saturating_add(if self.disk_usage { s.disk } else { s.apparent })
+        });
+        Some(bytes / now.saturating_duration_since(started).as_secs().max(1))
+    }
+
+    /// Directories the running scans have not read yet, in the whole tree.
+    pub fn dirs_left(&self) -> u32 {
+        self.tree.nodes[self.tree.root].unscanned
     }
 
     /// Export the whole tree as it is right now (including deletions made this session) to the
@@ -2475,20 +2491,86 @@ mod tests {
         assert!(!app.show_item_count);
     }
 
-    /// The footer's throughput figure: bytes/sec while a scan runs, none otherwise.
-    #[test]
-    fn scan_rate_reports_bytes_per_second_while_scanning() {
-        let mut app = app_with_entries();
-        assert_eq!(app.scan_rate(), None, "no scan attached yet");
-
+    /// Attach a scan stream that started at `started`; the sender feeds it.
+    fn add_stream(app: &mut App, refresh: bool, started: Instant) -> Sender<Batch> {
+        let (tx, rx) = unbounded();
+        app.scans.push(ScanHandle::new(rx, refresh, started));
         app.scanning = true;
-        app.scan_started = Some(Instant::now());
-        app.bytes_seen = 4_000_000;
-        // Elapsed is sub-second, so the rate is the bytes seen in the first second.
-        assert_eq!(app.scan_rate(), Some(4_000_000));
+        tx
+    }
 
-        app.scanning = false;
-        assert_eq!(app.scan_rate(), None);
+    /// A batch with one file of the given sizes, for the directory with id `parent_id`.
+    fn sized_batch(parent_id: u64, name: &str, apparent: u64, disk: u64) -> Batch {
+        let mut batch = file_batch(name, apparent);
+        batch.parent_id = parent_id;
+        batch.nodes[0].disk = disk;
+        batch
+    }
+
+    /// The footer's throughput figure: bytes per second of the streams that are running, in
+    /// the size metric on screen; none when nothing is being scanned.
+    #[test]
+    fn scan_rate_counts_in_the_metric_on_screen() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        let t0 = Instant::now();
+        assert_eq!(app.scan_rate_at(t0), None, "no scan attached");
+
+        let tx = add_stream(&mut app, false, t0);
+        // A sparse file: 4 GB by its length, 8 MB on disk.
+        tx.send(sized_batch(0, "sparse", 4_000_000_000, 8_000_000))
+            .unwrap();
+        app.poll_scans(100);
+        // Within the first second the rate is what has been seen so far.
+        assert_eq!(app.scan_rate_at(t0), Some(8_000_000), "disk usage");
+        assert_eq!(
+            app.scan_rate_at(t0 + Duration::from_secs(4)),
+            Some(2_000_000)
+        );
+        app.on_key(KeyAction::ToggleUsage);
+        assert_eq!(
+            app.scan_rate_at(t0 + Duration::from_secs(4)),
+            Some(1_000_000_000),
+            "apparent size"
+        );
+
+        drop(tx);
+        app.poll_scans(100);
+        assert!(!app.scanning);
+        assert_eq!(app.scan_rate_at(t0 + Duration::from_secs(5)), None);
+    }
+
+    /// A rescan that starts while the first scan is still running does not reset the figure:
+    /// both streams count. When the first scan ends, the figure is the rescan's own.
+    #[test]
+    fn scan_rate_spans_a_rescan() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        let first = add_stream(&mut app, false, t0);
+        first.send(sized_batch(0, "a", 6_000, 6_000)).unwrap();
+        app.poll_scans(100);
+        assert_eq!(app.scan_rate_at(t0 + secs(2)), Some(3_000));
+
+        // Two seconds in, a rescan of some directory starts and delivers as well.
+        let base = SCAN_ID_STRIDE;
+        app.tree.begin_refresh(app.tree.root, base);
+        let rescan = add_stream(&mut app, true, t0 + secs(2));
+        rescan.send(sized_batch(base, "b", 2_000, 2_000)).unwrap();
+        app.poll_scans(100);
+        assert_eq!(
+            app.scan_rate_at(t0 + secs(4)),
+            Some(2_000),
+            "8,000 bytes in the 4 seconds since the older stream started"
+        );
+
+        // The first scan is done: what remains is the rescan, measured from its own start.
+        drop(first);
+        app.poll_scans(100);
+        assert!(app.scanning, "the rescan is still running");
+        assert_eq!(app.scan_rate_at(t0 + secs(4)), Some(1_000));
+        drop(rescan);
+        app.poll_scans(100);
+        assert_eq!(app.scan_rate_at(t0 + secs(4)), None);
     }
 
     /// The info popup's timestamps (dependency-free UTC formatting, leap days included).
@@ -3228,7 +3310,7 @@ mod tests {
 
     /// The footer's byte counter saturates like the totals do.
     #[test]
-    fn bytes_seen_saturates() {
+    fn scan_rate_saturates() {
         use crate::scan::NewNode;
         let huge = |name: &str, ino| NewNode {
             name: name.into(),
@@ -3245,20 +3327,18 @@ mod tests {
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), false, false, true);
         let (tx, rx) = crossbeam_channel::unbounded();
-        app.scans.push(ScanHandle {
-            rx,
-            refresh: false,
-            alive: true,
-        });
+        let started = Instant::now();
+        app.scans.push(ScanHandle::new(rx, false, started));
         tx.send(Batch {
             parent_id: 0,
             nodes: vec![huge("x", 2), huge("y", 3)],
             error: None,
         })
         .unwrap();
+        app.poll_scans(100);
+        assert_eq!(app.scan_rate_at(started), Some(u64::MAX));
         drop(tx);
         app.poll_scans(100);
-        assert_eq!(app.bytes_seen, u64::MAX);
         assert_eq!(app.size_of(app.tree.root), u64::MAX);
     }
 

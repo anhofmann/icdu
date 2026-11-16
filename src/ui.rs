@@ -621,64 +621,117 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// What the running scans have done and have left to do, for the footer:
+/// `scanning  12.3 MiB/s  1,234 dirs  56,789 files  321 dirs left`. The last figure is not a
+/// percentage (the total is unknown until the scan is over), but it shrinks to nothing, which
+/// tells the user the scan is getting there.
+fn scan_progress(rate: Option<u64>, dirs: u64, files: u64, left: u32) -> String {
+    let rate = rate
+        .map(|bytes| format!("  {}/s", fmt_size(bytes).trim_start()))
+        .unwrap_or_default();
+    let left = match left {
+        0 => String::new(),
+        1 => "  1 dir left".to_string(),
+        n => format!("  {} dirs left", fmt_count(n as usize)),
+    };
+    format!(
+        "scanning{rate}  {} dirs  {} files{left}",
+        fmt_count(dirs as usize),
+        fmt_count(files as usize)
+    )
+}
+
+/// How the footer line is shared when a status message and an activity (scan progress, a
+/// running deletion) both want it: the columns for the message and for the activity. The
+/// activity is shown in full or not at all, and only if the message keeps a usable width.
+fn footer_split(width: u16, activity: usize) -> (u16, u16) {
+    const MESSAGE_MIN: u16 = 24;
+    // Two columns of space between the two.
+    let wanted = u16::try_from(activity.saturating_add(2)).unwrap_or(u16::MAX);
+    if width >= wanted.saturating_add(MESSAGE_MIN) {
+        (width - wanted, wanted)
+    } else {
+        (width, 0)
+    }
+}
+
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    // A transient status message wins (it carries warnings like the armed force-quit prompt).
-    if let Some(msg) = &app.status {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {msg}"),
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ))),
-            area,
+    let spinner = SPINNER[app.tick % SPINNER.len()];
+    // What is going on in the background, if anything. A running deletion is the most
+    // important thing to surface.
+    let activity: Option<(String, Style)> = if let Some(didx) = app.deleting_idx() {
+        Some((
+            format!("{spinner} deleting {} …", app.tree.nodes[didx].name),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    } else if app.scanning {
+        let mut text = format!(
+            "{spinner} {}",
+            scan_progress(
+                app.scan_rate(),
+                app.tree.total_dirs,
+                app.tree.total_files,
+                app.dirs_left(),
+            )
         );
+        // An in-place rescan is worth naming.
+        if let Some(idx) = app.refreshing_idx {
+            text.push_str(&format!("  rescanning {}…", app.tree.nodes[idx].name));
+        }
+        Some((text, Style::default().fg(Color::Yellow)))
+    } else {
+        None
+    };
+
+    // A status message takes the line (it carries warnings like the armed force-quit
+    // prompt), but it shares it with the activity: a message from a background event, such
+    // as "opened …", must not hide the progress of the scan for as long as no key is pressed.
+    if let Some(msg) = &app.status {
+        let (msg_width, activity_width) = match &activity {
+            Some((text, _)) => footer_split(area.width, text.chars().count()),
+            None => (area.width, 0),
+        };
+        let [msg_area, activity_area] = Layout::horizontal([
+            Constraint::Length(msg_width),
+            Constraint::Length(activity_width),
+        ])
+        .areas(area);
+        f.render_widget(
+            Paragraph::new(Line::from(format!(" {msg}")))
+                .style(Style::default().fg(Color::Black).bg(Color::Yellow)),
+            msg_area,
+        );
+        if let (Some((text, style)), true) = (activity, activity_width > 0) {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("  {text}"), style))),
+                activity_area,
+            );
+        }
         return;
     }
 
-    // Otherwise a running deletion is the most important thing to surface; show it but keep the
-    // key hints so it's clear browsing still works.
-    if let Some(didx) = app.deleting_idx() {
-        let name = &app.tree.nodes[didx].name;
+    // During a deletion the key hints stay, cut down, so it's clear browsing still works.
+    if app.is_deleting() {
+        let (text, style) = activity.unwrap_or_default();
         let line = Line::from(vec![
             Span::styled(
                 " j/k move  l enter  h up  q quit ",
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" │ "),
-            Span::styled(
-                format!("{} deleting {name} …", SPINNER[app.tick % SPINNER.len()]),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(text, style),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
     }
 
-    let status = if app.scanning {
-        let rate = app
-            .scan_rate()
-            .map(|b| format!("  {}/s", fmt_size(b).trim_start()))
-            .unwrap_or_default();
-        format!(
-            "{} scanning{rate}  {} dirs  {} files",
-            SPINNER[app.tick % SPINNER.len()],
-            app.tree.total_dirs,
-            app.tree.total_files,
-        )
-    } else {
-        format!(
+    let status = match activity {
+        Some((text, _)) => text,
+        None => format!(
             "done  {} dirs  {} files",
-            app.tree.total_dirs, app.tree.total_files
-        )
-    };
-    // An in-place rescan is worth surfacing even after the initial scan finished.
-    let status = if let Some(idx) = app.refreshing_idx {
-        format!(
-            "{status}  {} rescanning {}…",
-            SPINNER[app.tick % SPINNER.len()],
-            app.tree.nodes[idx].name
-        )
-    } else {
-        status
+            fmt_count(app.tree.total_dirs as usize),
+            fmt_count(app.tree.total_files as usize)
+        ),
     };
     let sort = match app.sort {
         SortKey::Size => "size",
@@ -917,9 +970,9 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar_scale, confirm_export_text, dir_label, find_title, fmt_count, fmt_items,
-        hard_link_note, item_cell, left_to_read, list_title, listing_state, size_cell,
-        truncate_left, Listing, ITEMS_WIDTH,
+        bar_scale, confirm_export_text, dir_label, find_title, fmt_count, fmt_items, footer_split,
+        hard_link_note, item_cell, left_to_read, list_title, listing_state, scan_progress,
+        size_cell, truncate_left, Listing, ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
 
@@ -1101,6 +1154,44 @@ mod tests {
             "a row outgrew it"
         );
         assert_eq!(bar_scale(0, std::iter::empty()), 1, "never zero");
+    }
+
+    /// The footer's account of a running scan.
+    #[test]
+    fn scan_progress_says_what_is_left() {
+        assert_eq!(
+            scan_progress(Some(12 << 20), 1_234, 56_789, 321),
+            "scanning  12.0 MiB/s  1,234 dirs  56,789 files  321 dirs left"
+        );
+        assert_eq!(
+            scan_progress(None, 1, 0, 1),
+            "scanning  1 dirs  0 files  1 dir left"
+        );
+        // The last batches are in but the streams have not closed yet.
+        assert_eq!(
+            scan_progress(Some(0), 10, 20, 0),
+            "scanning  0   B/s  10 dirs  20 files"
+        );
+    }
+
+    /// A status message and the scan progress share the footer when both fit; otherwise the
+    /// message has it alone. The progress is never cut off in the middle.
+    #[test]
+    fn footer_split_keeps_the_progress_whole() {
+        assert_eq!(footer_split(120, 60), (58, 62));
+        assert_eq!(
+            footer_split(86, 60),
+            (24, 62),
+            "just enough for the message"
+        );
+        assert_eq!(
+            footer_split(85, 60),
+            (85, 0),
+            "too narrow: the message alone"
+        );
+        assert_eq!(footer_split(40, 60), (40, 0));
+        assert_eq!(footer_split(0, 0), (0, 0));
+        assert_eq!(footer_split(100, usize::MAX), (100, 0));
     }
 
     #[test]

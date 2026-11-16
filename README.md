@@ -139,6 +139,10 @@ Sizes are live, so the screen says which of them are final:
 
 The same `…` marks unfinished directories in the search results.
 
+The footer shows what the scan has done and what is left: the size found per second (in the
+metric on screen), directories and files seen, and the number of directories still to be read in
+the whole tree. A status message shares the line with this progress and does not hide it.
+
 ### Shelling out
 
 Press `b` to suspend the TUI and run `$SHELL` interactively in the directory you are viewing
