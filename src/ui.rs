@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{find_ci, indicator, App, Find, Modal, SortKey, TopFiles, FIND_CAP};
+use crate::app::{find_ci, indicator, App, Find, Modal, SortKey, TopFiles};
 use crate::model::{Excluded, Node, NodeKind};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -205,9 +205,51 @@ fn truncate_left(path: &str, width: usize) -> usize {
     }
 }
 
-/// The whole-tree search popup: the query line, one row per hit (path relative to the scan
-/// root, size, the matched part of the name highlighted), and the match count and progress
-/// of the running pass in the title. Paths are only built for the rows on screen.
+/// The search popup's title: what is searched, and once a query runs, the match count and the
+/// progress of the pass. `scope` is the name of the directory a scoped search is limited to,
+/// `shown` the number of hits kept (fewer than `total` once the cap is reached), `progress`
+/// the percentage done while the pass is still running.
+fn find_title(
+    searching: bool,
+    total: usize,
+    shown: usize,
+    scope: Option<&str>,
+    progress: Option<u8>,
+) -> String {
+    let place = |whole: &str| match scope {
+        Some(dir) => format!("under {dir}"),
+        None => whole.to_string(),
+    };
+    if !searching {
+        return format!(" Search {} ", place("the whole tree"));
+    }
+    let place = place("in the whole tree");
+    let running = progress.map_or(String::new(), |pct| format!(" · searching… {pct}%"));
+    if total > shown {
+        let hint = if progress.is_some() {
+            ""
+        } else {
+            " — refine the query"
+        };
+        format!(" {}+ matches {place}{running}{hint} ", fmt_count(shown))
+    } else {
+        let s = if total == 1 { "" } else { "es" };
+        format!(" {} match{s} {place}{running} ", fmt_count(total))
+    }
+}
+
+/// A directory name for a title: at most `width` columns, cut on the left, with a trailing `/`.
+fn dir_label(name: &str, width: usize) -> String {
+    let cut = truncate_left(name, width);
+    let ellipsis = if cut > 0 { "…" } else { "" };
+    let slash = if name.ends_with('/') { "" } else { "/" };
+    format!("{ellipsis}{}{slash}", &name[cut..])
+}
+
+/// The search popup: the query line, one row per hit (path, size, the matched part of the name
+/// highlighted), and the scope, match count and progress of the running pass in the title.
+/// Paths are relative to the scan root, or to the viewed directory when the search is limited
+/// to it. They are only built for the rows on screen.
 fn render_find(f: &mut Frame, app: &App, find: &Find) {
     let width = f.area().width.saturating_sub(4).clamp(28, 120);
     let height = f.area().height.saturating_sub(2).max(7);
@@ -215,24 +257,17 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
     f.render_widget(Clear, area);
 
     let busy = find.busy(&app.tree);
-    let progress = if busy {
-        let pct = find.cursor as f64 / app.tree.nodes.len().max(1) as f64 * 100.0;
-        format!(" · searching… {pct:.0}%")
-    } else {
-        String::new()
-    };
-    let title = if find.active.is_none() {
-        " Search the whole tree ".to_string()
-    } else if find.capped() {
-        let hint = if busy { "" } else { " — refine the query" };
-        format!(
-            " {}+ matches{progress}{hint} ",
-            fmt_count(FIND_CAP.min(find.hits.len()))
-        )
-    } else {
-        let s = if find.total == 1 { "" } else { "es" };
-        format!(" {} match{s}{progress} ", fmt_count(find.total))
-    };
+    let progress =
+        busy.then(|| (find.cursor as f64 / app.tree.nodes.len().max(1) as f64 * 100.0) as u8);
+    let scope = find.scope();
+    let scope_name = scope.map(|dir| dir_label(&app.tree.nodes[dir].name, 30));
+    let title = find_title(
+        find.active.is_some(),
+        find.total,
+        find.hits.len(),
+        scope_name.as_deref(),
+        progress,
+    );
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -247,7 +282,7 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " find ",
+                " search ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -260,9 +295,17 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
 
     let dim = Style::default().fg(Color::DarkGray);
     if find.hits.is_empty() {
-        let msg = match &find.active {
-            None if find.query.is_empty() => "  type to search entry names across the whole tree",
-            Some(q) if *q == find.query && !busy => "  no matches",
+        let msg = match (&find.active, scope) {
+            (None, None) if find.query.is_empty() => {
+                "  type to search entry names across the whole tree"
+            }
+            (None, Some(_)) if find.query.is_empty() => {
+                "  type to search entry names below this directory"
+            }
+            (Some(q), None) if *q == find.query && !busy => "  no matches",
+            (Some(q), Some(_)) if *q == find.query && !busy => {
+                "  no matches below this directory (Tab searches the whole tree)"
+            }
             _ => "",
         };
         f.render_widget(
@@ -284,7 +327,7 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
             .iter()
             .map(|&idx| {
                 let n = &app.tree.nodes[idx];
-                let mut path = app.tree.rel_path_of(idx);
+                let mut path = app.tree.rel_path_from(idx, scope.unwrap_or(app.tree.root));
                 // The name is the path's last component; locate the match inside it.
                 let name_start = path.len() - n.name.len();
                 let hit = find_ci(&n.name, q).map(|m| (name_start + m, name_start + m + q.len()));
@@ -325,9 +368,16 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
     } else {
         "apparent size"
     };
+    let other = if scope.is_some() {
+        "whole tree"
+    } else {
+        "this directory only"
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(" ↑/↓ PgUp/PgDn move · Enter go to entry · Esc close   (sizes: {metric})"),
+            format!(
+                " ↑/↓ PgUp/PgDn move · Enter go to entry · Tab {other} · Esc close   (sizes: {metric})"
+            ),
             dim,
         ))),
         hint_area,
@@ -452,10 +502,6 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         } else {
             " (empty) ".to_string()
         }
-    } else if app.filter.is_some() {
-        // When a filter is active, show how many of the directory's entries match.
-        let total = app.tree.nodes[app.cur].children.len();
-        format!(" {} of {} items ", kids.len(), total)
     } else {
         format!(" {} items ", kids.len())
     };
@@ -481,27 +527,6 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ))),
             area,
         );
-        return;
-    }
-
-    // While a filter is being typed, the input line replaces the hints.
-    if app.searching {
-        let q = app.filter.as_deref().unwrap_or("");
-        let line = Line::from(vec![
-            Span::styled(
-                " filter ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" /{q}▌")),
-            Span::styled(
-                "  Enter apply · Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
         return;
     }
 
@@ -555,14 +580,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         SortKey::Size => "size",
         SortKey::Name => "name",
     };
-    let mut help = format!(" ? help  d delete  s sort:{sort}  a usage  q quit");
-    if let Some(q) = &app.filter {
-        // Keep the applied filter visible (with match counts) so it's never silently on.
-        let matches = app.sorted_children().len();
-        let total = app.tree.nodes[app.cur].children.len();
-        help.push_str(&format!("  │  /{q} ({matches}/{total})"));
-    }
-    help.push_str(&format!("   │   {status}"));
+    let help =
+        format!(" ? help  / search  d delete  s sort:{sort}  a usage  q quit   │   {status}");
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             help,
@@ -609,8 +628,9 @@ fn render_help(f: &mut Frame) {
         Line::from("  g / G             jump to top / bottom"),
         Line::from("  PgUp / PgDn, C-d / C-u  page up / down"),
         Line::from("  s                 toggle sort (size ↔ name)"),
-        Line::from("  /                 filter entries by name (Enter applies, Esc cancels)"),
-        Line::from("  f                 search the whole tree by name (Enter goes there)"),
+        Line::from(
+            "  /                 search by name (Enter goes there, Tab: this directory only)",
+        ),
         Line::from("  a                 toggle apparent ↔ disk usage"),
         Line::from("  c                 toggle item count column (entries below each dir)"),
         Line::from("  d                 delete selected (confirm; needs full scan)"),
@@ -763,8 +783,53 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{confirm_export_text, fmt_count, fmt_items, item_cell, truncate_left, ITEMS_WIDTH};
+    use super::{
+        confirm_export_text, dir_label, find_title, fmt_count, fmt_items, item_cell, truncate_left,
+        ITEMS_WIDTH,
+    };
     use crate::model::{Excluded, NodeKind, Tree};
+
+    /// The title always says what is being searched, so the scope is never silently on.
+    #[test]
+    fn find_title_names_the_scope() {
+        assert_eq!(
+            find_title(false, 0, 0, None, None),
+            " Search the whole tree "
+        );
+        assert_eq!(
+            find_title(false, 0, 0, Some("docs/"), None),
+            " Search under docs/ "
+        );
+        assert_eq!(
+            find_title(true, 1, 1, None, None),
+            " 1 match in the whole tree "
+        );
+        assert_eq!(
+            find_title(true, 1_234, 1_234, Some("docs/"), Some(40)),
+            " 1,234 matches under docs/ · searching… 40% "
+        );
+        assert_eq!(
+            find_title(true, 0, 0, Some("docs/"), None),
+            " 0 matches under docs/ "
+        );
+        // Past the cap the count is a lower bound; the hint waits until the pass is done.
+        assert_eq!(
+            find_title(true, 25_000, 10_000, None, Some(7)),
+            " 10,000+ matches in the whole tree · searching… 7% "
+        );
+        assert_eq!(
+            find_title(true, 25_000, 10_000, Some("docs/"), None),
+            " 10,000+ matches under docs/ — refine the query "
+        );
+    }
+
+    #[test]
+    fn dir_label_ends_in_one_slash_and_is_cut_on_the_left() {
+        assert_eq!(dir_label("docs", 30), "docs/");
+        assert_eq!(dir_label("/", 30), "/");
+        assert_eq!(dir_label("/home/me/projects/thing", 12), "…/thing/");
+        assert_eq!(dir_label("averyveryverylongname", 8), "…ongname/");
+    }
 
     /// Exact while it fits, compact (rounded down) beyond, never wider than the column.
     #[test]

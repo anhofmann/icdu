@@ -459,15 +459,18 @@ impl Tree {
         false
     }
 
-    /// The path of a node relative to the root (`sub/dir/file`), for compact display. Empty
-    /// for the root itself.
-    pub fn rel_path_of(&self, idx: NodeIdx) -> String {
+    /// The path of a node relative to `base`, one of its ancestors (`sub/dir/file`), for
+    /// compact display. Empty for `base` itself. The walk also ends at the root, so a `base`
+    /// that is not an ancestor yields the path relative to the root.
+    pub fn rel_path_from(&self, idx: NodeIdx, base: NodeIdx) -> String {
         let mut parts = Vec::new();
         let mut cur = idx;
-        while cur != self.root {
-            parts.push(self.nodes[cur].name.as_str());
+        while cur != base {
             match self.nodes[cur].parent {
-                Some(p) => cur = p,
+                Some(p) => {
+                    parts.push(self.nodes[cur].name.as_str());
+                    cur = p;
+                }
                 None => break,
             }
         }
@@ -628,6 +631,30 @@ mod tests {
             read_error: false,
             dir_id: Some(id),
         }
+    }
+
+    /// Display paths are relative to an ancestor and never start with its name.
+    #[test]
+    fn rel_path_from_stops_at_the_base() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("a", 1)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![dir("b", 2)],
+            error: None,
+        });
+        let a = t.nodes[t.root].children[0];
+        let b = t.nodes[a].children[0];
+        assert_eq!(t.rel_path_from(b, t.root), "a/b");
+        assert_eq!(t.rel_path_from(b, a), "b");
+        assert_eq!(t.rel_path_from(a, a), "");
+        assert_eq!(t.rel_path_from(t.root, t.root), "");
+        // Not an ancestor: the walk ends at the root.
+        assert_eq!(t.rel_path_from(a, b), "a");
     }
 
     /// A directory is not deletable until its entire subtree has been scanned.

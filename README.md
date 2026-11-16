@@ -85,8 +85,7 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `g` / `G` | jump to top / bottom |
 | `PgUp` / `PgDn`, `Ctrl-d` / `Ctrl-u` | page up / down |
 | `s` | toggle sort (size ↔ name) |
-| `/` | filter entries by name (type to filter live, Enter applies, Esc cancels) |
-| `f` | search the whole tree by name; `Enter` jumps to the selected match |
+| `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `c` | toggle the item count column (entries below each directory) |
 | `d` | delete selected entry (asks to confirm) |
@@ -112,24 +111,18 @@ return.
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
 Symlinks are never followed (counted as the link itself), matching ncdu's default.
 
-### Filtering
+### Searching
 
-Press `/` and type: the view narrows to entries whose name contains the query
-(case-insensitive), and the selection jumps to the first match. While a filter is applied the
-title shows `N of M items` and the footer echoes the query with match counts, so a filter is
-never silently on. `Enter` applies it (navigation, delete, and open then operate only on the
-matches); `Esc` cancels and restores the previous selection. The filter applies to whichever
-directory you're viewing until cleared.
+Press `/` to ask: *where in this tree is anything called X?* Type part of a name
+(case-insensitive); 100 ms after your last keystroke every entry in the tree is searched, and the
+matches are listed with their path and size, largest first, with the matched part highlighted.
+`↑`/`↓` and `PgUp`/`PgDn` move (letters all go to the query), `Enter` jumps to the directory
+containing the selected match with it highlighted, and `Esc` closes the popup without moving.
 
-### Searching the whole tree
-
-`/` only narrows the directory you're viewing. Press `f` to ask the other question: *where in
-this tree is anything called X?* Type part of a name (case-insensitive, the same matching as
-`/`); 100 ms after your last keystroke every entry in the tree is searched, and the matches are
-listed with their path relative to the scan root and their size, largest first, with the
-matched part highlighted. `↑`/`↓` and `PgUp`/`PgDn` move (letters all go to the query),
-`Enter` jumps to the directory containing the selected match with it highlighted, and `Esc`
-closes the popup without moving.
+`Tab` switches what is searched: the whole tree (the default), or only what lies below the
+directory you are viewing. Limited to a directory, paths are shown relative to it. The title
+always names the scope, for example `12 matches under node_modules/`. This is the way to narrow
+down a huge directory: go into it, press `/`, then `Tab`.
 
 The search runs in slices between frames, so the UI stays responsive even on trees with
 millions of entries; the title shows the match count and progress. While a scan or rescan is

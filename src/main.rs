@@ -185,7 +185,7 @@ OPTIONS:
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/Backspace     go up         PgUp/PgDn,C-d/u page
-    /               filter names  f               search whole tree
+    /               search names (Tab: whole tree / this directory)
     s               toggle sort   t               top files
     r               rescan dir    a               apparent/disk
     d               delete (confirm; full scan)
@@ -475,7 +475,7 @@ fn decode_key(
     mode: InputMode,
     page: usize,
 ) -> Option<KeyAction> {
-    // Ctrl-C quits even while a filter or search query is being typed.
+    // Ctrl-C quits even while a search query is being typed.
     if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
         return Some(KeyAction::Quit);
     }
@@ -491,16 +491,8 @@ fn decode_key(
             KeyCode::Home => KeyAction::Top,
             KeyCode::End => KeyAction::Bottom,
             KeyCode::Enter => KeyAction::Enter,
+            KeyCode::Tab => KeyAction::FindScope,
             KeyCode::Esc => KeyAction::Cancel,
-            _ => return None,
-        });
-    }
-    if mode == InputMode::Filter {
-        return Some(match code {
-            KeyCode::Char(c) => KeyAction::FilterChar(c),
-            KeyCode::Backspace => KeyAction::FilterBackspace,
-            KeyCode::Enter => KeyAction::FilterConfirm,
-            KeyCode::Esc => KeyAction::FilterCancel,
             _ => return None,
         });
     }
@@ -529,8 +521,7 @@ fn decode_key(
         KeyCode::Char('e') => KeyAction::Export,
         KeyCode::Char('x') | KeyCode::Char('!') => KeyAction::NextError,
         KeyCode::Char('b') => KeyAction::Shell,
-        KeyCode::Char('/') => KeyAction::Search,
-        KeyCode::Char('f') => KeyAction::Find,
+        KeyCode::Char('/') => KeyAction::Find,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
@@ -638,16 +629,23 @@ mod tests {
         assert_eq!(foreign_links("install.sh", credit).len(), 1);
     }
 
-    /// `f` opens the search; inside it letters (even `q`, `j`) go to the query, arrows still
-    /// navigate, Esc cancels and Ctrl-C still quits.
+    /// `/` opens the search, and it is the only key that does; inside it letters (even `q`,
+    /// `j`) go to the query, arrows still navigate, Tab switches the scope, Esc cancels and
+    /// Ctrl-C still quits.
     #[test]
     fn decode_key_routes_find_mode() {
         let none = KeyModifiers::NONE;
         let dec = |code, mode| decode_key(code, none, mode, 10);
         assert!(matches!(
-            dec(KeyCode::Char('f'), InputMode::Normal),
+            dec(KeyCode::Char('/'), InputMode::Normal),
             Some(KeyAction::Find)
         ));
+        assert!(dec(KeyCode::Char('f'), InputMode::Normal).is_none());
+        assert!(matches!(
+            dec(KeyCode::Tab, InputMode::Find),
+            Some(KeyAction::FindScope)
+        ));
+        assert!(dec(KeyCode::Tab, InputMode::Normal).is_none());
         for c in ['q', 'j', 'f', '/'] {
             assert!(
                 matches!(dec(KeyCode::Char(c), InputMode::Find), Some(KeyAction::FindChar(x)) if x == c),
@@ -703,7 +701,7 @@ mod tests {
         assert_eq!(a.path, PathBuf::from("/tmp"));
     }
 
-    /// Plain `c` toggles the item count column; Ctrl-C still quits, and while a filter is
+    /// Plain `c` toggles the item count column; Ctrl-C still quits, and while a search is
     /// typed `c` goes to the query.
     #[test]
     fn decode_key_maps_c_to_item_count_toggle() {
@@ -722,8 +720,8 @@ mod tests {
             Some(KeyAction::Quit)
         ));
         assert!(matches!(
-            decode_key(KeyCode::Char('c'), none, InputMode::Filter, 10),
-            Some(KeyAction::FilterChar('c'))
+            decode_key(KeyCode::Char('c'), none, InputMode::Find, 10),
+            Some(KeyAction::FindChar('c'))
         ));
     }
 

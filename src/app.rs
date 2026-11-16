@@ -49,7 +49,7 @@ pub const FIND_CAP: usize = 10_000;
 /// The shortest interval between re-sorts of the hit list while it grows or sizes change.
 const FIND_RESORT: Duration = Duration::from_millis(250);
 
-/// State of the whole-tree search popup (`f`).
+/// State of the search popup (`/`).
 ///
 /// The search is one linear pass over `tree.nodes`, sliced across frames by a cursor so a huge
 /// tree never blocks the UI. Nodes are only ever appended, so the same cursor also picks up
@@ -57,6 +57,10 @@ const FIND_RESORT: Duration = Duration::from_millis(250);
 pub struct Find {
     /// The query being typed.
     pub query: String,
+    /// The directory being viewed behind the popup. `App::find_tick` keeps it current.
+    pub dir: NodeIdx,
+    /// Tab switches between the whole tree (false) and what lies below `dir` (true).
+    pub scoped: bool,
     /// The query was edited since the last tick; the next tick (re)arms the debounce.
     edited: bool,
     /// When the debounced query is due to run.
@@ -76,9 +80,11 @@ pub struct Find {
 }
 
 impl Find {
-    fn new() -> Self {
+    fn new(dir: NodeIdx) -> Self {
         Find {
             query: String::new(),
+            dir,
+            scoped: false,
             edited: false,
             due: None,
             active: None,
@@ -101,7 +107,28 @@ impl Find {
         self.total > self.hits.len()
     }
 
-    /// Start a fresh pass over the whole tree for the active query.
+    /// The directory the search is limited to, if it is.
+    pub fn scope(&self) -> Option<NodeIdx> {
+        self.scoped.then_some(self.dir)
+    }
+
+    /// Switch between the whole tree and the viewed directory, and search again.
+    fn toggle_scope(&mut self) {
+        self.scoped = !self.scoped;
+        self.restart();
+    }
+
+    /// The viewed directory changed behind the popup (a deletion finished and took it away).
+    fn set_dir(&mut self, dir: NodeIdx) {
+        if self.dir != dir {
+            self.dir = dir;
+            if self.scoped {
+                self.restart();
+            }
+        }
+    }
+
+    /// Start a fresh pass over the tree for the active query.
     fn restart(&mut self) {
         self.cursor = 0;
         self.hits.clear();
@@ -129,9 +156,13 @@ impl Find {
         let end = len.min(self.cursor.saturating_add(budget));
         // Tombstones exist only after a delete or rescan; until then skip the parent walk.
         let check_attached = tree.detached > 0;
+        // The whole pass stays linear: the walk up to the scope is paid only by names that
+        // match. Scoped to the root is the whole tree.
+        let scope = self.scope().filter(|&d| d != tree.root);
         for i in self.cursor..end {
             if i != tree.root
                 && contains_ci(&tree.nodes[i].name, q)
+                && scope.is_none_or(|d| i != d && tree.is_within(i, d))
                 && (!check_attached || tree.is_attached(i))
             {
                 self.total += 1;
@@ -213,9 +244,7 @@ impl Find {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
     Normal,
-    /// Typing the `/` filter.
-    Filter,
-    /// The whole-tree search popup is open: letters go to its query.
+    /// The search popup is open: letters go to its query.
     Find,
 }
 
@@ -231,7 +260,7 @@ pub enum Modal {
     TopFiles(Box<TopFiles>),
     /// Details of the selected entry (tree data plus a fresh on-disk stat).
     Info(NodeIdx),
-    /// Whole-tree search by name.
+    /// Search by name, in the whole tree or below the viewed directory.
     Find(Box<Find>),
 }
 
@@ -265,13 +294,6 @@ pub struct App {
     /// Currently highlighted child node (by identity), if any.
     pub selected: Option<NodeIdx>,
     pub sort: SortKey,
-    /// Incremental name filter (`/`): `Some(query)` while a filter is applied — possibly empty
-    /// while still typing — `None` when nothing is filtered.
-    pub filter: Option<String>,
-    /// True while the user is typing the filter; input is captured for it.
-    pub searching: bool,
-    /// Selection to restore if the filter being typed is cancelled.
-    pre_search_selected: Option<NodeIdx>,
     /// Show on-disk usage (`st_blocks`) vs. apparent size (`st_size`).
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
@@ -336,9 +358,6 @@ impl App {
             cur: tree.root,
             selected: None,
             sort: SortKey::Size,
-            filter: None,
-            searching: false,
-            pre_search_selected: None,
             disk_usage,
             show_item_count: false,
             scanning,
@@ -642,14 +661,9 @@ impl App {
         }
     }
 
-    /// Children of the current directory, sorted for display (largest first, or by name), with
-    /// the active name filter (if any) applied on top.
+    /// Children of the current directory, sorted for display (largest first, or by name).
     pub fn sorted_children(&self) -> Vec<NodeIdx> {
-        let mut kids = self.order_children(self.tree.nodes[self.cur].children.clone());
-        if let Some(q) = &self.filter {
-            kids.retain(|&k| contains_ci(&self.tree.nodes[k].name, q));
-        }
-        kids
+        self.order_children(self.tree.nodes[self.cur].children.clone())
     }
 
     /// Sort children the way every view presents them (largest first, or by name), so
@@ -738,12 +752,6 @@ impl App {
             Some(sel) if kids.contains(&sel) => {}
             _ => self.selected = kids.first().copied(),
         }
-    }
-
-    /// While typing a filter, keep the selection on the first entry matching it.
-    fn snap_to_first_match(&mut self) {
-        let kids = self.sorted_children();
-        self.selected = kids.first().copied();
     }
 
     /// Open the top-files popup for the directory currently being viewed.
@@ -896,18 +904,17 @@ impl App {
     pub fn input_mode(&self) -> InputMode {
         if matches!(self.modal, Modal::Find(_)) {
             InputMode::Find
-        } else if self.searching {
-            InputMode::Filter
         } else {
             InputMode::Normal
         }
     }
 
-    /// Advance the whole-tree search, if its popup is open: debounce the query, look at up to
-    /// `budget` nodes, and re-sort the hits now and then. Called once per frame, after the
-    /// scan batches are applied, so live results show up in the same frame.
+    /// Advance the search, if its popup is open: debounce the query, look at up to `budget`
+    /// nodes, and re-sort the hits now and then. Called once per frame, after the scan batches
+    /// are applied, so live results show up in the same frame.
     pub fn find_tick(&mut self, now: Instant, budget: usize) {
         if let Modal::Find(f) = &mut self.modal {
+            f.set_dir(self.cur);
             f.tick(&self.tree, self.disk_usage, self.scanning, now, budget);
         }
     }
@@ -1025,6 +1032,10 @@ impl App {
                         f.edited = true;
                         true
                     }
+                    KeyAction::FindScope => {
+                        f.toggle_scope();
+                        true
+                    }
                     KeyAction::Down => {
                         f.move_selection(1);
                         true
@@ -1072,40 +1083,6 @@ impl App {
             Modal::None => {}
         }
 
-        // While typing a filter, capture input: characters extend the query, Backspace erases,
-        // Enter applies it, Esc discards it and restores the prior selection. Navigation keys
-        // are inert meanwhile (they'd otherwise act on half-typed queries).
-        if self.searching {
-            match action {
-                KeyAction::FilterChar(c) => {
-                    if let Some(q) = &mut self.filter {
-                        q.push(c);
-                    }
-                    self.snap_to_first_match();
-                }
-                KeyAction::FilterBackspace => {
-                    if let Some(q) = &mut self.filter {
-                        q.pop();
-                    }
-                    self.snap_to_first_match();
-                }
-                KeyAction::FilterConfirm => {
-                    self.searching = false;
-                    if self.filter.as_ref().is_none_or(|q| q.is_empty()) {
-                        self.filter = None;
-                    }
-                }
-                KeyAction::FilterCancel => {
-                    self.searching = false;
-                    self.filter = None;
-                    self.selected = self.pre_search_selected.take();
-                    self.ensure_selection(&self.sorted_children());
-                }
-                _ => {}
-            }
-            return;
-        }
-
         // Any key other than a repeated quit dismisses a stale status and disarms a pending
         // force-quit (so the two-press abort only triggers on consecutive quits).
         if !matches!(action, KeyAction::Quit) {
@@ -1148,14 +1125,6 @@ impl App {
                     SortKey::Name => SortKey::Size,
                 };
             }
-            KeyAction::Search => {
-                self.searching = true;
-                self.status = None;
-                self.pre_search_selected = self.selected;
-                if self.filter.is_none() {
-                    self.filter = Some(String::new());
-                }
-            }
             KeyAction::ToggleUsage => self.disk_usage = !self.disk_usage,
             KeyAction::ToggleItemCount => self.show_item_count = !self.show_item_count,
             KeyAction::Help => self.modal = Modal::Help,
@@ -1167,15 +1136,10 @@ impl App {
             KeyAction::Export => self.request_export(),
             KeyAction::NextError => self.jump_to_next_error(),
             KeyAction::Shell => self.request_shell(),
-            KeyAction::Find => self.modal = Modal::Find(Box::new(Find::new())),
+            KeyAction::Find => self.modal = Modal::Find(Box::new(Find::new(self.cur))),
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Only produced while the search popup is open, which handles them above.
-            KeyAction::FindChar(_) | KeyAction::FindBackspace => {}
-            // Handled by the search-mode block above; unreachable here.
-            KeyAction::FilterChar(_)
-            | KeyAction::FilterBackspace
-            | KeyAction::FilterConfirm
-            | KeyAction::FilterCancel => {}
+            KeyAction::FindChar(_) | KeyAction::FindBackspace | KeyAction::FindScope => {}
         }
     }
 
@@ -1509,11 +1473,6 @@ pub enum KeyAction {
     Open,
     Confirm,
     Cancel,
-    Search,
-    FilterChar(char),
-    FilterBackspace,
-    FilterConfirm,
-    FilterCancel,
     TopFiles,
     Refresh,
     Info,
@@ -1523,11 +1482,13 @@ pub enum KeyAction {
     Export,
     NextError,
     Shell,
-    /// Open the whole-tree search popup.
+    /// Open the search popup.
     Find,
     /// A character typed into the search popup's query.
     FindChar(char),
     FindBackspace,
+    /// Switch the search between the whole tree and the viewed directory.
+    FindScope,
 }
 
 /// Create the first free `rcdu-dump*.json` in `dir`, so consecutive exports never clobber each
@@ -1581,10 +1542,9 @@ pub fn fmt_time(secs: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }
 
-/// Case-insensitive substring test used by the `/` filter and the whole-tree search. ASCII
-/// letters compare case-insensitively; other bytes must match exactly (a plain byte-substring
-/// test, so multi-byte UTF-8 names can't produce false positives). An empty needle matches
-/// everything, so a just-opened (still-empty) filter hides nothing.
+/// Case-insensitive substring test used by the search. ASCII letters compare
+/// case-insensitively; other bytes must match exactly (a plain byte-substring test, so
+/// multi-byte UTF-8 names can't produce false positives). An empty needle matches everything.
 fn contains_ci(haystack: &str, needle: &str) -> bool {
     find_ci(haystack, needle).is_some()
 }
@@ -1635,13 +1595,6 @@ mod tests {
         App::new(t, true, false, false)
     }
 
-    fn shown_names(app: &App) -> Vec<&str> {
-        app.sorted_children()
-            .iter()
-            .map(|&k| app.tree.nodes[k].name.as_str())
-            .collect()
-    }
-
     #[test]
     fn contains_ci_matches_ascii_case_insensitively() {
         assert!(contains_ci("Hello, World", "WORLD"));
@@ -1653,54 +1606,6 @@ mod tests {
             "non-ASCII compares exactly"
         );
         assert!(contains_ci("résumé", "sum"));
-    }
-
-    #[test]
-    fn filter_narrows_live_and_applies_on_enter() {
-        let mut app = app_with_entries();
-        // Opening the filter (empty query) hides nothing.
-        app.on_key(KeyAction::Search);
-        assert_eq!(app.sorted_children().len(), 4);
-        app.on_key(KeyAction::FilterChar('b'));
-        assert_eq!(shown_names(&app), vec!["Beta", "banner"]);
-        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "Beta");
-        assert!(app.searching);
-
-        app.on_key(KeyAction::FilterChar('a'));
-        assert_eq!(shown_names(&app), vec!["banner"]);
-        assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "banner");
-
-        app.on_key(KeyAction::FilterConfirm);
-        assert!(!app.searching);
-        assert_eq!(shown_names(&app), vec!["banner"], "filter persists");
-    }
-
-    #[test]
-    fn filter_cancel_restores_previous_selection() {
-        let mut app = app_with_entries();
-        app.on_key(KeyAction::Down); // select "banner" (2nd by size: 30, 20, 10, 5)
-        let before = app.selected;
-        app.on_key(KeyAction::Search);
-        app.on_key(KeyAction::FilterChar('g')); // only "gamma" matches
-        assert_eq!(shown_names(&app), vec!["gamma"]);
-        assert_ne!(app.selected, before);
-
-        app.on_key(KeyAction::FilterCancel);
-        assert!(app.filter.is_none());
-        assert_eq!(app.selected, before, "selection restored");
-        assert_eq!(shown_names(&app).len(), 4);
-    }
-
-    #[test]
-    fn empty_query_confirms_to_no_filter() {
-        let mut app = app_with_entries();
-        app.on_key(KeyAction::Search);
-        app.on_key(KeyAction::FilterChar('z'));
-        assert!(app.sorted_children().is_empty());
-        app.on_key(KeyAction::FilterBackspace);
-        app.on_key(KeyAction::FilterConfirm);
-        assert!(app.filter.is_none(), "empty query clears the filter");
-        assert_eq!(app.sorted_children().len(), 4);
     }
 
     fn app_with_tree_for_top_files() -> App {
@@ -3080,6 +2985,133 @@ mod tests {
         app.find_tick(now, usize::MAX);
         assert_eq!(hit_names(&app), vec!["hit-root"]);
         assert_eq!(find_state(&app).total, 1);
+    }
+
+    /// Tab limits the search to what lies below the viewed directory, and Tab again widens
+    /// it back to the whole tree. The viewed directory itself is never a hit.
+    #[test]
+    fn find_scope_limits_hits_to_the_viewed_directory() {
+        let mut app = app_for_find();
+        app.cur = idx_named(&app, "docs");
+        let now = search(&mut app, "readme");
+        assert_eq!(find_state(&app).scope(), None, "whole tree by default");
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+
+        app.on_key(KeyAction::FindScope);
+        assert_eq!(find_state(&app).scope(), Some(app.cur));
+        assert!(app.find_busy(), "the pass starts over");
+        app.find_tick(now, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md"]);
+        assert_eq!(find_state(&app).total, 2);
+        assert_eq!(find_state(&app).query, "readme", "the query is kept");
+
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(now, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+
+        // "docs" matches "doc" in the whole tree, but not below itself.
+        let mut app = app_for_find();
+        app.cur = idx_named(&app, "docs");
+        let now = search(&mut app, "doc");
+        assert_eq!(hit_names(&app), vec!["docs"]);
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(now, usize::MAX);
+        assert!(hit_names(&app).is_empty());
+    }
+
+    /// Scoped to the scan root, the search covers the whole tree.
+    #[test]
+    fn find_scoped_to_the_root_is_the_whole_tree() {
+        let mut app = app_for_find();
+        let now = search(&mut app, "readme");
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(now, usize::MAX);
+        assert_eq!(find_state(&app).total, 3);
+    }
+
+    /// Entries a running scan adds are matched against the scope as well.
+    #[test]
+    fn find_scope_applies_to_live_inserts() {
+        use crate::scan::NewNode;
+        let node = |name: &str, kind, dir_id| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind,
+            apparent: 10,
+            disk: 10,
+            dev: 1,
+            ino: 1,
+            hlink: false,
+            shared: false,
+            excluded: Excluded::No,
+            read_error: false,
+            dir_id,
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                node("in", NodeKind::Dir, Some(1)),
+                node("out", NodeKind::Dir, Some(2)),
+            ],
+            error: None,
+        });
+        app.cur = idx_named(&app, "in");
+        let now = search(&mut app, ".log");
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(now, usize::MAX);
+        assert!(hit_names(&app).is_empty());
+
+        for (parent_id, name) in [(1, "inside.log"), (2, "outside.log")] {
+            app.tree.apply(Batch {
+                parent_id,
+                nodes: vec![node(name, NodeKind::File, None)],
+                error: None,
+            });
+        }
+        app.find_tick(now + Duration::from_secs(1), usize::MAX);
+        assert_eq!(hit_names(&app), vec!["inside.log"]);
+    }
+
+    /// Enter on a scoped hit goes to its parent, like on any other hit.
+    #[test]
+    fn find_enter_jumps_to_a_scoped_hit() {
+        let mut app = app_for_find();
+        app.cur = idx_named(&app, "docs");
+        let now = search(&mut app, "readme");
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(now, usize::MAX);
+        app.on_key(KeyAction::Enter); // README.txt, in docs/sub
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.cur, idx_named(&app, "sub"));
+        assert_eq!(app.selected, Some(idx_named(&app, "README.txt")));
+    }
+
+    /// The scope is the directory on screen. When a finished deletion moves the view while
+    /// the popup is open, the scoped search follows it.
+    #[test]
+    fn find_scope_follows_the_viewed_directory() {
+        let mut app = app_for_find();
+        app.cur = idx_named(&app, "sub");
+        let now = search(&mut app, "readme");
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(now, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+
+        app.cur = idx_named(&app, "docs");
+        app.find_tick(now, usize::MAX);
+        assert_eq!(find_state(&app).scope(), Some(app.cur));
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md"]);
+    }
+
+    /// A jump always lands on a visible, highlighted row: nothing hides entries any more.
+    #[test]
+    fn jump_targets_are_always_listed() {
+        let mut app = app_for_find();
+        search(&mut app, "other");
+        app.on_key(KeyAction::Enter);
+        let sel = app.selected.expect("the hit is selected");
+        assert!(app.sorted_children().contains(&sel));
     }
 
     /// Enter moves the view to the hit's parent with the hit selected and closes the popup.
