@@ -492,24 +492,21 @@ impl App {
         self.imported
     }
 
-    /// Rescan the selected directory in place: the model tears its subtree down and a new
-    /// scanner generation re-reads it from disk, grafting back into the same node. Browsing
-    /// stays live the whole time; totals of surrounding directories stay correct throughout.
+    /// Rescan the viewed directory in place (at the top level: the whole tree). The model
+    /// tears its subtree down and a new scanner generation re-reads it from disk, grafting
+    /// back into the same node. Browsing stays live the whole time; totals of surrounding
+    /// directories stay correct throughout.
     fn request_refresh(&mut self) {
         if self.refused_for_import("rescan") {
             return;
         }
-        let Some(sel) = self.selected else { return };
+        let sel = self.cur;
         if self.scan_opts.is_none() {
             self.status = Some("rescan unavailable: no scan is attached".into());
             return;
         }
         if self.refreshing_idx.is_some() {
             self.status = Some("a rescan is already in progress — please wait".into());
-            return;
-        }
-        if !self.tree.nodes[sel].is_dir() {
-            self.status = Some("select a directory to rescan".into());
             return;
         }
         // An excluded directory was left out on purpose (`--exclude`, `-x`, the mtime
@@ -723,20 +720,14 @@ impl App {
         });
     }
 
-    /// Request a shell in the selected directory (or, for a file/symlink, the directory
-    /// containing it). The event loop owns the terminal, so it consumes the request and
-    /// handles the suspend/resume; nothing happens here but recording it.
+    /// Request a shell in the viewed directory. The event loop owns the terminal, so it
+    /// consumes the request and handles the suspend/resume; nothing happens here but
+    /// recording it.
     fn request_shell(&mut self) {
         if self.refused_for_import("the shell") {
             return;
         }
-        let idx = self.selected.unwrap_or(self.cur);
-        let target = if self.tree.nodes[idx].is_dir() {
-            idx
-        } else {
-            self.cur
-        };
-        match self.tree.fs_path_of(target) {
+        match self.tree.fs_path_of(self.cur) {
             Some(path) => self.shell_request = Some(path),
             None => self.status = Some(GONE.into()),
         }
@@ -1137,6 +1128,8 @@ impl App {
             KeyAction::NextError => self.jump_to_next_error(),
             KeyAction::Shell => self.request_shell(),
             KeyAction::Find => self.modal = Modal::Find(Box::new(Find::new(self.cur))),
+            KeyAction::Moved(to) => self.status = Some(to.into()),
+            // Esc and `n` answer dialogs; in the browser they do nothing (as in ncdu).
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Only produced while the search popup is open, which handles them above.
             KeyAction::FindChar(_) | KeyAction::FindBackspace | KeyAction::FindScope => {}
@@ -1455,7 +1448,7 @@ pub fn indicator(kind: NodeKind, shared: bool, excluded: bool, read_error: bool)
 }
 
 /// Logical input actions, decoded from raw keys in `main`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyAction {
     Quit,
     Up,
@@ -1489,6 +1482,8 @@ pub enum KeyAction {
     FindBackspace,
     /// Switch the search between the whole tree and the viewed directory.
     FindScope,
+    /// A key whose function moved to another key: the footer says where.
+    Moved(&'static str),
 }
 
 /// Create the first free `rcdu-dump*.json` in `dir`, so consecutive exports never clobber each
@@ -2160,28 +2155,83 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("no read errors"));
     }
 
-    /// `b` targets the selected directory, or — for a file — the directory containing it.
+    /// `b` opens the shell in the directory on screen, whatever is selected in it (as ncdu
+    /// does).
     #[test]
-    fn shell_request_targets_selected_dir_or_parent_of_file() {
+    fn shell_opens_in_the_viewed_directory() {
         let mut app = app_with_entries();
-        // No selection yet: falls back to the current directory.
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request().as_deref(), Some(Path::new("/r")));
+        assert!(app.take_shell_request().is_none(), "request is consumed");
+
+        // "gamma" is a directory. Selected, the shell still opens where the user is.
+        app.selected = Some(idx_named(&app, "gamma"));
         app.on_key(KeyAction::Shell);
         assert_eq!(app.take_shell_request().as_deref(), Some(Path::new("/r")));
 
-        // "alpha" (two downs from Beta) is a file: the shell goes to its parent, not the file.
-        app.on_key(KeyAction::Down);
-        app.on_key(KeyAction::Down);
-        app.on_key(KeyAction::Shell);
-        assert_eq!(app.take_shell_request().as_deref(), Some(Path::new("/r")));
-
-        // "gamma" is a directory: the shell opens there.
-        app.on_key(KeyAction::Down);
+        // Inside it, the shell opens there.
+        app.on_key(KeyAction::Enter);
+        assert_eq!(app.cur, idx_named(&app, "gamma"));
         app.on_key(KeyAction::Shell);
         assert_eq!(
             app.take_shell_request().as_deref(),
             Some(Path::new("/r/gamma"))
         );
-        assert!(app.take_shell_request().is_none(), "request is consumed");
+    }
+
+    /// `r` reads the directory on screen again, not the selected entry (as ncdu does).
+    #[test]
+    fn rescan_reads_the_viewed_directory() {
+        let mut app = app_for_find();
+        app.scan_opts = Some(test_opts());
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        app.cur = docs;
+        app.selected = Some(sub);
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, Some(docs));
+        assert!(
+            !app.tree.is_attached(sub),
+            "everything below it is read again"
+        );
+        assert!(app.tree.is_attached(docs));
+    }
+
+    /// At the top level, `r` reads the whole tree again.
+    #[test]
+    fn rescan_at_the_top_reads_the_whole_tree() {
+        let mut app = app_for_find();
+        app.scan_opts = Some(test_opts());
+        let root = app.tree.root;
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, Some(root));
+        assert!(app.tree.nodes[root].children.is_empty());
+        assert_eq!(app.tree.nodes[root].items, 0);
+    }
+
+    /// Esc closes popups and nothing else. It used to quit, so a second tap on the key that
+    /// closed a popup threw the whole scan away.
+    #[test]
+    fn esc_does_not_quit() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Help);
+        app.on_key(KeyAction::Cancel);
+        assert!(matches!(app.modal, Modal::None), "the popup is closed");
+        app.on_key(KeyAction::Cancel);
+        assert!(!app.quit);
+        app.on_key(KeyAction::Quit);
+        assert!(app.quit, "q still quits");
+    }
+
+    /// A key whose function moved says where it went and does nothing else.
+    #[test]
+    fn a_moved_key_only_tells_where_its_function_went() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Down); // settle the selection (first key always selects)
+        let before = (app.cur, app.selected);
+        app.on_key(KeyAction::Moved("export is now on E"));
+        assert_eq!(app.status.as_deref(), Some("export is now on E"));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!((app.cur, app.selected), before);
     }
 
     // ---- Whole-tree search (`f`) ------------------------------------------------------
@@ -2543,7 +2593,7 @@ mod tests {
         let _worker = start_fake_delete(&mut app, sub);
 
         // `docs` contains the directory being deleted.
-        app.selected = Some(docs);
+        app.cur = docs;
         app.on_key(KeyAction::Refresh);
         assert_eq!(app.refreshing_idx, None, "no rescan was started");
         assert!(app.tree.is_attached(sub), "the subtree was not torn down");
@@ -2905,7 +2955,7 @@ mod tests {
         let dir = node_at(&app, &raw);
         assert_eq!(app.tree.nodes[dir].items, 1, "the scan read it");
 
-        app.selected = Some(dir);
+        app.cur = dir;
         app.on_key(KeyAction::Shell);
         assert_eq!(app.take_shell_request(), Some(raw.clone()));
 
@@ -2941,9 +2991,9 @@ mod tests {
         let mut app = App::new(t, true, false, false);
         app.scan_opts = Some(test_opts());
 
-        for (view, target) in [(app.tree.root, mount), (mount, below)] {
+        for view in [mount, below] {
             app.cur = view;
-            app.selected = Some(target);
+            app.selected = None;
             app.status = None;
             app.on_key(KeyAction::Refresh);
             assert_eq!(app.refreshing_idx, None, "no rescan was started");

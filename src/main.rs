@@ -184,15 +184,15 @@ OPTIONS:
 
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
-    h/Backspace     go up         PgUp/PgDn,C-d/u page
+    h/</Backspace   go up         PgUp/PgDn,C-d/u page
     /               search names (Tab: whole tree / this directory)
-    s               toggle sort   t               top files
-    r               rescan dir    a               apparent/disk
+    s               toggle sort   T               largest files
+    r               rescan this directory          a   apparent/disk
     d               delete (confirm; full scan)
     o               open          i               entry details
-    e               export JSON   b               shell here
-    x / !           next error    ?               help    q/Esc  quit
-    g/G, Home/End   top/bottom    c               item counts",
+    E               export JSON   b               shell in this directory
+    x / !           next error    ?               help    q  quit
+    Home/End, G     top/bottom    c               item counts",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -497,7 +497,9 @@ fn decode_key(
         });
     }
     Some(match code {
-        KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
+        KeyCode::Char('q') => KeyAction::Quit,
+        // Esc closes popups and answers "no"; it never quits (as in ncdu).
+        KeyCode::Esc => KeyAction::Cancel,
         KeyCode::Char('j') | KeyCode::Down => KeyAction::Down,
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Up,
         KeyCode::PageDown => KeyAction::PageDown(page),
@@ -505,26 +507,35 @@ fn decode_key(
         // Vim-style half-keys map to a full page; kept ahead of the plain `d` (delete) arm.
         KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => KeyAction::PageDown(page),
         KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => KeyAction::PageUp(page),
-        KeyCode::Char('g') | KeyCode::Home => KeyAction::Top,
+        KeyCode::Home => KeyAction::Top,
         KeyCode::Char('G') | KeyCode::End => KeyAction::Bottom,
         KeyCode::Char('l') | KeyCode::Enter | KeyCode::Right => KeyAction::Enter,
-        KeyCode::Char('h') | KeyCode::Backspace | KeyCode::Left => KeyAction::Leave,
+        KeyCode::Char('h') | KeyCode::Char('<') | KeyCode::Backspace | KeyCode::Left => {
+            KeyAction::Leave
+        }
         KeyCode::Char('s') => KeyAction::ToggleSort,
         KeyCode::Char('a') => KeyAction::ToggleUsage,
         // Plain `c` only: Ctrl-C was turned into Quit at the top.
         KeyCode::Char('c') => KeyAction::ToggleItemCount,
         KeyCode::Char('d') => KeyAction::Delete,
         KeyCode::Char('o') => KeyAction::Open,
-        KeyCode::Char('t') => KeyAction::TopFiles,
+        KeyCode::Char('T') => KeyAction::TopFiles,
         KeyCode::Char('r') => KeyAction::Refresh,
         KeyCode::Char('i') => KeyAction::Info,
-        KeyCode::Char('e') => KeyAction::Export,
+        KeyCode::Char('E') => KeyAction::Export,
         KeyCode::Char('x') | KeyCode::Char('!') => KeyAction::NextError,
         KeyCode::Char('b') => KeyAction::Shell,
         KeyCode::Char('/') => KeyAction::Find,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
+        // ncdu keys whose ncdu function is not implemented yet (hidden entries, directories
+        // first, the graph column), and the old search key. Each used to do something else
+        // here, so say where that went instead of doing nothing.
+        KeyCode::Char('e') => KeyAction::Moved("export is now on E"),
+        KeyCode::Char('t') => KeyAction::Moved("largest files are now on T"),
+        KeyCode::Char('g') => KeyAction::Moved("jump to top is now on Home"),
+        KeyCode::Char('f') => KeyAction::Moved("search is now on /"),
         _ => return None,
     })
 }
@@ -629,6 +640,74 @@ mod tests {
         assert_eq!(foreign_links("install.sh", credit).len(), 1);
     }
 
+    /// Every key of the browser, with ncdu's meaning where ncdu has one. `e`, `t` and `g` are
+    /// ncdu keys whose functions do not exist here yet: they only say where the function that
+    /// used to sit on them went.
+    #[test]
+    fn decode_key_covers_every_key_in_normal_mode() {
+        use KeyAction::*;
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let ch = KeyCode::Char;
+        let table: &[(KeyCode, KeyModifiers, Option<KeyAction>)] = &[
+            (ch('q'), none, Some(Quit)),
+            (ch('c'), ctrl, Some(Quit)),
+            (KeyCode::Esc, none, Some(Cancel)),
+            (ch('j'), none, Some(Down)),
+            (KeyCode::Down, none, Some(Down)),
+            (ch('k'), none, Some(Up)),
+            (KeyCode::Up, none, Some(Up)),
+            (KeyCode::PageDown, none, Some(PageDown(10))),
+            (KeyCode::PageUp, none, Some(PageUp(10))),
+            (ch('d'), ctrl, Some(PageDown(10))),
+            (ch('u'), ctrl, Some(PageUp(10))),
+            (KeyCode::Home, none, Some(Top)),
+            (KeyCode::End, none, Some(Bottom)),
+            (ch('G'), none, Some(Bottom)),
+            (ch('l'), none, Some(Enter)),
+            (KeyCode::Enter, none, Some(Enter)),
+            (KeyCode::Right, none, Some(Enter)),
+            (ch('h'), none, Some(Leave)),
+            (ch('<'), none, Some(Leave)),
+            (KeyCode::Backspace, none, Some(Leave)),
+            (KeyCode::Left, none, Some(Leave)),
+            (ch('s'), none, Some(ToggleSort)),
+            (ch('a'), none, Some(ToggleUsage)),
+            (ch('c'), none, Some(ToggleItemCount)),
+            (ch('d'), none, Some(Delete)),
+            (ch('o'), none, Some(Open)),
+            (ch('T'), none, Some(TopFiles)),
+            (ch('r'), none, Some(Refresh)),
+            (ch('i'), none, Some(Info)),
+            (ch('E'), none, Some(Export)),
+            (ch('x'), none, Some(NextError)),
+            (ch('!'), none, Some(NextError)),
+            (ch('b'), none, Some(Shell)),
+            (ch('/'), none, Some(Find)),
+            (ch('y'), none, Some(Confirm)),
+            (ch('Y'), none, Some(Confirm)),
+            (ch('n'), none, Some(Cancel)),
+            (ch('N'), none, Some(Cancel)),
+            (ch('?'), none, Some(Help)),
+            // Keys that used to do something else.
+            (ch('e'), none, Some(Moved("export is now on E"))),
+            (ch('t'), none, Some(Moved("largest files are now on T"))),
+            (ch('g'), none, Some(Moved("jump to top is now on Home"))),
+            (ch('f'), none, Some(Moved("search is now on /"))),
+            // Unbound.
+            (ch('z'), none, None),
+            (KeyCode::Tab, none, None),
+            (KeyCode::F(1), none, None),
+        ];
+        for &(code, mods, want) in table {
+            assert_eq!(
+                decode_key(code, mods, InputMode::Normal, 10),
+                want,
+                "{code:?} with {mods:?}"
+            );
+        }
+    }
+
     /// `/` opens the search, and it is the only key that does; inside it letters (even `q`,
     /// `j`) go to the query, arrows still navigate, Tab switches the scope, Esc cancels and
     /// Ctrl-C still quits.
@@ -640,7 +719,6 @@ mod tests {
             dec(KeyCode::Char('/'), InputMode::Normal),
             Some(KeyAction::Find)
         ));
-        assert!(dec(KeyCode::Char('f'), InputMode::Normal).is_none());
         assert!(matches!(
             dec(KeyCode::Tab, InputMode::Find),
             Some(KeyAction::FindScope)

@@ -81,31 +81,31 @@ rcdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 |-----|--------|
 | `j` / `k`, `↓` / `↑` | move selection |
 | `l` / `Enter` / `→` | enter directory |
-| `h` / `Backspace` / `←` | go up |
-| `g` / `G` | jump to top / bottom |
+| `h` / `<` / `Backspace` / `←` | go up |
+| `Home` / `End`, `G` | jump to top / bottom |
 | `PgUp` / `PgDn`, `Ctrl-d` / `Ctrl-u` | page up / down |
 | `s` | toggle sort (size ↔ name) |
 | `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `c` | toggle the item count column (entries below each directory) |
 | `d` | delete selected entry (asks to confirm) |
-| `t` | show the largest files under the current directory |
-| `r` | rescan the selected directory in place |
+| `T` | show the largest files under the current directory |
+| `r` | rescan the current directory in place |
 | `i` | show details of the selected entry |
-| `e` | export the tree to an ncdu-format JSON file |
+| `E` | export the tree to an ncdu-format JSON file |
 | `x` | jump to the next read-error entry (`!` marker), wrapping around |
-| `b` | spawn `$SHELL` in the selected directory (its parent, for a file) |
+| `b` | spawn `$SHELL` in the current directory |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
-| `q` / `Esc` | quit |
+| `q` | quit |
+| `Esc` | close a popup (it never quits) |
 
 Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` excluded · `!` read error.
 
 ### Shelling out
 
-Press `b` to suspend the TUI and run `$SHELL` interactively in the selected directory (for a
-file, the directory containing it) — find it here, fix it there, `exit` to come straight back
-into rcdu. The scan keeps running in the background while you're away and catches up when you
+Press `b` to suspend the TUI and run `$SHELL` interactively in the directory you are viewing
+(as ncdu does) — find it here, fix it there, `exit` to come straight back into rcdu. The scan keeps running in the background while you're away and catches up when you
 return.
 
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
@@ -132,7 +132,7 @@ drop out of the list. Very broad queries keep the first 10,000 matches and repor
 
 ### Largest files
 
-Press `t` to see the largest regular files under the directory you're viewing, flattened across
+Press `T` to see the largest regular files under the directory you're viewing, flattened across
 its whole subtree — "what exactly is eating this directory?" without descending level by level.
 Sizes follow the active metric (`a` toggles disk usage vs. apparent before opening the popup).
 `j`/`k` move, `Enter` jumps to the selected file's parent directory with the file highlighted,
@@ -155,9 +155,10 @@ counts, derived on load. The info popup (`i`) shows the count as `total items`.
 
 ### Rescanning in place
 
-Press `r` on a directory to rescan it from disk without restarting: the subtree's current
-children are replaced as the new scan streams back in, the entry shows a spinner until it
-completes, and the totals of surrounding directories stay correct throughout. Navigation keeps
+Press `r` to rescan the directory you are viewing from disk without restarting (as in ncdu; at
+the top level this reads the whole tree again). Its entries are replaced as the new scan streams
+back in, the footer shows a spinner until it completes, and the totals of surrounding directories
+stay correct throughout. Navigation keeps
 steering the rescan, so the directory you're viewing fills in first. The same guards as delete
 apply: the directory must have finished scanning, only one rescan runs at a time, and while a
 deletion is running, neither the directory being deleted nor any directory around or above it
@@ -242,10 +243,10 @@ touch a local file that happens to have the same path. Independently of that, `-
 dump whose entry names aren't single path components (empty, `.`, `..`, or containing `/` or
 NUL), or whose root path contains a `..` component.
 
-Press `e` in the UI to write the currently browsed tree — including deletions made this session —
+Press `E` in the UI to write the currently browsed tree — including deletions made this session —
 to `rcdu-dump.json` in the working directory (`rcdu-dump-2.json` and so on if one already
 exists), in the same format as `-o`: handy for snapshotting a long scan without redoing it.
-While the scan is still running, `e` asks first, because the dump will be partial. Directories
+While the scan is still running, `E` asks first, because the dump will be partial. Directories
 that have not been read yet are then written with the read-error flag, so rcdu and ncdu show
 them as incomplete (`!`) instead of as empty.
 
