@@ -684,7 +684,7 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
     } else {
         format!("file ({})", fmt_size(app.size_of(idx)).trim_start())
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![Span::styled(
             "Delete?",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -692,6 +692,11 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
         Line::from(""),
         Line::from(format!("  {path}")),
         Line::from(format!("  This removes the {what} from disk.")),
+    ];
+    if let Some(note) = hard_link_note(app.confirm_hard_links, n.is_dir()) {
+        lines.push(Line::from(format!("  {note}")));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -702,7 +707,7 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
             Span::styled("n / Esc", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" cancel"),
         ]),
-    ];
+    ]);
     let width = 72.min(f.area().width.saturating_sub(4)).max(24);
     let height = wrapped_height(&lines, width - 2) + 2;
     let area = popup(f.area(), width, height);
@@ -716,6 +721,27 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
         ),
         area,
     );
+}
+
+/// What the delete dialog says about hard-linked files in the selection: removing a link
+/// frees the file's space only when it was the last one. Whether it is cannot be known here
+/// (other links may lie outside the scanned directory), so the dialog does not promise the
+/// space. `None` when there is nothing to say.
+fn hard_link_note(hard_links: u32, is_dir: bool) -> Option<String> {
+    let space = "space is only freed once";
+    match (hard_links, is_dir) {
+        (0, _) => None,
+        (_, false) => Some(format!(
+            "It has other hard links: its {space} the last one is gone."
+        )),
+        (1, true) => Some(format!(
+            "1 file in it has other hard links: its {space} the last one is gone."
+        )),
+        (n, true) => Some(format!(
+            "{} files in it have other hard links: their {space} the last ones are gone.",
+            fmt_count(n as usize)
+        )),
+    }
 }
 
 /// Headline and the two explanatory lines of the export confirmation, for the number of
@@ -785,10 +811,26 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_export_text, dir_label, find_title, fmt_count, fmt_items, item_cell, truncate_left,
-        ITEMS_WIDTH,
+        confirm_export_text, dir_label, find_title, fmt_count, fmt_items, hard_link_note,
+        item_cell, truncate_left, ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
+
+    /// The delete dialog warns that deleting a hard link may free nothing.
+    #[test]
+    fn hard_link_note_only_appears_when_there_are_links() {
+        assert_eq!(hard_link_note(0, false), None);
+        assert_eq!(hard_link_note(0, true), None);
+        let file = hard_link_note(1, false).unwrap();
+        assert!(file.starts_with("It has other hard links"), "{file}");
+        let one = hard_link_note(1, true).unwrap();
+        assert!(one.starts_with("1 file in it has"), "{one}");
+        let many = hard_link_note(1_500, true).unwrap();
+        assert!(many.starts_with("1,500 files in it have"), "{many}");
+        for note in [file, one, many] {
+            assert!(note.contains("only freed once"), "{note}");
+        }
+    }
 
     /// The title always says what is being searched, so the scope is never silently on.
     #[test]

@@ -19,7 +19,7 @@
 //! frontier is marked `done` and all idle workers are woken to exit, which drops every event
 //! `Sender` and disconnects the channel — the UI's signal that the scan is complete.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -49,8 +49,9 @@ pub struct NewNode {
     pub disk: u64,
     pub dev: u64,
     pub ino: u64,
+    /// A file with more than one link. Which of an inode's links is counted is the tree's
+    /// decision (see `Tree::graft`), so it holds across scan generations.
     pub hlink: bool,
-    pub shared: bool,
     pub excluded: Excluded,
     /// Why the entry could not be examined (its `lstat` failed), if it could not. Such an
     /// entry is shown with the read-error flag and without a size.
@@ -162,8 +163,6 @@ struct Shared {
     older_than: Option<i64>,
     /// `--newer-than` cutoff in Unix seconds; entries modified after it are excluded.
     newer_than: Option<i64>,
-    /// (dev, ino) of hard-linked inodes already counted, so duplicates can be flagged.
-    seen_hardlinks: Mutex<HashSet<(u64, u64)>>,
     /// A rescan's starting directory: its job id and what it must still be when it is read.
     start_check: Option<(u64, Identity)>,
     /// The id of the directory the scan starts at.
@@ -272,7 +271,6 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identi
         excludes: opts.excludes,
         older_than: opts.older_than,
         newer_than: opts.newer_than,
-        seen_hardlinks: Mutex::new(HashSet::new()),
         start_check: identity.map(|identity| (id_base, identity)),
         start_id: id_base,
     });
@@ -389,7 +387,6 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                     dev: 0,
                     ino: 0,
                     hlink: false,
-                    shared: false,
                     excluded: Excluded::No,
                     error: Some(e.to_string().into()),
                     dir_id: None,
@@ -426,16 +423,6 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
             excluded = Excluded::OtherFs;
         }
 
-        // Hard-link dedup: a file whose (dev, ino) we've already counted is "shared" and
-        // contributes zero to totals (so the grand total counts each inode once).
-        let mut shared_hl = false;
-        if hlink && excluded == Excluded::No {
-            let mut seen = shared.seen_hardlinks.lock().unwrap();
-            if !seen.insert((dev, ino)) {
-                shared_hl = true;
-            }
-        }
-
         let recurse = matches!(kind, NodeKind::Dir) && excluded == Excluded::No;
         let dir_id = if recurse {
             Some(shared.next_id.fetch_add(1, Ordering::Relaxed))
@@ -452,7 +439,6 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
             dev,
             ino,
             hlink,
-            shared: shared_hl,
             excluded,
             error: None,
             dir_id,
@@ -507,6 +493,8 @@ fn age_excluded(mtime: i64, shared: &Shared) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::model::{NodeIdx, Tree};
     use std::fs;

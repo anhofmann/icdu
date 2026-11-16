@@ -345,6 +345,9 @@ pub struct App {
     /// Where the export key writes its dump; `None` means the working directory at that
     /// moment. Tests point it at a scratch directory.
     export_dir: Option<PathBuf>,
+    /// How many hard-linked files the entry in the delete dialog is or contains, counted
+    /// when the dialog opens (a walk of the subtree, too slow to repeat every frame).
+    pub confirm_hard_links: u32,
     /// Spinner animation frame.
     pub tick: usize,
 }
@@ -382,6 +385,7 @@ impl App {
             scan_started: None,
             shell_request: None,
             export_dir: None,
+            confirm_hard_links: 0,
             tick: 0,
             tree,
         }
@@ -433,7 +437,7 @@ impl App {
                         self.bytes_seen = batch
                             .nodes
                             .iter()
-                            .filter(|n| !n.shared && n.excluded == Excluded::No)
+                            .filter(|n| n.excluded == Excluded::No)
                             .fold(self.bytes_seen, |sum, n| sum.saturating_add(n.apparent));
                         self.tree.apply(batch);
                         applied += 1;
@@ -1303,6 +1307,7 @@ impl App {
                 return;
             }
         }
+        self.confirm_hard_links = self.tree.hard_links_in(sel);
         self.modal = Modal::ConfirmDelete(sel);
     }
 
@@ -2022,7 +2027,6 @@ mod tests {
             dev: 1,
             ino: 1,
             hlink: false,
-            shared: false,
             excluded: Excluded::No,
             error: None,
             dir_id,
@@ -2185,7 +2189,6 @@ mod tests {
             dev: 1,
             ino: id,
             hlink: false,
-            shared: false,
             excluded: Excluded::No,
             error: None,
             dir_id: Some(id),
@@ -2558,7 +2561,6 @@ mod tests {
             dev: 1,
             ino,
             hlink: false,
-            shared: false,
             excluded: Excluded::No,
             error: None,
             dir_id: None,
@@ -2595,7 +2597,6 @@ mod tests {
             dev: 1,
             ino: 1,
             hlink: false,
-            shared: false,
             excluded: Excluded::No,
             error: None,
             dir_id,
@@ -3098,6 +3099,102 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// `a/one` and `b/two` are links to one 5000-byte file; `a` also has a plain file.
+    fn tree_with_a_hard_link(tag: &str) -> (PathBuf, App) {
+        let root = real_dir(tag);
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::fs::write(root.join("a/one"), vec![b'x'; 5000]).unwrap();
+        std::fs::hard_link(root.join("a/one"), root.join("b/two")).unwrap();
+        std::fs::write(root.join("a/plain"), b"x").unwrap();
+        let app = scanned_app(&root, &[]);
+        (root, app)
+    }
+
+    /// Deleting the counted link of a file does not free the file: the other link keeps it.
+    /// The total above both links must stay what it was, whichever link the scan counted.
+    #[test]
+    fn deleting_one_hard_link_keeps_the_inode_in_the_totals() {
+        let (root, mut app) = tree_with_a_hard_link("hl_delete");
+        let one = node_at_path(&app, &["a", "one"]);
+        let two = node_at_path(&app, &["b", "two"]);
+        let (counted, other) = if app.tree.nodes[one].shared {
+            (two, one)
+        } else {
+            (one, two)
+        };
+        let total = app.size_of(app.tree.root);
+        let file_size = app.size_of(counted);
+
+        app.cur = app.tree.nodes[counted].parent.unwrap();
+        app.selected = Some(counted);
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::ConfirmDelete(_)));
+        assert_eq!(app.confirm_hard_links, 1, "the dialog can say so");
+        app.on_key(KeyAction::Confirm);
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+
+        assert!(
+            !app.tree.nodes[other].shared,
+            "the other link is counted now"
+        );
+        assert_eq!(app.size_of(app.tree.root), total, "the file is still there");
+        assert!(root.join("a/one").exists() != root.join("b/two").exists());
+
+        // The last link gone, the space is free.
+        app.cur = app.tree.nodes[other].parent.unwrap();
+        app.selected = Some(other);
+        app.on_key(KeyAction::Delete);
+        app.on_key(KeyAction::Confirm);
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert_eq!(app.size_of(app.tree.root), total - file_size);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Rescanning a directory that holds one link of a file must not count the file a second
+    /// time, and rescanning the whole tree gives the same total as the first scan.
+    #[test]
+    fn rescans_count_a_hard_linked_file_once() {
+        let (root, mut app) = tree_with_a_hard_link("hl_rescan");
+        let total = app.size_of(app.tree.root);
+        for dir in ["a", "b"] {
+            app.cur = node_at_path(&app, &[dir]);
+            app.on_key(KeyAction::Refresh);
+            pump(&mut app, "the rescan", |a| !a.scanning);
+            assert_eq!(app.size_of(app.tree.root), total, "after rescanning {dir}");
+        }
+        app.cur = app.tree.root;
+        app.on_key(KeyAction::Refresh);
+        pump(&mut app, "the rescan", |a| !a.scanning);
+        assert_eq!(
+            app.size_of(app.tree.root),
+            total,
+            "after rescanning everything"
+        );
+        let dups = app
+            .tree
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.shared && app.tree.is_attached(*i))
+            .count();
+        assert_eq!(dups, 1, "exactly one link is the duplicate");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The attached node at `path` (names from the root down).
+    fn node_at_path(app: &App, path: &[&str]) -> NodeIdx {
+        let mut cur = app.tree.root;
+        for name in path {
+            cur = *app.tree.nodes[cur]
+                .children
+                .iter()
+                .find(|&&c| app.tree.nodes[c].name == *name)
+                .unwrap_or_else(|| panic!("{name} not found"));
+        }
+        cur
+    }
+
     /// A directory tree for the rescan identity tests: `d/` with one file, and `elsewhere/`
     /// with files that must never show up below `d`.
     fn tree_with_a_decoy(tag: &str) -> (PathBuf, App) {
@@ -3300,7 +3397,6 @@ mod tests {
             dev: 1,
             ino: 1,
             hlink: false,
-            shared: false,
             excluded: Excluded::No,
             error: None,
             dir_id,

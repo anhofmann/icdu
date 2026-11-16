@@ -87,6 +87,16 @@ impl Node {
     }
 }
 
+/// The links to one inode that a scan has delivered (files with a link count above 1 only).
+struct LinkSet {
+    /// The link whose size is in the totals.
+    counted: NodeIdx,
+    /// The other links, in the order they arrived: shown with their size, marked as
+    /// duplicates, and counted nowhere. May hold tombstones; they are dropped when the count
+    /// is handed over.
+    others: Vec<NodeIdx>,
+}
+
 pub struct Tree {
     pub nodes: Vec<Node>,
     pub root: NodeIdx,
@@ -101,6 +111,11 @@ pub struct Tree {
     /// Why an entry is flagged with a read error, in the words of the OS. Only entries a scan
     /// could not read have one; an imported dump carries the flag without a reason.
     errors: HashMap<NodeIdx, Box<str>>,
+    /// Hard-linked files by `(dev, ino)`, so that each inode is counted exactly once: across
+    /// directories, across scan generations, and after its counted link is deleted. It costs
+    /// memory only for files with more than one link. Imported trees do not use it (their
+    /// duplicates are marked by the import, and nothing in them is deleted or rescanned).
+    links: HashMap<(u64, u64), LinkSet>,
     pub total_files: u64,
     pub total_dirs: u64,
     /// How many times a subtree has been detached (deleted or torn down for a rescan). While
@@ -138,6 +153,7 @@ impl Tree {
             orphans: HashMap::new(),
             raw_names: HashMap::new(),
             errors: HashMap::new(),
+            links: HashMap::new(),
             total_dirs: 1,
             total_files: 0,
             detached: 0,
@@ -194,7 +210,12 @@ impl Tree {
                 self.total_files += 1;
             }
 
-            let counts = !nn.shared && nn.excluded == Excluded::No;
+            // Of all the links to one inode, the first to arrive is counted. Excluded entries
+            // take no part: they count nowhere anyway.
+            let shared = nn.hlink
+                && nn.excluded == Excluded::No
+                && self.register_link((nn.dev, nn.ino), idx);
+            let counts = !shared && nn.excluded == Excluded::No;
             if counts {
                 sum_apparent = sum_apparent.saturating_add(nn.apparent);
                 sum_disk = sum_disk.saturating_add(nn.disk);
@@ -217,7 +238,7 @@ impl Tree {
                 dev: nn.dev,
                 ino: nn.ino,
                 hlink: nn.hlink,
-                shared: nn.shared,
+                shared,
                 excluded: nn.excluded,
                 read_error,
                 scanned: false,
@@ -361,6 +382,7 @@ impl Tree {
         // Walk the subtree to update global counts (nodes become unreachable tombstones).
         let mut dirs = 0u64;
         let mut files = 0u64;
+        let mut lost_links = Vec::new();
         let mut stack = vec![idx];
         while let Some(n) = stack.pop() {
             if self.nodes[n].is_dir() {
@@ -368,11 +390,95 @@ impl Tree {
             } else {
                 files += 1;
             }
+            if self.is_counted_link(n) {
+                lost_links.push(n);
+            }
             stack.extend_from_slice(&self.nodes[n].children);
         }
         self.total_dirs = self.total_dirs.saturating_sub(dirs);
         self.total_files = self.total_files.saturating_sub(files);
+        self.hand_over_links(lost_links);
         (dirs, files)
+    }
+
+    /// How many hard-linked files `idx` is or contains. Deleting one of them frees its space
+    /// only if it is the last link, and the tree cannot know that: links may exist outside
+    /// the scanned directory.
+    pub fn hard_links_in(&self, idx: NodeIdx) -> u32 {
+        let mut count = 0u32;
+        let mut stack = vec![idx];
+        while let Some(n) = stack.pop() {
+            if self.nodes[n].hlink {
+                count = count.saturating_add(1);
+            }
+            stack.extend_from_slice(&self.nodes[n].children);
+        }
+        count
+    }
+
+    /// True if `idx` is a hard-linked file whose size is in the totals: the one link of its
+    /// inode that counts.
+    fn is_counted_link(&self, idx: NodeIdx) -> bool {
+        let n = &self.nodes[idx];
+        n.hlink && n.counts()
+    }
+
+    /// Record a link to the inode `key` that is about to become node `idx`. Returns true if
+    /// it is a duplicate: another link of that inode is in the tree and counted.
+    fn register_link(&mut self, key: (u64, u64), idx: NodeIdx) -> bool {
+        match self.links.get(&key).map(|set| set.counted) {
+            Some(counted) if self.is_attached(counted) => {
+                if let Some(set) = self.links.get_mut(&key) {
+                    set.others.push(idx);
+                }
+                true
+            }
+            // Never seen, or its links have all left the tree since.
+            _ => {
+                self.links.insert(
+                    key,
+                    LinkSet {
+                        counted: idx,
+                        others: Vec::new(),
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    /// `lost` are counted links that were just detached (deleted, or torn down for a rescan).
+    /// Their inodes may live on through other links, which were duplicates until now. Hand
+    /// each count to the first link that is still part of the tree: it becomes the counted
+    /// one and its size goes into its ancestors. Without this the inode would vanish from
+    /// every total although it still occupies the disk.
+    fn hand_over_links(&mut self, lost: Vec<NodeIdx>) {
+        for idx in lost {
+            let key = (self.nodes[idx].dev, self.nodes[idx].ino);
+            let Some(mut set) = self.links.remove(&key) else {
+                continue;
+            };
+            if set.counted != idx {
+                self.links.insert(key, set);
+                continue;
+            }
+            // No link left in the tree: the entry is dropped with the inode.
+            let Some(pos) = set.others.iter().position(|&o| self.is_attached(o)) else {
+                continue;
+            };
+            let heir = set.others[pos];
+            // Everything before the heir is a tombstone.
+            set.others.drain(..=pos);
+            set.counted = heir;
+            self.links.insert(key, set);
+
+            let n = &mut self.nodes[heir];
+            n.shared = false;
+            let (apparent, disk, parent) = (n.apparent, n.disk, n.parent);
+            if let Some(parent) = parent {
+                self.add_totals(parent, apparent, disk, 0);
+            }
+        }
     }
 
     /// Prepare a subtree for an in-place rescan (`r`): its children are detached (and dropped
@@ -398,11 +504,15 @@ impl Tree {
         self.detached += 1;
         let mut dirs = 0u64;
         let mut files = 0u64;
+        let mut lost_links = Vec::new();
         while let Some(n) = stack.pop() {
             if self.nodes[n].is_dir() {
                 dirs += 1;
             } else {
                 files += 1;
+            }
+            if self.is_counted_link(n) {
+                lost_links.push(n);
             }
             // Detach the grandchildren too: the nodes stay as tombstones (like delete), but
             // they no longer hold on to their subtree.
@@ -430,6 +540,10 @@ impl Tree {
         // it may pass the delete/rescan gate.
         self.bump_unscanned(idx, 1);
         self.dir_index.insert(id_base, idx);
+        // Inodes whose counted link was below `idx` are counted through a link elsewhere in
+        // the tree from now on, if they have one. The links the rescan brings back are then
+        // duplicates, so nothing is counted twice or lost, whatever the disk looks like now.
+        self.hand_over_links(lost_links);
     }
 
     /// True if `idx` is still part of the tree: its parent chain reaches the root. Deleted and
@@ -639,7 +753,6 @@ mod tests {
             dev: 1,
             ino: id,
             hlink: false,
-            shared: false,
             excluded: Excluded::No,
             error: None,
             dir_id: Some(id),
@@ -1118,13 +1231,211 @@ mod tests {
         assert_eq!(t.nodes[t.root].items, 3);
     }
 
+    /// A hard link to inode `ino` with a size of 1000.
+    fn link(name: &str, ino: u64) -> NewNode {
+        NewNode {
+            hlink: true,
+            apparent: 1000,
+            disk: 1000,
+            ..file(name, ino)
+        }
+    }
+
+    /// Root (100) with `a/` and `b/` (100 each). One inode (1000 bytes) is linked from both
+    /// as `a/one` and `b/two`; `a` also holds a plain file `a/x`.
+    fn tree_with_two_links() -> Tree {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("a", 1), dir("b", 2)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![link("one", 50), file("x", 11)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 2,
+            nodes: vec![link("two", 50)],
+            error: None,
+        });
+        t
+    }
+
+    /// The tree decides which link of an inode is counted: the first one it gets. Every
+    /// later link is a duplicate.
+    #[test]
+    fn the_first_link_seen_is_the_counted_one() {
+        let t = tree_with_two_links();
+        let (one, two) = (idx_of(&t, "one"), idx_of(&t, "two"));
+        assert!(!t.nodes[one].shared);
+        assert!(t.nodes[two].shared);
+        assert_eq!(t.nodes[idx_of(&t, "a")].apparent, 100 + 1000 + 100);
+        assert_eq!(t.nodes[idx_of(&t, "b")].apparent, 100);
+        assert_eq!(t.nodes[t.root].apparent, 100 + 1200 + 100);
+        // Equal inode numbers on different devices are different files.
+        let mut t = tree_with_two_links();
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![NewNode {
+                dev: 2,
+                ..link("elsewhere", 50)
+            }],
+            error: None,
+        });
+        assert!(!t.nodes[idx_of(&t, "elsewhere")].shared);
+    }
+
+    /// Deleting the link that carries the size leaves the inode on disk: another link still
+    /// holds it. The size moves to that link, and the total above both does not change.
+    #[test]
+    fn deleting_the_counted_link_moves_its_size_to_a_surviving_link() {
+        let mut t = tree_with_two_links();
+        let (one, two) = (idx_of(&t, "one"), idx_of(&t, "two"));
+        let (a, b) = (idx_of(&t, "a"), idx_of(&t, "b"));
+        let total = (t.nodes[t.root].apparent, t.nodes[t.root].disk);
+
+        t.delete_subtree(one);
+        assert!(!t.nodes[two].shared, "the surviving link is counted now");
+        assert_eq!(t.nodes[a].apparent, 100 + 100);
+        assert_eq!(t.nodes[b].apparent, 100 + 1000);
+        assert_eq!((t.nodes[t.root].apparent, t.nodes[t.root].disk), total);
+
+        // The last link gone, the inode is gone.
+        t.delete_subtree(two);
+        assert_eq!(t.nodes[t.root].apparent, total.0 - 1000);
+        assert_eq!(t.nodes[t.root].disk, total.1 - 1000);
+    }
+
+    /// The same when the counted link goes as part of a directory.
+    #[test]
+    fn deleting_a_directory_with_the_counted_link_moves_its_size() {
+        let mut t = tree_with_two_links();
+        let (two, a, b) = (idx_of(&t, "two"), idx_of(&t, "a"), idx_of(&t, "b"));
+        let before = t.nodes[t.root].apparent;
+
+        t.delete_subtree(a);
+        assert!(!t.nodes[two].shared);
+        assert_eq!(t.nodes[b].apparent, 100 + 1000);
+        // Gone: the directory itself (100) and `x` (100). The inode stays.
+        assert_eq!(t.nodes[t.root].apparent, before - 200);
+    }
+
+    #[test]
+    fn hard_links_in_counts_links_of_any_kind() {
+        let t = tree_with_two_links();
+        assert_eq!(t.hard_links_in(t.root), 2);
+        assert_eq!(t.hard_links_in(idx_of(&t, "a")), 1);
+        assert_eq!(
+            t.hard_links_in(idx_of(&t, "two")),
+            1,
+            "a duplicate is one too"
+        );
+        assert_eq!(t.hard_links_in(idx_of(&t, "x")), 0);
+    }
+
+    /// Deleting a duplicate frees nothing and changes no size.
+    #[test]
+    fn deleting_a_duplicate_link_changes_no_size() {
+        let mut t = tree_with_two_links();
+        let (one, two) = (idx_of(&t, "one"), idx_of(&t, "two"));
+        let before = t.nodes[t.root].apparent;
+        t.delete_subtree(two);
+        assert!(!t.nodes[one].shared);
+        assert_eq!(t.nodes[t.root].apparent, before);
+        // With the duplicate gone, deleting the counted link removes the inode.
+        t.delete_subtree(one);
+        assert_eq!(t.nodes[t.root].apparent, before - 1000);
+    }
+
+    /// A rescan must count each inode once too, whichever side of its boundary the links are
+    /// on. The counted link inside the rescanned directory: the outside link takes over at
+    /// once, and the link that comes back is the duplicate.
+    #[test]
+    fn rescan_hands_the_count_to_a_link_outside() {
+        let mut t = tree_with_two_links();
+        let (two, a) = (idx_of(&t, "two"), idx_of(&t, "a"));
+        let total = t.nodes[t.root].apparent;
+        let base = crate::scan::SCAN_ID_STRIDE;
+
+        t.begin_refresh(a, base);
+        assert!(
+            !t.nodes[two].shared,
+            "counted while `a` is being read again"
+        );
+        assert_eq!(t.nodes[t.root].apparent, total - 100, "only `x` is missing");
+        t.apply(Batch {
+            parent_id: base,
+            nodes: vec![link("one", 50), file("x", 11)],
+            error: None,
+        });
+        let again = t.nodes[a].children[0];
+        assert!(
+            t.nodes[again].shared,
+            "the link that came back is the duplicate"
+        );
+        assert_eq!(t.nodes[t.root].apparent, total);
+    }
+
+    /// The counted link outside the rescanned directory: the link inside stays a duplicate.
+    #[test]
+    fn rescan_does_not_count_a_link_twice() {
+        let mut t = tree_with_two_links();
+        let (one, b) = (idx_of(&t, "one"), idx_of(&t, "b"));
+        let total = t.nodes[t.root].apparent;
+        let base = crate::scan::SCAN_ID_STRIDE;
+
+        t.begin_refresh(b, base);
+        assert_eq!(t.nodes[t.root].apparent, total);
+        t.apply(Batch {
+            parent_id: base,
+            nodes: vec![link("two", 50)],
+            error: None,
+        });
+        assert!(!t.nodes[one].shared);
+        assert!(t.nodes[t.nodes[b].children[0]].shared);
+        assert_eq!(t.nodes[t.root].apparent, total, "counted once, as before");
+    }
+
+    /// An excluded hard link takes no part: it is never the counted link and never takes
+    /// the count over.
+    #[test]
+    fn excluded_links_stay_out_of_the_count() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                NewNode {
+                    excluded: Excluded::Pattern,
+                    ..link("skipped", 50)
+                },
+                link("kept", 50),
+            ],
+            error: None,
+        });
+        let (skipped, kept) = (idx_of(&t, "skipped"), idx_of(&t, "kept"));
+        assert!(
+            !t.nodes[kept].shared,
+            "the excluded link did not take the count"
+        );
+        assert_eq!(t.nodes[t.root].apparent, 100 + 1000);
+        t.delete_subtree(kept);
+        assert!(!t.nodes[skipped].counts());
+        assert_eq!(t.nodes[t.root].apparent, 100);
+    }
+
     /// Hard-link duplicates and excluded entries don't count toward sizes, but they are
     /// listed entries, so they count as items. An excluded directory contributes just itself.
     #[test]
     fn shared_and_excluded_entries_are_items() {
         let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        // Two links to one inode: the second is the duplicate.
+        let counted = NewNode {
+            hlink: true,
+            ..file("f", 10)
+        };
         let shared = NewNode {
-            shared: true,
             hlink: true,
             ..file("dup", 10)
         };
@@ -1139,7 +1450,7 @@ mod tests {
         };
         t.apply(Batch {
             parent_id: 0,
-            nodes: vec![shared, excluded_dir, excluded_file, file("f", 12)],
+            nodes: vec![counted, shared, excluded_dir, excluded_file],
             error: None,
         });
         assert_eq!(t.nodes[t.root].items, 4);

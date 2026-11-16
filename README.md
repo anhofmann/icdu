@@ -183,9 +183,8 @@ are not rescanned either: they were left out on purpose. And the path must still
 directory that was scanned: if it has been replaced since, by a symlink or by another directory,
 `r` refuses instead of listing something else in its place.
 
-One limitation: hard links that cross the rescan boundary (one link inside, another outside the
-rescanned subtree) are each counted, so totals can slightly overcount until the whole tree is
-rescanned (`r` at the top level).
+Hard-linked files are counted once across a rescan as well, whichever side of the rescanned
+directory their links are on.
 
 ### Entry details
 
@@ -242,8 +241,12 @@ leaves the rest on disk. Any other key disarms the prompt.
 ### Hard links, exclusions, filesystems
 
 - **Hard links** (`nlink > 1`) are detected by `(device, inode)`. Each inode is counted **once**
-  toward totals; later links are flagged `H` and shown at their real size but excluded from the
-  aggregate — so a tree's grand total isn't inflated by hard links.
+  (the first link the scan delivers); further links are shown with their size, marked `H`, and
+  add nothing to any total — so a tree's grand total isn't inflated by hard links. When you
+  delete the link that was counted, the file is still on disk through its other links, so the
+  size moves to one of them instead of dropping out of the totals. The delete dialog says when
+  the selection contains hard-linked files: their space is only freed once the last link is
+  gone.
 - `--exclude PATTERN` matches an entry's **basename** with shell globbing (`*`, `?`, `[...]`).
   Excluded entries stay visible (marked `<`) but are not descended into and don't count.
 - `-x` keeps the scan on the root's filesystem; mount points on other devices are shown but not
@@ -321,8 +324,8 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 
 | Module | Responsibility |
 |--------|----------------|
-| `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). One `Batch` per directory; hard-link dedup, excludes, one-filesystem. |
-| `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
+| `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). One `Batch` per directory; excludes, one-filesystem. |
+| `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, counts each hard-linked inode once, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
 | `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
 | `glob.rs` | `fnmatch`-style globbing for `--exclude`. |
 | `dump.rs` | ncdu-compatible JSON import/export. |
