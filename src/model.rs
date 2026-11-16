@@ -237,25 +237,35 @@ impl Tree {
     }
 
     /// Add counted sizes and an item count to `start` and every ancestor, in one walk.
-    fn add_totals(&mut self, start: NodeIdx, apparent: u64, disk: u64, items: u32) {
+    ///
+    /// Sizes stop at a node that does not count (see [`Node::counts`]): an excluded directory
+    /// shows what it holds itself, but nothing below it reaches its ancestors. Items go all
+    /// the way up, because every entry is an item.
+    fn add_totals(&mut self, start: NodeIdx, mut apparent: u64, mut disk: u64, items: u32) {
         let mut cur = Some(start);
         while let Some(i) = cur {
             let n = &mut self.nodes[i];
             n.apparent += apparent;
             n.disk += disk;
             n.items = n.items.saturating_add(items);
+            if !n.counts() {
+                (apparent, disk) = (0, 0);
+            }
             cur = n.parent;
         }
     }
 
-    /// The inverse of [`Tree::add_totals`], saturating at zero.
-    fn sub_totals(&mut self, start: NodeIdx, apparent: u64, disk: u64, items: u32) {
+    /// The inverse of [`Tree::add_totals`], saturating at zero, with the same stop for sizes.
+    fn sub_totals(&mut self, start: NodeIdx, mut apparent: u64, mut disk: u64, items: u32) {
         let mut cur = Some(start);
         while let Some(i) = cur {
             let n = &mut self.nodes[i];
             n.apparent = n.apparent.saturating_sub(apparent);
             n.disk = n.disk.saturating_sub(disk);
             n.items = n.items.saturating_sub(items);
+            if !n.counts() {
+                (apparent, disk) = (0, 0);
+            }
             cur = n.parent;
         }
     }
@@ -372,21 +382,18 @@ impl Tree {
         self.total_dirs = self.total_dirs.saturating_sub(dirs);
         self.total_files = self.total_files.saturating_sub(files);
 
-        let n = &mut self.nodes[idx];
+        // The detached children's counted sizes and items are baked into this directory's
+        // aggregate and every ancestor's — remove them, so totals stay correct while the
+        // rescan streams them back in. That leaves the directory with its own size and no
+        // items. `sub_totals` mirrors how they were added, including where sizes stop.
+        let n = &self.nodes[idx];
         let removed_apparent = n.apparent.saturating_sub(own_apparent);
         let removed_disk = n.disk.saturating_sub(own_disk);
         let removed_items = n.items;
-        let parent = n.parent;
-        n.apparent = own_apparent;
-        n.disk = own_disk;
-        n.items = 0;
+        self.sub_totals(idx, removed_apparent, removed_disk, removed_items);
+        let n = &mut self.nodes[idx];
         n.scanned = false;
         n.read_error = false;
-        // The detached children's counted sizes and items are baked into every ancestor's
-        // aggregate — remove them, so totals stay correct while the rescan streams them back in.
-        if let Some(parent) = parent {
-            self.sub_totals(parent, removed_apparent, removed_disk, removed_items);
-        }
         // This directory is unread again, and every ancestor has to count it: the batch that
         // reads it takes one off the whole chain (see `graft`), and until then nothing above
         // it may pass the delete/rescan gate.
@@ -402,6 +409,19 @@ impl Tree {
             cur = p;
         }
         cur == self.root
+    }
+
+    /// True if `idx` or one of its ancestors is excluded (`--exclude`, `-x`, the mtime
+    /// filters): the scan left that part of the filesystem out on purpose.
+    pub fn in_excluded(&self, idx: NodeIdx) -> bool {
+        let mut cur = Some(idx);
+        while let Some(i) = cur {
+            if self.nodes[i].excluded != Excluded::No {
+                return true;
+            }
+            cur = self.nodes[i].parent;
+        }
+        false
     }
 
     /// True if `idx` is `ancestor` itself or lies somewhere below it.
@@ -765,6 +785,92 @@ mod tests {
         assert!(!t.subtree_complete(a), "parent of the rescanned directory");
         assert!(!t.subtree_complete(t.root));
         assert_counts_in_step(&t, "rescan started");
+    }
+
+    fn sizes(t: &Tree, idx: NodeIdx) -> (u64, u64) {
+        (t.nodes[idx].apparent, t.nodes[idx].disk)
+    }
+
+    /// Sizes found below a directory that does not count stay below it: an excluded directory
+    /// contributes nothing to its ancestors, whatever turns up inside it.
+    #[test]
+    fn sizes_stop_at_a_directory_that_does_not_count() {
+        let mut t = Tree::new_imported("/r".into(), 100, 100, 1, 1);
+        let ex = t.import_child(
+            t.root,
+            "ex".into(),
+            NodeKind::Dir,
+            4096,
+            4096,
+            2,
+            2,
+            false,
+            false,
+            Excluded::OtherFs,
+            false,
+        );
+        assert_eq!(
+            sizes(&t, t.root),
+            (100, 100),
+            "the excluded directory adds 0"
+        );
+
+        let inside = t.import_child(
+            ex,
+            "big".into(),
+            NodeKind::File,
+            1000,
+            1000,
+            2,
+            5,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        assert_eq!(sizes(&t, t.root), (100, 100), "nor does anything inside it");
+        assert_eq!(sizes(&t, ex), (5096, 5096), "it shows what it holds itself");
+        assert_eq!(t.nodes[t.root].items, 2, "every entry is still an item");
+
+        // Taking the entry out again must not subtract what was never added.
+        t.delete_subtree(inside);
+        assert_eq!(sizes(&t, t.root), (100, 100));
+        assert_eq!(sizes(&t, ex), (4096, 4096));
+        assert_eq!(t.nodes[t.root].items, 1);
+    }
+
+    /// The same through the scanner path: a batch grafted below an excluded directory, which
+    /// is what rescanning one used to do.
+    #[test]
+    fn batches_below_an_excluded_directory_leave_ancestors_alone() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        let excluded = NewNode {
+            excluded: Excluded::Pattern,
+            dir_id: None,
+            ..dir("ex", 9)
+        };
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![excluded, file("f", 10)],
+            error: None,
+        });
+        let ex = idx_of(&t, "ex");
+        let before = sizes(&t, t.root);
+        assert_eq!(before, (200, 200), "root plus f; ex is excluded");
+
+        let base = 1 << 40;
+        t.begin_refresh(ex, base);
+        assert_eq!(
+            sizes(&t, t.root),
+            before,
+            "tearing it down subtracts nothing"
+        );
+        t.apply(Batch {
+            parent_id: base,
+            nodes: vec![file("inside", 11)],
+            error: None,
+        });
+        assert_eq!(sizes(&t, t.root), before, "its content adds nothing");
     }
 
     fn items(t: &Tree, name: &str) -> u32 {

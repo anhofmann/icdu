@@ -453,6 +453,12 @@ impl App {
             self.status = Some("select a directory to rescan".into());
             return;
         }
+        // An excluded directory was left out on purpose (`--exclude`, `-x`, the mtime
+        // filters). A rescan of it, or of anything below it, would read what the scan skipped.
+        if self.tree.in_excluded(sel) {
+            self.status = Some("can't rescan: excluded directories are not scanned".into());
+            return;
+        }
         // Scanning a subtree that is being removed from disk would race the deletion, and the
         // rescan tears down every node below `sel`, the one being deleted included. So this
         // has to hold for a deletion anywhere below `sel` as well as around it.
@@ -2431,6 +2437,44 @@ mod tests {
                 .any(|(k, v)| k == "on disk" && v.starts_with("unavailable")),
             "info does not stat a relative path"
         );
+    }
+
+    /// An excluded directory is deliberately not scanned, and `r` does not get around that:
+    /// neither on the directory itself nor on anything below it.
+    #[test]
+    fn rescan_is_refused_on_excluded_directories() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let mut add_dir = |parent, name: &str, excluded| {
+            t.import_child(
+                parent,
+                name.into(),
+                NodeKind::Dir,
+                4096,
+                4096,
+                2,
+                2,
+                false,
+                false,
+                excluded,
+                false,
+            )
+        };
+        let mount = add_dir(0, "mnt", Excluded::OtherFs);
+        let below = add_dir(mount, "below", Excluded::No);
+        let mut app = App::new(t, true, false, false);
+        app.scan_opts = Some(test_opts());
+
+        for (view, target) in [(app.tree.root, mount), (mount, below)] {
+            app.cur = view;
+            app.selected = Some(target);
+            app.status = None;
+            app.on_key(KeyAction::Refresh);
+            assert_eq!(app.refreshing_idx, None, "no rescan was started");
+            assert!(app
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("excluded")));
+        }
     }
 
     /// Past the cap the count can't be fixed up from the kept hits: the pass starts over.

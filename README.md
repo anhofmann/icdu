@@ -169,7 +169,8 @@ completes, and the totals of surrounding directories stay correct throughout. Na
 steering the rescan, so the directory you're viewing fills in first. The same guards as delete
 apply: the directory must have finished scanning, only one rescan runs at a time, and while a
 deletion is running, neither the directory being deleted nor any directory around or above it
-can be rescanned. One limitation: hard links that cross the rescan
+can be rescanned. Excluded directories (`--exclude`, `-x`, the mtime filters) are not rescanned
+either: they were left out on purpose. One limitation: hard links that cross the rescan
 boundary (one link inside, another outside the rescanned subtree) are each counted, so totals
 can slightly overcount until a full restart.
 
