@@ -649,9 +649,15 @@ fn render_help(f: &mut Frame) {
 fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
     let n = &app.tree.nodes[idx];
     let path = app.tree.path_of(idx);
+    // A directory goes with exactly what the scan listed inside it. Anything that appeared
+    // since, or that the scan left out, stays (see `delete.rs`).
     let what = if n.is_dir() {
         format!(
-            "directory and ALL its contents ({})",
+            "directory and the {} scanned inside it ({})",
+            match n.items {
+                1 => "1 entry".to_string(),
+                items => format!("{} entries", fmt_count(items as usize)),
+            },
             fmt_size(app.size_of(idx)).trim_start()
         )
     } else {

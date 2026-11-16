@@ -185,23 +185,38 @@ details are unavailable. For an imported dump (`-f`) nothing is read from disk a
 
 ### Deleting
 
-Press `d` to delete the selected file or directory; a confirmation dialog appears first. Two
-guards apply:
+Press `d` to delete the selected file or directory; a confirmation dialog appears first.
 
-- **Read-only** (`-r`) disables deletion entirely.
+**Only what the scan listed is deleted.** rcdu does not hand the directory to a recursive
+remove, which would take whatever is on disk at that moment. It walks the entries it scanned,
+checks each one against what the scan recorded (same type, device and inode), unlinks the files
+and removes each directory once it is empty. So:
+
+- A file that **appeared after the scan** stays, and so do the directories that hold it.
+- A directory the scan **left out** (`--exclude`, `-x`, the mtime filters) or could not read is
+  never emptied. `d` on such a directory is refused; inside a larger deletion it is left in place.
+- An entry that has **changed identity** since the scan is not touched: a directory that became a
+  symlink, a directory that now has another filesystem mounted on it, a file that was replaced.
+
+When something is left behind, the footer says what and why, and the directory is read again so
+the list shows what is really there.
+
+Further guards:
+
+- **Read-only** (`-r`) disables deletion entirely, and so does browsing an imported dump (`-f`).
 - A directory **cannot be deleted until its whole subtree has finished scanning**. Because the
   scan is live, a directory's size and contents may still be growing; rcdu refuses to delete one
   until every descendant has been read, so you never delete something whose true extent isn't yet
   known. Files are always deletable immediately.
 
 The removal itself runs on a **background thread**, so deleting a huge directory never freezes
-the UI: a spinner marks the entry (`[⠋ deleting…]`) and the footer shows progress, while you keep
+the UI: a spinner marks the entry (`[| deleting…]`) and the footer shows progress, while you keep
 browsing the rest of the tree normally. Only the subtree being deleted is locked (you can't enter
 it), and one deletion runs at a time.
 
 Quitting (`q` / `Ctrl-C`) **while a deletion is running** does not abort it silently: the first
-press warns, and a second press force-quits — which interrupts the removal and may leave partial
-results (`remove_dir_all` can't be cleanly cancelled). Any other key disarms the prompt.
+press warns, and a second press force-quits — which interrupts the removal wherever it is and
+leaves the rest on disk. Any other key disarms the prompt.
 
 ### Hard links, exclusions, filesystems
 
@@ -281,7 +296,8 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | Module | Responsibility |
 |--------|----------------|
 | `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). One `Batch` per directory; hard-link dedup, excludes, one-filesystem. |
-| `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and performs deletion. |
+| `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
+| `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
 | `glob.rs` | `fnmatch`-style globbing for `--exclude`. |
 | `dump.rs` | ncdu-compatible JSON import/export. |
 | `app.rs` | App state + key handling, modals (help/confirm), background delete and open. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |

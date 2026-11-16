@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver};
 
+use crate::delete::{Plan, Report};
 use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
 use crate::scan::{start_at, Batch, Opts, Scan, ScanControl, SCAN_ID_STRIDE};
 
@@ -239,7 +240,7 @@ pub enum Modal {
 struct PendingDelete {
     idx: NodeIdx,
     path: String,
-    rx: Receiver<std::io::Result<()>>,
+    rx: Receiver<Report>,
 }
 
 /// A system-open running on a background thread, so a slow or hung opener can't freeze the UI.
@@ -300,6 +301,13 @@ pub struct App {
     scan_opts: Option<Opts>,
     /// The subtree currently being rescanned in place, if any.
     pub refreshing_idx: Option<NodeIdx>,
+    /// A directory to read again as soon as the running rescan has finished: a deletion left
+    /// things behind in it while another rescan held the single rescan slot.
+    rescan_queued: Option<NodeIdx>,
+    /// The running rescan was started to bring the tree back in step after a deletion, not by
+    /// the user. Its end is not announced: the footer keeps the message that says what the
+    /// deletion could not remove.
+    rescan_is_resync: bool,
     /// Generation counter for subtree rescans; each gets a disjoint scanner-id range.
     next_scan_base: u64,
     /// Counted bytes grafted by live scans, for the footer's throughput display.
@@ -345,6 +353,8 @@ impl App {
             controls: Vec::new(),
             scan_opts: None,
             refreshing_idx: None,
+            rescan_queued: None,
+            rescan_is_resync: false,
             next_scan_base: 1,
             bytes_seen: 0,
             scan_started: None,
@@ -421,7 +431,13 @@ impl App {
 
         if self.refreshing_idx.is_some() && !self.scans.iter().any(|h| h.alive && h.refresh) {
             let idx = self.refreshing_idx.take().unwrap();
-            self.status = Some(format!("rescanned {}", self.tree.path_of(idx)));
+            if !std::mem::take(&mut self.rescan_is_resync) {
+                self.status = Some(format!("rescanned {}", self.tree.path_of(idx)));
+            }
+            // The rescan slot is free again: read the directory a deletion left out of step.
+            if let Some(queued) = self.rescan_queued.take() {
+                self.resync(queued);
+            }
         }
         let any_alive = self.scans.iter().any(|h| h.alive);
         if self.scanning && !any_alive {
@@ -464,10 +480,10 @@ impl App {
             return;
         }
         let Some(sel) = self.selected else { return };
-        let Some(opts) = self.scan_opts.as_ref() else {
+        if self.scan_opts.is_none() {
             self.status = Some("rescan unavailable: no scan is attached".into());
             return;
-        };
+        }
         if self.refreshing_idx.is_some() {
             self.status = Some("a rescan is already in progress — please wait".into());
             return;
@@ -495,14 +511,23 @@ impl App {
             self.status = Some("cannot rescan: directory is still being scanned".into());
             return;
         }
-        let Some(path) = self.tree.fs_path_of(sel) else {
-            self.status = Some(GONE.into());
-            return;
-        };
+        self.status = Some(match self.start_rescan(sel) {
+            Some(path) => format!("rescanning {path}…"),
+            None => GONE.into(),
+        });
+    }
+
+    /// Tear the subtree below `idx` down and start a scanner generation that reads it again.
+    /// The caller has checked the gates: `idx` is a fully scanned directory, no other rescan
+    /// is running, no deletion touches it. Returns the path being read, or `None` when `idx`
+    /// has left the tree or no scan options are attached.
+    fn start_rescan(&mut self, idx: NodeIdx) -> Option<String> {
+        let opts = self.scan_opts.clone()?;
+        let path = self.tree.fs_path_of(idx)?;
         let id_base = self.next_scan_base * SCAN_ID_STRIDE;
         self.next_scan_base += 1;
-        self.tree.begin_refresh(sel, id_base);
-        let scan = start_at(PathBuf::from(&path), opts.clone(), id_base);
+        self.tree.begin_refresh(idx, id_base);
+        let scan = start_at(PathBuf::from(&path), opts, id_base);
         self.prune_find();
         self.scans.push(ScanHandle {
             rx: scan.events,
@@ -510,13 +535,29 @@ impl App {
             alive: true,
         });
         self.controls.push(scan.control);
-        self.refreshing_idx = Some(sel);
+        self.refreshing_idx = Some(idx);
         self.scanning = true;
         // A fresh generation: the throughput display reflects this rescan, not the bytes the
         // original scan already brought in.
         self.bytes_seen = 0;
         self.scan_started = Some(Instant::now());
-        self.status = Some(format!("rescanning {path}…"));
+        Some(path)
+    }
+
+    /// Bring the tree below `idx` back in step with the disk after a deletion that left
+    /// things behind: the directory is read again. Only one rescan runs at a time, so if
+    /// that slot is taken the directory waits for it. Returns whether a rescan was started
+    /// or queued.
+    fn resync(&mut self, idx: NodeIdx) -> bool {
+        if !self.tree.is_attached(idx) || !self.tree.nodes[idx].is_dir() {
+            return false;
+        }
+        if self.refreshing_idx.is_some() {
+            self.rescan_queued = Some(idx);
+            return true;
+        }
+        self.rescan_is_resync = self.start_rescan(idx).is_some();
+        self.rescan_is_resync
     }
 
     /// Counted bytes per second being grafted by the live scan, for the footer. None when no
@@ -1077,8 +1118,8 @@ impl App {
             KeyAction::Quit => {
                 if self.is_deleting() {
                     // Don't silently abort a destructive operation. Arm on the first press,
-                    // force-quit on the second (the removal is interrupted and may leave
-                    // partial results — remove_dir_all is not cleanly cancellable).
+                    // force-quit on the second (the removal is interrupted wherever it is and
+                    // leaves the rest of the subtree on disk).
                     if self.quit_armed {
                         self.quit = true;
                     } else {
@@ -1250,41 +1291,56 @@ impl App {
         if sel == self.cur {
             return;
         }
-        // The core safety rule: never delete a subtree that is still being scanned, or its
-        // contents (and on-disk reality) aren't fully known yet.
-        if self.tree.nodes[sel].is_dir() && !self.tree.subtree_complete(sel) {
-            self.status = Some(
-                "cannot delete: directory is still being scanned — wait for it to finish".into(),
-            );
-            return;
+        let n = &self.tree.nodes[sel];
+        if n.is_dir() {
+            // The core safety rule: never delete a subtree that is still being scanned, or
+            // its contents (and on-disk reality) aren't fully known yet.
+            if !self.tree.subtree_complete(sel) {
+                self.status = Some(
+                    "cannot delete: directory is still being scanned — wait for it to finish"
+                        .into(),
+                );
+                return;
+            }
+            // The same holds for a directory the scan never listed: nobody has seen what is
+            // in it. (Inside a larger deletion such a directory is simply left in place.)
+            if n.excluded != Excluded::No {
+                self.status = Some(
+                    "cannot delete: this directory was excluded from the scan, its contents are unknown"
+                        .into(),
+                );
+                return;
+            }
+            if n.read_error {
+                self.status = Some(
+                    "cannot delete: this directory could not be read, its contents are unknown"
+                        .into(),
+                );
+                return;
+            }
         }
         self.modal = Modal::ConfirmDelete(sel);
     }
 
     fn perform_delete(&mut self, idx: NodeIdx) {
-        let Some(path) = self.tree.fs_path_of(idx) else {
-            self.status = Some(GONE.into());
-            return;
-        };
-        let is_dir = self.tree.nodes[idx].is_dir();
         // Double-check the gate at the moment of action (scan may have advanced).
-        if is_dir && !self.tree.subtree_complete(idx) {
+        if self.tree.nodes[idx].is_dir() && !self.tree.subtree_complete(idx) {
             self.status = Some("cannot delete: subtree not fully scanned".into());
             return;
         }
+        // Only what the scan listed is removed: the worker gets a copy of the subtree and
+        // checks every entry against it (see `delete.rs`).
+        let (Some(path), Some(plan)) = (self.tree.fs_path_of(idx), Plan::of(&self.tree, idx))
+        else {
+            self.status = Some(GONE.into());
+            return;
+        };
 
         // Run the (potentially slow) filesystem removal off the UI thread. The loop polls
         // `poll_delete`, and the UI shows a spinner via `deleting_path` until it completes.
         let (tx, rx) = unbounded();
-        let p = path.clone();
         std::thread::spawn(move || {
-            let res = if is_dir {
-                std::fs::remove_dir_all(&p)
-            } else {
-                // Covers files, symlinks (removes the link, not the target), and special files.
-                std::fs::remove_file(&p)
-            };
-            let _ = tx.send(res);
+            let _ = tx.send(plan.execute());
         });
         self.status = None;
         self.pending_delete = Some(PendingDelete { idx, path, rx });
@@ -1296,48 +1352,83 @@ impl App {
         let Some(pd) = self.pending_delete.as_ref() else {
             return;
         };
-        let result = match pd.rx.try_recv() {
-            Ok(res) => res,
+        let report = match pd.rx.try_recv() {
+            Ok(report) => report,
             Err(crossbeam_channel::TryRecvError::Empty) => return, // still working
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Err(std::io::Error::other("delete worker exited unexpectedly"))
-            }
+            // The worker died without reporting: what it removed is unknown.
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Report::lost(),
         };
         let pd = self.pending_delete.take().unwrap();
         // The deletion is over, so a pending force-quit is no longer relevant.
         self.quit_armed = false;
-        match result {
-            Ok(()) => {
-                // If the removed node is in the view the user is looking at, land the highlight
-                // on a neighbour; if they browsed elsewhere, leave their selection untouched.
-                let kids = self.sorted_children();
-                let pos = kids.iter().position(|&k| k == pd.idx);
-                let parent = self.tree.nodes[pd.idx].parent;
-                // A node that is no longer part of the tree has already been taken out of
-                // every total; removing it again would subtract it a second time.
-                if self.tree.is_attached(pd.idx) {
-                    self.tree.delete_subtree(pd.idx);
-                }
-                self.prune_find();
-                if !self.tree.is_attached(self.cur) {
-                    // The view was inside what just disappeared. Step out to the directory
-                    // that contained it: staying would show entries that no longer exist,
-                    // with no way back up.
-                    self.cur = parent
-                        .filter(|&p| self.tree.is_attached(p))
-                        .unwrap_or(self.tree.root);
-                    self.selected = self.sorted_children().first().copied();
-                    self.refocus();
-                } else if let Some(p) = pos {
+
+        if report.complete {
+            // If the removed node is in the view the user is looking at, land the highlight
+            // on a neighbour; if they browsed elsewhere, leave their selection untouched.
+            let kids = self.sorted_children();
+            let pos = kids.iter().position(|&k| k == pd.idx);
+            let parent = self.tree.nodes[pd.idx].parent;
+            // A node that is no longer part of the tree has already been taken out of
+            // every total; removing it again would subtract it a second time.
+            if self.tree.is_attached(pd.idx) {
+                self.tree.delete_subtree(pd.idx);
+            }
+            self.prune_find();
+            if !self.rehome_view(parent) {
+                if let Some(p) = pos {
                     let kids = self.sorted_children();
                     self.selected = (!kids.is_empty()).then(|| kids[p.min(kids.len() - 1)]);
                 }
-                self.status = Some(format!("deleted {}", pd.path));
             }
-            Err(e) => {
-                self.status = Some(format!("delete failed: {e}"));
-            }
+            self.status = Some(format!("deleted {}", pd.path));
+            return;
         }
+
+        // Something was left behind: entries that appeared after the scan, that changed, that
+        // the scan never read, or that the OS refused to remove. The tree below the target no
+        // longer matches the disk. If the target is still the directory that was scanned,
+        // read it again; the status says what stood in the way.
+        let rereading = report.target_intact && self.resync(pd.idx);
+        self.rehome_view(Some(pd.idx));
+        // The footer is one line: name the target by its name and what stood in the way by
+        // its path below the target.
+        let first = match report.failures.first() {
+            None => "unknown reason".to_string(),
+            Some((path, reason)) => match path.strip_prefix(&pd.path) {
+                Ok(below) if !below.as_os_str().is_empty() => {
+                    format!("{}: {reason}", below.display())
+                }
+                _ => reason.clone(),
+            },
+        };
+        let more = match report.failed.saturating_sub(1) {
+            0 => String::new(),
+            n => format!(" (and {n} more)"),
+        };
+        let tail = if rereading {
+            " — reading it again"
+        } else {
+            ""
+        };
+        self.status = Some(format!(
+            "{} could not be removed completely: {first}{more}{tail}",
+            self.tree.nodes[pd.idx].name
+        ));
+    }
+
+    /// If the directory being viewed has left the tree, move the view to `fallback` (or to the
+    /// root if that has gone as well) and select its first entry. Staying would show entries
+    /// that no longer exist, with no way back up. Returns whether the view moved.
+    fn rehome_view(&mut self, fallback: Option<NodeIdx>) -> bool {
+        if self.tree.is_attached(self.cur) {
+            return false;
+        }
+        self.cur = fallback
+            .filter(|&p| self.tree.is_attached(p))
+            .unwrap_or(self.tree.root);
+        self.selected = self.sorted_children().first().copied();
+        self.refocus();
+        true
     }
 }
 
@@ -2512,8 +2603,8 @@ mod tests {
     }
 
     /// Mark `idx` as being deleted by a worker that has not reported yet; the returned sender
-    /// delivers its result.
-    fn start_fake_delete(app: &mut App, idx: NodeIdx) -> Sender<std::io::Result<()>> {
+    /// delivers its report.
+    fn start_fake_delete(app: &mut App, idx: NodeIdx) -> Sender<Report> {
         let (tx, rx) = unbounded();
         app.pending_delete = Some(PendingDelete {
             idx,
@@ -2521,6 +2612,14 @@ mod tests {
             rx,
         });
         tx
+    }
+
+    /// The report of a worker that removed everything it was asked to.
+    fn all_removed() -> Report {
+        Report {
+            complete: true,
+            ..Report::default()
+        }
     }
 
     /// A rescan tears down everything below its directory. That must not happen to a
@@ -2554,7 +2653,7 @@ mod tests {
         app.tree.begin_refresh(docs, SCAN_ID_STRIDE);
         let (dirs, files) = (app.tree.total_dirs, app.tree.total_files);
 
-        worker.send(Ok(())).unwrap();
+        worker.send(all_removed()).unwrap();
         app.poll_delete();
         assert!(!app.is_deleting());
         assert_eq!((app.tree.total_dirs, app.tree.total_files), (dirs, files));
@@ -2621,7 +2720,7 @@ mod tests {
         app.cur = sub;
         app.selected = Some(idx_named(&app, "README.txt"));
 
-        worker.send(Ok(())).unwrap();
+        worker.send(all_removed()).unwrap();
         app.poll_delete();
         assert_eq!(
             app.cur, app.tree.root,
@@ -2663,6 +2762,163 @@ mod tests {
                 .any(|(k, v)| k == "on disk" && v.starts_with("unavailable")),
             "info does not stat a relative path"
         );
+    }
+
+    /// An app over a real directory, its tree filled by the real scanner run to completion.
+    fn scanned_app(root: &Path, excludes: &[&str]) -> App {
+        let meta = std::fs::symlink_metadata(root).unwrap();
+        let opts = Opts {
+            excludes: excludes.iter().map(|s| s.to_string()).collect(),
+            root_dev: meta.dev(),
+            ..test_opts()
+        };
+        let mut tree = Tree::new(
+            root.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        for batch in crate::scan::start(root.to_path_buf(), opts.clone())
+            .events
+            .iter()
+        {
+            tree.apply(batch);
+        }
+        let mut app = App::new(tree, true, false, false);
+        app.scan_opts = Some(opts);
+        app
+    }
+
+    /// A scratch directory under its canonical path, as the scanner would be given it.
+    fn real_dir(tag: &str) -> PathBuf {
+        std::fs::canonicalize(scratch_dir(tag)).unwrap()
+    }
+
+    /// Poll like the event loop does until `done`, or fail after ten seconds.
+    fn pump(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(app) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+            app.poll_scans(20_000);
+            app.poll_delete();
+        }
+    }
+
+    /// Select `name` in the root view and confirm its deletion.
+    fn delete_by_keys(app: &mut App, name: &str) {
+        app.selected = Some(idx_named(app, name));
+        app.on_key(KeyAction::Delete);
+        assert!(
+            matches!(app.modal, Modal::ConfirmDelete(_)),
+            "confirm dialog for {name}: {:?}",
+            app.status
+        );
+        app.on_key(KeyAction::Confirm);
+    }
+
+    /// Deleting removes what the scan saw. A file that appeared afterwards was never shown
+    /// to the user and survives, together with the directories that hold it; the tree is
+    /// read again so it shows what is really left.
+    #[test]
+    fn delete_leaves_what_the_scan_never_saw() {
+        let root = real_dir("delete_unseen");
+        std::fs::create_dir_all(root.join("victim/sub")).unwrap();
+        std::fs::write(root.join("victim/known.txt"), b"known").unwrap();
+        std::fs::write(root.join("victim/sub/deep.txt"), b"deep").unwrap();
+        let mut app = scanned_app(&root, &[]);
+
+        std::fs::write(root.join("victim/sub/new.txt"), b"created after the scan").unwrap();
+        delete_by_keys(&mut app, "victim");
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+
+        assert!(root.join("victim/sub/new.txt").exists(), "unseen file kept");
+        assert!(
+            !root.join("victim/known.txt").exists(),
+            "scanned file removed"
+        );
+        assert!(!root.join("victim/sub/deep.txt").exists());
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("could not be removed"), "{status:?}");
+
+        // The directory is read again, so the tree shows exactly what is left.
+        pump(&mut app, "the rescan", |a| !a.scanning);
+        let victim = idx_named(&app, "victim");
+        assert!(app.tree.is_attached(victim));
+        assert_eq!(app.tree.nodes[victim].items, 2, "sub/ and sub/new.txt");
+        // The end of that rescan is not announced: the footer still says what was left and why.
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("could not be removed"), "{status:?}");
+        assert_eq!(app.refreshing_idx, None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A fully scanned directory is removed completely and leaves the tree.
+    #[test]
+    fn delete_removes_a_scanned_directory() {
+        let root = real_dir("delete_all");
+        std::fs::create_dir_all(root.join("victim/sub")).unwrap();
+        std::fs::write(root.join("victim/sub/deep.txt"), b"deep").unwrap();
+        std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+        let mut app = scanned_app(&root, &[]);
+
+        delete_by_keys(&mut app, "victim");
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert!(!root.join("victim").exists());
+        assert!(root.join("keep.txt").exists());
+        assert!(!app.tree.is_attached(idx_named(&app, "victim")));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("deleted")));
+        assert!(!app.scanning, "nothing to read again");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A directory the scan left out or could not read has unknown content: `d` is refused.
+    #[test]
+    fn delete_is_refused_on_directories_that_were_not_read() {
+        let root = real_dir("delete_excluded");
+        std::fs::create_dir_all(root.join("skipme")).unwrap();
+        std::fs::write(root.join("skipme/secret.txt"), b"never listed").unwrap();
+        let mut app = scanned_app(&root, &["skipme"]);
+
+        app.selected = Some(idx_named(&app, "skipme"));
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no confirm dialog");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("excluded")));
+        assert!(root.join("skipme/secret.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut app = app_with_errors();
+        app.selected = Some(idx_named(&app, "brokendir"));
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no confirm dialog");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("could not be read")));
+    }
+
+    /// An excluded directory inside the one being deleted is not emptied: only what the scan
+    /// listed goes, and the excluded directory keeps its parents alive.
+    #[test]
+    fn delete_does_not_empty_an_excluded_directory_inside() {
+        let root = real_dir("delete_inner_excluded");
+        std::fs::create_dir_all(root.join("victim/skipme")).unwrap();
+        std::fs::write(root.join("victim/skipme/secret.txt"), b"never listed").unwrap();
+        std::fs::write(root.join("victim/known.txt"), b"known").unwrap();
+        let mut app = scanned_app(&root, &["skipme"]);
+
+        delete_by_keys(&mut app, "victim");
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert!(root.join("victim/skipme/secret.txt").exists());
+        assert!(!root.join("victim/known.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// An excluded directory is deliberately not scanned, and `r` does not get around that:

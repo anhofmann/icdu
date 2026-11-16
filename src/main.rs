@@ -1,6 +1,7 @@
 //! rcdu — an ncdu-like disk usage explorer that is interactive while it scans.
 
 mod app;
+mod delete;
 mod dump;
 mod glob;
 mod model;
