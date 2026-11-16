@@ -342,6 +342,10 @@ impl Tree {
     /// scan generation (see `scan::start_at`); batches from that scan graft back into this node.
     pub fn begin_refresh(&mut self, idx: NodeIdx, id_base: u64) {
         debug_assert!(self.nodes[idx].is_dir());
+        debug_assert!(
+            self.subtree_complete(idx),
+            "only a fully scanned subtree may be rescanned"
+        );
         // Own size first: the aggregate minus the counted children is this node's own size,
         // which is what the reset aggregate becomes.
         let (own_apparent, own_disk) = (self.own_apparent(idx), self.own_disk(idx));
@@ -378,12 +382,15 @@ impl Tree {
         n.items = 0;
         n.scanned = false;
         n.read_error = false;
-        n.unscanned = 1;
         // The detached children's counted sizes and items are baked into every ancestor's
         // aggregate — remove them, so totals stay correct while the rescan streams them back in.
         if let Some(parent) = parent {
             self.sub_totals(parent, removed_apparent, removed_disk, removed_items);
         }
+        // This directory is unread again, and every ancestor has to count it: the batch that
+        // reads it takes one off the whole chain (see `graft`), and until then nothing above
+        // it may pass the delete/rescan gate.
+        self.bump_unscanned(idx, 1);
         self.dir_index.insert(id_base, idx);
     }
 
@@ -621,6 +628,102 @@ mod tests {
         for gone in ["x", "sub", "y"] {
             assert!(!t.is_attached(idx_of(&t, gone)), "{gone} is a tombstone");
         }
+    }
+
+    /// Directories at or below `idx` that are still waiting for their batch, counted by walking
+    /// the subtree: what `unscanned` must equal at every moment.
+    fn unread_dirs(t: &Tree, idx: NodeIdx) -> u32 {
+        let n = &t.nodes[idx];
+        let own = (n.is_dir() && !n.scanned && n.excluded == Excluded::No) as u32;
+        own + n.children.iter().map(|&c| unread_dirs(t, c)).sum::<u32>()
+    }
+
+    /// `unscanned` matches the real number of unread directories for every attached directory.
+    fn assert_counts_in_step(t: &Tree, when: &str) {
+        for idx in 0..t.nodes.len() {
+            if t.nodes[idx].is_dir() && t.is_attached(idx) {
+                assert_eq!(
+                    t.nodes[idx].unscanned,
+                    unread_dirs(t, idx),
+                    "{when}: unscanned of {:?}",
+                    t.nodes[idx].name
+                );
+            }
+        }
+    }
+
+    /// A rescan makes its directory unread again, and every ancestor has to know: their
+    /// `unscanned` count is the gate for delete and rescan. While the original scan is still
+    /// reading other directories, the count must not reach zero one directory early.
+    #[test]
+    fn rescan_keeps_ancestor_counts_in_step() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        // `a` is read; `b` and `c` are still waiting for the original scan.
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("a", 1), dir("b", 2), dir("c", 3)],
+            error: None,
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("x", 11)],
+            error: None,
+        });
+        let a = idx_of(&t, "a");
+        assert!(t.subtree_complete(a));
+        assert_counts_in_step(&t, "before the rescan");
+
+        let base = 1 << 40;
+        t.begin_refresh(a, base);
+        assert!(!t.subtree_complete(a), "a is unread again");
+        assert!(!t.subtree_complete(t.root));
+        assert_counts_in_step(&t, "rescan started");
+
+        // The rescan reads `a`, finding a new subdirectory, then reads that.
+        t.apply(Batch {
+            parent_id: base,
+            nodes: vec![file("x", 11), dir("sub", base + 1)],
+            error: None,
+        });
+        assert_counts_in_step(&t, "rescan read a");
+        t.apply(Batch {
+            parent_id: base + 1,
+            nodes: vec![],
+            error: None,
+        });
+        assert!(t.subtree_complete(a));
+        assert_counts_in_step(&t, "rescan done");
+
+        // The original scan still owes two directories: the root is complete only after both.
+        t.apply(Batch {
+            parent_id: 2,
+            nodes: vec![],
+            error: None,
+        });
+        assert!(!t.subtree_complete(t.root), "c has not been read yet");
+        assert_counts_in_step(&t, "b read");
+        t.apply(Batch {
+            parent_id: 3,
+            nodes: vec![],
+            error: None,
+        });
+        assert!(t.subtree_complete(t.root));
+        assert_counts_in_step(&t, "c read");
+    }
+
+    /// With nothing else pending, the parent of a directory being rescanned is incomplete from
+    /// the moment the rescan starts, not only once its first batch arrives.
+    #[test]
+    fn rescan_makes_ancestors_incomplete_at_once() {
+        let mut t = small_tree();
+        let (a, sub) = (idx_of(&t, "a"), idx_of(&t, "sub"));
+        assert!(t.subtree_complete(t.root));
+
+        t.begin_refresh(sub, 1 << 40);
+        assert!(!t.subtree_complete(sub));
+        assert!(!t.subtree_complete(a), "parent of the rescanned directory");
+        assert!(!t.subtree_complete(t.root));
+        assert_counts_in_step(&t, "rescan started");
     }
 
     fn items(t: &Tree, name: &str) -> u32 {

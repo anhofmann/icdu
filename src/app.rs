@@ -2200,6 +2200,26 @@ mod tests {
         assert_eq!(find_state(&app).total, 2);
     }
 
+    /// While a directory is being rescanned, nothing above it may be deleted: its content is
+    /// not known again until the rescan has delivered it.
+    #[test]
+    fn delete_is_refused_above_a_directory_being_rescanned() {
+        let mut app = app_for_find();
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        app.tree.begin_refresh(sub, SCAN_ID_STRIDE);
+
+        app.selected = Some(docs);
+        app.on_key(KeyAction::Delete);
+        assert!(
+            matches!(app.modal, Modal::None),
+            "no confirm dialog for a directory with a rescan running below it"
+        );
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("still being scanned")));
+    }
+
     /// Past the cap the count can't be fixed up from the kept hits: the pass starts over.
     #[test]
     fn find_prune_restarts_a_capped_pass() {
