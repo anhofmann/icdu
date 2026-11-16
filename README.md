@@ -167,8 +167,9 @@ Press `r` on a directory to rescan it from disk without restarting: the subtree'
 children are replaced as the new scan streams back in, the entry shows a spinner until it
 completes, and the totals of surrounding directories stay correct throughout. Navigation keeps
 steering the rescan, so the directory you're viewing fills in first. The same guards as delete
-apply: the directory must have finished scanning, only one rescan runs at a time, and a
-directory being deleted cannot be rescanned. One limitation: hard links that cross the rescan
+apply: the directory must have finished scanning, only one rescan runs at a time, and while a
+deletion is running, neither the directory being deleted nor any directory around or above it
+can be rescanned. One limitation: hard links that cross the rescan
 boundary (one link inside, another outside the rescanned subtree) are each counted, so totals
 can slightly overcount until a full restart.
 

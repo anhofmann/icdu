@@ -419,16 +419,15 @@ impl App {
 
     /// True if a deletion in progress covers `sel` (the node itself or an ancestor of it).
     fn deletion_covers(&self, sel: NodeIdx) -> bool {
-        self.deleting_idx().is_some_and(|d| {
-            let mut cur = Some(sel);
-            while let Some(i) = cur {
-                if i == d {
-                    return true;
-                }
-                cur = self.tree.nodes[i].parent;
-            }
-            false
-        })
+        self.deleting_idx()
+            .is_some_and(|d| self.tree.is_within(sel, d))
+    }
+
+    /// True if a deletion is in progress anywhere in `sel`'s subtree: `sel` is being deleted,
+    /// lies inside what is being deleted, or contains it.
+    fn deletion_touches(&self, sel: NodeIdx) -> bool {
+        self.deleting_idx()
+            .is_some_and(|d| self.tree.is_within(sel, d) || self.tree.is_within(d, sel))
     }
 
     /// Rescan the selected directory in place: the model tears its subtree down and a new
@@ -448,8 +447,10 @@ impl App {
             self.status = Some("select a directory to rescan".into());
             return;
         }
-        // Scanning a subtree that is being removed from disk would race the deletion.
-        if self.deletion_covers(sel) {
+        // Scanning a subtree that is being removed from disk would race the deletion, and the
+        // rescan tears down every node below `sel`, the one being deleted included. So this
+        // has to hold for a deletion anywhere below `sel` as well as around it.
+        if self.deletion_touches(sel) {
             self.status = Some("can't rescan: a deletion is in progress here".into());
             return;
         }
@@ -1199,7 +1200,11 @@ impl App {
                 // on a neighbour; if they browsed elsewhere, leave their selection untouched.
                 let kids = self.sorted_children();
                 let pos = kids.iter().position(|&k| k == pd.idx);
-                self.tree.delete_subtree(pd.idx);
+                // A node that is no longer part of the tree has already been taken out of
+                // every total; removing it again would subtract it a second time.
+                if self.tree.is_attached(pd.idx) {
+                    self.tree.delete_subtree(pd.idx);
+                }
                 self.prune_find();
                 if let Some(p) = pos {
                     let kids = self.sorted_children();
@@ -1385,6 +1390,7 @@ pub fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::model::{Excluded, NodeKind};
+    use crossbeam_channel::Sender;
 
     fn app() -> App {
         App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, false)
@@ -2218,6 +2224,67 @@ mod tests {
             .status
             .as_deref()
             .is_some_and(|s| s.contains("still being scanned")));
+    }
+
+    /// Scan options for tests that need the rescan key to get past "imported dump".
+    fn test_opts() -> Opts {
+        Opts {
+            threads: 1,
+            one_file_system: false,
+            excludes: Vec::new(),
+            root_dev: 1,
+            older_than: None,
+            newer_than: None,
+        }
+    }
+
+    /// Mark `idx` as being deleted by a worker that has not reported yet; the returned sender
+    /// delivers its result.
+    fn start_fake_delete(app: &mut App, idx: NodeIdx) -> Sender<std::io::Result<()>> {
+        let (tx, rx) = unbounded();
+        app.pending_delete = Some(PendingDelete {
+            idx,
+            path: app.tree.path_of(idx),
+            rx,
+        });
+        tx
+    }
+
+    /// A rescan tears down everything below its directory. That must not happen to a
+    /// directory that is being removed from disk, wherever in the subtree it sits.
+    #[test]
+    fn rescan_is_refused_above_a_directory_being_deleted() {
+        let mut app = app_for_find();
+        app.scan_opts = Some(test_opts());
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        let _worker = start_fake_delete(&mut app, sub);
+
+        // `docs` contains the directory being deleted.
+        app.selected = Some(docs);
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None, "no rescan was started");
+        assert!(app.tree.is_attached(sub), "the subtree was not torn down");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("deletion is in progress")));
+    }
+
+    /// If the node is no longer part of the tree when its deletion finishes, there is nothing
+    /// left to take out: the global counts must not be reduced a second time.
+    #[test]
+    fn finished_delete_of_a_detached_node_changes_nothing() {
+        let mut app = app_for_find();
+        let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
+        let worker = start_fake_delete(&mut app, sub);
+        // Something tore the subtree down while the worker was still running.
+        app.tree.begin_refresh(docs, SCAN_ID_STRIDE);
+        let (dirs, files) = (app.tree.total_dirs, app.tree.total_files);
+
+        worker.send(Ok(())).unwrap();
+        app.poll_delete();
+        assert!(!app.is_deleting());
+        assert_eq!((app.tree.total_dirs, app.tree.total_files), (dirs, files));
     }
 
     /// Past the cap the count can't be fixed up from the kept hits: the pass starts over.

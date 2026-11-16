@@ -404,6 +404,18 @@ impl Tree {
         cur == self.root
     }
 
+    /// True if `idx` is `ancestor` itself or lies somewhere below it.
+    pub fn is_within(&self, idx: NodeIdx, ancestor: NodeIdx) -> bool {
+        let mut cur = Some(idx);
+        while let Some(i) = cur {
+            if i == ancestor {
+                return true;
+            }
+            cur = self.nodes[i].parent;
+        }
+        false
+    }
+
     /// The path of a node relative to the root (`sub/dir/file`), for compact display. Empty
     /// for the root itself.
     pub fn rel_path_of(&self, idx: NodeIdx) -> String {
