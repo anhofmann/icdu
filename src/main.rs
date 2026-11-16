@@ -491,6 +491,8 @@ fn run(
         // What the keys act on must be what is highlighted, from the first frame on.
         app.begin_frame(Instant::now());
         app.settle_selection();
+        // The scans follow the selection: what is highlighted is read first.
+        app.steer_scans();
         terminal.draw(|f| ui::render(f, app))?;
 
         // Poll faster while scanning or deleting so updates/spinners animate smoothly. While a

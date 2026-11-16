@@ -439,6 +439,9 @@ pub struct App {
     pub list_offset: Cell<usize>,
     /// The sorted rows of the viewed directory, reused while they are still good.
     row_order: RefCell<Option<RowOrder>>,
+    /// What the scans were last told to read first: the viewed directory, and the selected
+    /// one if it was unfinished. `None` forces the next `steer_scans` to tell them again.
+    steered: Option<(NodeIdx, Option<NodeIdx>)>,
     /// When the frame being prepared started. The event loop sets it; without it (in tests)
     /// the rows are sorted again after every change, with it only when `resort_due` says so.
     frame_time: Option<Instant>,
@@ -480,6 +483,7 @@ impl App {
             confirm_hard_links: 0,
             list_offset: Cell::new(0),
             row_order: RefCell::new(None),
+            steered: None,
             frame_time: None,
             tick: 0,
             tree,
@@ -496,17 +500,34 @@ impl App {
         self.refocus();
     }
 
-    /// Tell every live scan to prioritize the directory currently being viewed.
+    /// Tell every live scan what to read first, now. Called when the view moved or a scan
+    /// was started; changes of the selection are picked up by [`App::steer_scans`].
     fn refocus(&mut self) {
+        self.steered = None;
+        self.steer_scans();
+    }
+
+    /// Keep the scans reading what the user is looking at: first the selected directory, if
+    /// it is not complete yet, then the rest of the viewed directory, then everything else.
+    /// The event loop calls this once per frame. It does nothing unless the view or the
+    /// selection changed, and what it does then is cheap (see `ScanControl::set_priorities`).
+    pub fn steer_scans(&mut self) {
         if !self.scanning {
             return;
         }
-        let Some(path) = self.tree.fs_path_of(self.cur) else {
-            return;
+        let unfinished = |idx: &NodeIdx| {
+            let n = &self.tree.nodes[*idx];
+            n.is_dir() && n.unscanned > 0
         };
-        let focus = Some(path);
+        let target = (self.cur, self.selected.filter(unfinished));
+        if self.steered == Some(target) {
+            return;
+        }
+        self.steered = Some(target);
+        let focus = self.tree.fs_path_of(target.0);
+        let first = target.1.and_then(|idx| self.tree.fs_path_of(idx));
         for ctrl in &self.controls {
-            ctrl.set_focus(focus.clone());
+            ctrl.set_priorities(first.clone(), focus.clone());
         }
     }
 
@@ -2489,6 +2510,88 @@ mod tests {
         assert_eq!(app.selected, sel);
         app.on_key(KeyAction::ToggleItemCount);
         assert!(!app.show_item_count);
+    }
+
+    /// The scans are told to read the selected directory first, then the rest of the viewed
+    /// one. A file, or a directory that is already complete, asks for nothing special.
+    #[test]
+    fn selection_steers_the_scan() {
+        use crate::scan::NewNode;
+        let dir = |name: &str, id: u64| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind: NodeKind::Dir,
+            apparent: id,
+            disk: id,
+            dev: 1,
+            ino: id,
+            hlink: false,
+            excluded: Excluded::No,
+            error: None,
+            dir_id: Some(id),
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.controls.push(ScanControl::idle());
+        let mut root_batch = file_batch("file", 1);
+        root_batch
+            .nodes
+            .extend([dir("pending", 10), dir("done", 20)]);
+        app.tree.apply(root_batch);
+        app.tree.apply(Batch {
+            parent_id: 20,
+            nodes: Vec::new(),
+            error: None,
+        });
+        let priorities = |app: &App| app.controls[0].priorities();
+        let path = |p: &str| Some(PathBuf::from(p));
+
+        app.selected = Some(idx_named(&app, "pending"));
+        app.steer_scans();
+        assert_eq!(priorities(&app), (path("/r/pending"), path("/r")));
+
+        // Moving on to entries that need no scanning drops the request.
+        for name in ["done", "file"] {
+            app.selected = Some(idx_named(&app, name));
+            app.steer_scans();
+            assert_eq!(priorities(&app), (None, path("/r")), "{name}");
+        }
+
+        // Entering the unfinished directory makes it the focus.
+        app.selected = Some(idx_named(&app, "pending"));
+        app.on_key(KeyAction::Enter);
+        assert_eq!(priorities(&app), (None, path("/r/pending")));
+
+        // Once the selected directory is complete, it is no longer asked for.
+        app.on_key(KeyAction::Leave);
+        app.steer_scans();
+        assert_eq!(priorities(&app), (path("/r/pending"), path("/r")));
+        app.tree.apply(Batch {
+            parent_id: 10,
+            nodes: Vec::new(),
+            error: None,
+        });
+        app.steer_scans();
+        assert_eq!(priorities(&app), (None, path("/r")));
+    }
+
+    /// A scan that starts later (a rescan) is told the current priorities too.
+    #[test]
+    fn a_new_scan_learns_the_priorities() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.controls.push(ScanControl::idle());
+        app.steer_scans();
+        app.controls.push(ScanControl::idle());
+        app.steer_scans();
+        assert_eq!(
+            app.controls[1].priorities(),
+            (None, None),
+            "nothing changed, nothing sent"
+        );
+        app.refocus();
+        assert_eq!(
+            app.controls[1].priorities(),
+            (None, Some(PathBuf::from("/r")))
+        );
     }
 
     /// Attach a scan stream that started at `started`; the sender feeds it.

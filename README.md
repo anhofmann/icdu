@@ -12,10 +12,11 @@ differences that matter:
    (This is the opposite of what you'd want on a spinning disk — and exactly the trade-off ncdu,
    being single-threaded, can't make.)
 
-3. **Navigation steers the scan.** When you enter a directory, its subtree is *prioritized* —
-   the scanner finishes the branch you're looking at before unrelated ones, so the sizes you
-   care about fill in first. (Pending work is kept in a two-tier "hot/cold" frontier keyed by the
-   directory you're viewing.)
+3. **Navigation steers the scan.** The scanner reads what you are looking at first: the
+   selected directory, then the rest of the directory you are viewing, then everything else. It
+   walks depth-first, so a subtree is finished before its siblings are started: sizes become
+   final, and delete and rescan become available, one directory after the other instead of all
+   at the end.
 
 It is a **drop-in ncdu replacement**: the common ncdu flags work, and it reads and writes the
 ncdu JSON export format, so existing dumps and scripts keep working.
