@@ -231,7 +231,8 @@ fn main() {
             eprintln!("icdu: export failed: {e}");
             std::process::exit(1);
         }
-        return;
+        // The dump is written and flushed. See `run_ui` for why not to return from here.
+        std::process::exit(0);
     }
 
     // --- Import mode: load a dump, browse it, no scanning. ---
@@ -242,7 +243,6 @@ fn main() {
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
         run_ui(&mut app);
-        return;
     }
 
     // --- Interactive scan mode. ---
@@ -393,7 +393,9 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
-fn run_ui(app: &mut App) {
+/// Run the TUI until the user quits or a signal ends it. Does not return: the process exits
+/// from here, with status 0 after a normal quit and 1 after a terminal error.
+fn run_ui(app: &mut App) -> ! {
     // ratatui's panic hook restores the screen but knows nothing of the paste mode. This hook
     // is installed first, so ratatui's wraps it and calls it after its own restore.
     let default_hook = std::panic::take_hook();
@@ -408,7 +410,11 @@ fn run_ui(app: &mut App) {
     match result {
         // Asked to end by a signal: now that the terminal is back, let it take effect.
         Ok(Some(signal)) => signals::die_by(signal),
-        Ok(None) => {}
+        // Leave at once. Returning would free the tree node by node, name by name, which on
+        // a tree of many millions of entries keeps the prompt waiting, with the scanner
+        // threads still reading the disk meanwhile. The OS takes it all back in one go.
+        // Nothing is pending here: exports and deletions finish inside the loop.
+        Ok(None) => std::process::exit(0),
         Err(e) => {
             eprintln!("icdu: {e}");
             std::process::exit(1);
