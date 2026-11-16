@@ -506,7 +506,7 @@ impl App {
         };
         let focus = Some(path);
         for ctrl in &self.controls {
-            ctrl.set_focus(focus.clone());
+            ctrl.set_priorities(None, focus.clone());
         }
     }
 
@@ -2489,6 +2489,32 @@ mod tests {
         assert_eq!(app.selected, sel);
         app.on_key(KeyAction::ToggleItemCount);
         assert!(!app.show_item_count);
+    }
+
+    /// The scans are told which directory is on screen: its entries are read side by side,
+    /// before the rest of the tree. A scan that starts later learns it too.
+    #[test]
+    fn the_viewed_directory_is_the_focus_of_the_scans() {
+        let mut app = app_for_find();
+        app.scanning = true;
+        app.controls.push(ScanControl::idle());
+        let focus = |app: &App, i: usize| app.controls[i].priorities();
+        let path = |p: &str| Some(PathBuf::from(p));
+
+        app.selected = Some(idx_named(&app, "docs"));
+        app.on_key(KeyAction::Enter);
+        assert_eq!(focus(&app, 0), (None, path("/r/docs")));
+        app.on_key(KeyAction::Leave);
+        assert_eq!(focus(&app, 0), (None, path("/r")));
+
+        // A jump moves the focus as well.
+        let deep = idx_named(&app, "README.txt");
+        assert!(app.jump_to(deep));
+        assert_eq!(focus(&app, 0), (None, path("/r/docs/sub")));
+
+        app.controls.push(ScanControl::idle());
+        app.refocus();
+        assert_eq!(focus(&app, 1), (None, path("/r/docs/sub")));
     }
 
     /// Attach a scan stream that started at `started`; the sender feeds it.

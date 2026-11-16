@@ -14,8 +14,8 @@ differences that matter:
 
 3. **Navigation steers the scan.** When you enter a directory, its subtree is *prioritized* —
    the scanner finishes the branch you're looking at before unrelated ones, so the sizes you
-   care about fill in first. (Pending work is kept in a two-tier "hot/cold" frontier keyed by the
-   directory you're viewing.)
+   care about fill in first. Moving around never holds the scan up, however much work is
+   queued.
 
 It is a **drop-in ncdu replacement**: the common ncdu flags work, and it reads and writes the
 ncdu JSON export format, so existing dumps and scripts keep working.

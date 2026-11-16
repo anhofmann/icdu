@@ -75,34 +75,169 @@ struct DirJob {
     path: PathBuf,
 }
 
-/// The shared pool of pending directory jobs, split by priority against the focused path.
-struct Frontier {
-    /// The directory the user is currently viewing; jobs under it are prioritized.
-    focus: Option<PathBuf>,
-    /// Jobs whose path is under `focus`.
-    hot: VecDeque<DirJob>,
-    /// All other pending jobs.
-    cold: VecDeque<DirJob>,
-    /// Queued + in-flight jobs. The scan is finished when this hits zero.
-    pending: usize,
-    done: bool,
+/// How urgently a queued directory should be read. The lower, the sooner.
+const FIRST: usize = 0;
+const FOCUSED: usize = 1;
+const REST: usize = 2;
+
+/// How many jobs one `pop` re-classifies at most after the priorities changed.
+const SORT_CHUNK: usize = 256;
+
+/// The queued jobs of one priority class.
+#[derive(Default)]
+struct Queue {
+    /// Take the newest job first (a depth-first walk) instead of the oldest (breadth-first).
+    newest_first: bool,
+    /// Jobs that were queued under earlier priorities and classified into this queue later.
+    /// They are older than everything in `fresh`.
+    late: VecDeque<DirJob>,
+    /// Jobs queued under the current priorities, oldest at the front.
+    fresh: VecDeque<DirJob>,
 }
 
-impl Frontier {
-    fn is_hot(focus: &Option<PathBuf>, path: &Path) -> bool {
-        focus.as_ref().is_some_and(|f| path.starts_with(f))
-    }
-
-    fn push(&mut self, job: DirJob) {
-        if Self::is_hot(&self.focus, &job.path) {
-            self.hot.push_back(job);
-        } else {
-            self.cold.push_back(job);
-        }
+impl Queue {
+    fn len(&self) -> usize {
+        self.late.len() + self.fresh.len()
     }
 
     fn pop(&mut self) -> Option<DirJob> {
-        self.hot.pop_front().or_else(|| self.cold.pop_front())
+        if self.newest_first {
+            self.fresh.pop_back().or_else(|| self.late.pop_back())
+        } else {
+            self.late.pop_front().or_else(|| self.fresh.pop_front())
+        }
+    }
+}
+
+/// The shared pool of directories waiting to be read.
+///
+/// **Priority.** Jobs fall into three classes: under a directory the user is waiting for
+/// (`first`), under the directory being viewed (`focus`), and the rest. A class is emptied
+/// before the next is touched.
+///
+/// **Order.** The focused directory and the rest are read oldest job first, which is a
+/// breadth-first walk: every entry on screen gets a size early, and the readers spread over
+/// the whole tree, and with it over all its disks. Measurements on a machine with several
+/// filesystems of very different speed decided this: a depth-first walk sent every reader
+/// into the first big directory while the rows next to it stayed empty, and letting the rows
+/// take turns tied the fast filesystems to the pace of the slowest one (see #38).
+///
+/// A directory the user is waiting for is different. There the aim is to have that one
+/// subtree complete as soon as possible, so it is read newest job first, depth-first.
+///
+/// **Changing the priorities is cheap.** Re-classifying every queued job when the user moves
+/// would block the UI thread and stall the workers on a large pool. Instead the queues are
+/// set aside as they are (`stale`), and the workers classify their jobs a chunk at a time as
+/// they take work.
+struct Frontier {
+    /// A directory to finish before anything else, if any.
+    first: Option<PathBuf>,
+    /// The directory the user is currently viewing.
+    focus: Option<PathBuf>,
+    /// The jobs classified against the current priorities, by class.
+    classes: [Queue; 3],
+    /// Queues classified against earlier priorities. The last one is worked off first.
+    stale: Vec<Queue>,
+    /// Queued + in-flight jobs. The scan is finished when this hits zero.
+    pending: usize,
+    done: bool,
+    /// The most jobs that were ever queued at once.
+    #[cfg(test)]
+    peak: usize,
+}
+
+impl Frontier {
+    fn new(root: DirJob) -> Self {
+        let mut frontier = Frontier {
+            first: None,
+            focus: None,
+            classes: Self::empty_classes(),
+            stale: Vec::new(),
+            pending: 1, // the root job
+            done: false,
+            #[cfg(test)]
+            peak: 0,
+        };
+        frontier.push(root);
+        frontier
+    }
+
+    fn empty_classes() -> [Queue; 3] {
+        let mut classes: [Queue; 3] = Default::default();
+        classes[FIRST].newest_first = true;
+        classes
+    }
+
+    fn class_of(&self, path: &Path) -> usize {
+        let under = |dir: &Option<PathBuf>| dir.as_ref().is_some_and(|d| path.starts_with(d));
+        if under(&self.first) {
+            FIRST
+        } else if under(&self.focus) {
+            FOCUSED
+        } else {
+            REST
+        }
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.classes.iter().chain(&self.stale).map(Queue::len).sum()
+    }
+
+    fn push(&mut self, job: DirJob) {
+        let class = self.class_of(&job.path);
+        self.classes[class].fresh.push_back(job);
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.queued());
+        }
+    }
+
+    /// Change what is read first. No job is looked at here: the queues are set aside as they
+    /// are, and `pop` classifies their jobs later.
+    fn set_priorities(&mut self, first: Option<PathBuf>, focus: Option<PathBuf>) {
+        if self.first == first && self.focus == focus {
+            return;
+        }
+        self.first = first;
+        self.focus = focus;
+        let old = std::mem::replace(&mut self.classes, Self::empty_classes());
+        // The last queue is worked off first: what used to be most urgent goes last.
+        self.stale
+            .extend(old.into_iter().rev().filter(|queue| queue.len() > 0));
+    }
+
+    /// The next directory to read.
+    fn pop(&mut self) -> Option<DirJob> {
+        loop {
+            // Classify some of the jobs that predate the current priorities, in the order
+            // they would have been read in.
+            let mut budget = SORT_CHUNK;
+            while budget > 0 {
+                let Some(queue) = self.stale.last_mut() else {
+                    break;
+                };
+                match queue.pop() {
+                    Some(job) => {
+                        let class = self.class_of(&job.path);
+                        self.classes[class].late.push_back(job);
+                        budget -= 1;
+                    }
+                    None => {
+                        self.stale.pop();
+                    }
+                }
+            }
+            // Take the most urgent job known. While stale jobs remain, one of them could be
+            // more urgent than what is found here; that is accepted, a chunk at a time, in
+            // exchange for never stalling.
+            if let Some(job) = self.classes.iter_mut().find_map(Queue::pop) {
+                return Some(job);
+            }
+            if self.stale.is_empty() {
+                return None;
+            }
+        }
     }
 }
 
@@ -113,20 +248,45 @@ pub struct ScanControl {
 }
 
 impl ScanControl {
-    /// Prioritize the subtree rooted at `path` (the directory the user navigated into). Pending
-    /// jobs are re-partitioned so anything under `path` is scanned before unrelated branches.
-    pub fn set_focus(&self, path: Option<PathBuf>) {
+    /// Prioritize in two steps: `first` is a directory to finish before anything else (one
+    /// the user is waiting for), `focus` the directory being viewed. Cheap enough to call on
+    /// every key press: nothing is re-sorted here.
+    pub fn set_priorities(&self, first: Option<PathBuf>, focus: Option<PathBuf>) {
         let (lock, _cv) = &*self.frontier;
-        let mut f = lock.lock().unwrap();
-        f.focus = path;
-        // Re-bucket every queued job against the new focus. Navigation is rare, so the O(n)
-        // pass over the frontier is negligible. Workers that are mid-directory will pick from
-        // the re-prioritized queues on their next pop; no need to wake anyone.
-        let mut all = std::mem::take(&mut f.hot);
-        all.extend(std::mem::take(&mut f.cold));
-        for job in all {
-            f.push(job);
+        lock.lock().unwrap().set_priorities(first, focus);
+        // Workers that are mid-directory pick up the new order on their next pop; no need to
+        // wake anyone, because no job was added.
+    }
+}
+
+#[cfg(test)]
+impl ScanControl {
+    /// The most directories that were waiting to be read at any one time.
+    fn peak_queued(&self) -> usize {
+        self.frontier.0.lock().unwrap().peak
+    }
+
+    /// Prioritize the subtree rooted at `path` only, as when the user navigates into it.
+    fn set_focus(&self, path: Option<PathBuf>) {
+        self.set_priorities(None, path);
+    }
+
+    /// A handle on a pool with nothing in it, for tests of the code that steers scans.
+    pub fn idle() -> Self {
+        let mut frontier = Frontier::new(DirJob {
+            id: 0,
+            path: PathBuf::new(),
+        });
+        drop(frontier.pop());
+        ScanControl {
+            frontier: Arc::new((Mutex::new(frontier), Condvar::new())),
         }
+    }
+
+    /// The priorities last set: the directory to finish first, and the focused one.
+    pub fn priorities(&self) -> (Option<PathBuf>, Option<PathBuf>) {
+        let f = self.frontier.0.lock().unwrap();
+        (f.first.clone(), f.focus.clone())
     }
 }
 
@@ -250,16 +410,10 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identi
     let (ev_tx, ev_rx) = unbounded::<Batch>();
 
     let frontier: FrontierArc = Arc::new((
-        Mutex::new(Frontier {
-            focus: None,
-            hot: VecDeque::new(),
-            cold: VecDeque::from([DirJob {
-                id: id_base,
-                path: root,
-            }]),
-            pending: 1, // the root job
-            done: false,
-        }),
+        Mutex::new(Frontier::new(DirJob {
+            id: id_base,
+            path: root,
+        })),
         Condvar::new(),
     ));
 
@@ -653,52 +807,161 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
-    /// The frontier drains hot (focused) jobs before cold ones, and `set_focus`'s re-partition
-    /// promotes the matching subtree. (Deterministic test of the scheduling core.)
-    #[test]
-    fn frontier_prioritizes_focused_subtree() {
-        let mut f = Frontier {
-            focus: None,
-            hot: VecDeque::new(),
-            cold: VecDeque::new(),
-            pending: 0,
-            done: false,
-        };
-        f.push(DirJob {
-            id: 1,
-            path: "/r/A/x".into(),
-        });
-        f.push(DirJob {
-            id: 2,
-            path: "/r/B/y".into(),
-        });
-        f.push(DirJob {
-            id: 3,
-            path: "/r/A/z".into(),
-        });
-
-        // Focus on /r/B and re-partition (mirrors ScanControl::set_focus).
-        f.focus = Some("/r/B".into());
-        let mut all = std::mem::take(&mut f.hot);
-        all.extend(std::mem::take(&mut f.cold));
-        for j in all {
-            f.push(j);
+    fn job(id: u64, path: &str) -> DirJob {
+        DirJob {
+            id,
+            path: path.into(),
         }
-
-        // The /r/B job comes out first; the /r/A jobs follow in FIFO order.
-        assert_eq!(f.pop().unwrap().id, 2, "focused subtree first");
-        assert_eq!(f.pop().unwrap().id, 1);
-        assert_eq!(f.pop().unwrap().id, 3);
-        assert!(f.pop().is_none());
     }
 
-    /// End-to-end: with a large `slow/` branch and a small `target/` branch, focusing `target/`
-    /// makes its subtree finish scanning before `slow/` does.
+    /// A pool with the given paths queued (ids are their positions, from 1), after the root.
+    fn frontier_with(paths: &[&str]) -> Frontier {
+        let mut f = Frontier::new(job(0, "/r"));
+        assert_eq!(f.pop().map(|j| j.id), Some(0));
+        for (i, path) in paths.iter().enumerate() {
+            f.push(job(i as u64 + 1, path));
+        }
+        f
+    }
+
+    fn drain(f: &mut Frontier) -> Vec<u64> {
+        std::iter::from_fn(|| f.pop().map(|j| j.id)).collect()
+    }
+
+    /// Without priorities the oldest job is taken first: a breadth-first walk. Every entry
+    /// of a directory is read before any of their subdirectories.
     #[test]
-    fn focus_prioritizes_navigated_subtree() {
-        let base = std::env::temp_dir().join(format!("icdu_prio_{}", std::process::id()));
+    fn frontier_reads_breadth_first() {
+        let mut f = frontier_with(&["/r/a", "/r/b"]);
+        assert_eq!(f.pop().map(|j| j.id), Some(1), "/r/a, the oldest");
+        // Reading /r/a found two subdirectories. /r/b comes before them.
+        f.push(job(10, "/r/a/x"));
+        f.push(job(11, "/r/a/y"));
+        assert_eq!(drain(&mut f), vec![2, 10, 11]);
+    }
+
+    /// A directory the user is waiting for is read depth-first: its newest job first, so its
+    /// subtrees are finished one after the other.
+    #[test]
+    fn frontier_reads_the_first_class_depth_first() {
+        let mut f = frontier_with(&["/r/a"]);
+        f.set_priorities(Some("/r/wait".into()), None);
+        f.push(job(10, "/r/wait/x"));
+        f.push(job(11, "/r/wait/y"));
+        assert_eq!(f.pop().map(|j| j.id), Some(11), "the newest");
+        f.push(job(12, "/r/wait/y/deep"));
+        assert_eq!(drain(&mut f), vec![12, 10, 1], "then the rest of the tree");
+    }
+
+    /// Jobs under the focused directory come before the rest, and jobs under the directory
+    /// to finish first come before those, wherever that directory lies.
+    #[test]
+    fn frontier_serves_the_classes_in_order() {
+        let paths = ["/r/A/x", "/r/B/y", "/r/A/z", "/r/C", "/r/B/q/deep"];
+        let mut f = frontier_with(&paths);
+        f.set_priorities(None, Some("/r/B".into()));
+        assert_eq!(drain(&mut f), vec![2, 5, 1, 3, 4], "B first, then the rest");
+
+        // A directory to finish first inside the focus...
+        let mut f = frontier_with(&paths);
+        f.set_priorities(Some("/r/B/q".into()), Some("/r/B".into()));
+        assert_eq!(drain(&mut f), vec![5, 2, 1, 3, 4]);
+        // ...and one outside it, which still wins.
+        let mut f = frontier_with(&paths);
+        f.set_priorities(Some("/r/C".into()), Some("/r/B".into()));
+        assert_eq!(drain(&mut f), vec![4, 2, 5, 1, 3]);
+
+        // New jobs are classified as they arrive, behind the older ones of their class.
+        let mut f = frontier_with(&["/r/A/x"]);
+        f.set_priorities(None, Some("/r/B".into()));
+        f.push(job(7, "/r/B/new"));
+        f.push(job(8, "/r/A/new"));
+        assert_eq!(drain(&mut f), vec![7, 1, 8]);
+
+        // A path is under a directory by components, not by prefix of its text.
+        let mut f = frontier_with(&["/r/Bee", "/r/B"]);
+        f.set_priorities(None, Some("/r/B".into()));
+        assert_eq!(drain(&mut f), vec![2, 1]);
+    }
+
+    /// Jobs that are still classified against earlier priorities.
+    fn stale_jobs(f: &Frontier) -> usize {
+        f.stale.iter().map(Queue::len).sum()
+    }
+
+    /// Changing the priorities does not walk the queued jobs: they are set aside and
+    /// classified by `pop`, a chunk at a time. No job is lost or served twice on the way,
+    /// also when the priorities change again before the first change has been worked off.
+    #[test]
+    fn frontier_classifies_lazily_and_loses_nothing() {
+        let total = SORT_CHUNK * 4 + 17;
+        let paths: Vec<String> = (0..total)
+            .map(|i| format!("/r/{}/d{i}", if i % 3 == 0 { "hot" } else { "cold" }))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut f = frontier_with(&refs);
+
+        f.set_priorities(None, Some("/r/hot".into()));
+        assert_eq!(stale_jobs(&f), total, "set aside, not classified");
+        assert_eq!(f.queued(), total);
+
+        // One pop classifies one chunk and serves a focused job from it.
+        let first = f.pop().unwrap();
+        assert!(first.path.starts_with("/r/hot"));
+        assert_eq!(stale_jobs(&f), total - SORT_CHUNK);
+
+        // The priorities change again while most jobs are still stale.
+        f.set_priorities(None, Some("/r/cold".into()));
+        assert_eq!(f.queued(), total - 1);
+        let mut seen = vec![first.id];
+        seen.extend(drain(&mut f));
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=total as u64).collect::<Vec<_>>());
+        assert_eq!(f.queued(), 0);
+        assert!(f.stale.is_empty());
+
+        // Setting the same priorities again is free: nothing is set aside.
+        let mut f = frontier_with(&["/r/hot/a", "/r/cold/b"]);
+        f.set_priorities(None, Some("/r/hot".into()));
+        drop(f.pop());
+        f.set_priorities(None, Some("/r/hot".into()));
+        assert!(f.stale.is_empty());
+    }
+
+    /// Classifying late keeps the order: jobs that were queued earlier are still read
+    /// earlier, and once everything is classified nothing from the rest is served while a
+    /// focused job waits.
+    #[test]
+    fn frontier_order_survives_a_change_of_priorities() {
+        let total = SORT_CHUNK * 3;
+        // The five focused jobs are the last ones queued, so they are classified last.
+        let paths: Vec<String> = (0..total)
+            .map(|i| format!("/r/{}/d{i}", if i >= total - 5 { "hot" } else { "cold" }))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut f = frontier_with(&refs);
+        f.set_priorities(None, Some("/r/hot".into()));
+        let order = drain(&mut f);
+        let hot: Vec<u64> = (total as u64 - 4..=total as u64).collect();
+        // Two jobs of the rest went ahead, one per chunk classified before the focused jobs
+        // were found; from then on the focused ones come first, oldest first.
+        assert_eq!(order[..2], [1, 2]);
+        assert_eq!(order[2..7], hot[..]);
+        // The rest follows in the order it was queued.
+        let rest: Vec<u64> = (3..=total as u64 - 5).collect();
+        assert_eq!(order[7..], rest[..]);
+    }
+
+    /// A tree with a large `slow/` branch (150 directories of 100 files) and a small `target/`
+    /// branch (15 directories). Scans it with the priorities `steer` sets right after the
+    /// start, as the UI does, and returns the number of the last batch from each branch.
+    fn finish_order(
+        tag: &str,
+        threads: usize,
+        steer: impl Fn(&ScanControl, &Path),
+    ) -> (usize, usize) {
+        let base = std::env::temp_dir().join(format!("icdu_prio_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
-        // A big branch that takes a while, and a small branch we'll "navigate into".
         for d in 0..150 {
             let sd = base.join("slow").join(format!("s{d}"));
             fs::create_dir_all(&sd).unwrap();
@@ -711,9 +974,8 @@ mod tests {
         }
 
         let meta = fs::symlink_metadata(&base).unwrap();
-        let scan = start(base.clone(), opts(8, meta.dev()));
-        // Prioritize the target subtree immediately, as if the user navigated into it.
-        scan.control.set_focus(Some(base.join("target")));
+        let scan = start(base.clone(), opts(threads, meta.dev()));
+        steer(&scan.control, &base);
 
         // Track which directory ids belong to each branch (batches arrive parent-first).
         let mut target_ids: HashSet<u64> = HashSet::new();
@@ -743,14 +1005,175 @@ mod tests {
                 }
             }
         }
-
+        fs::remove_dir_all(&base).unwrap();
         assert!(last_target > 0 && last_slow > 0, "both branches scanned");
+        (last_target, last_slow)
+    }
+
+    /// End-to-end: focusing `target/` makes its subtree finish scanning before `slow/` does.
+    #[test]
+    fn focus_prioritizes_navigated_subtree() {
+        // Prioritize the target subtree immediately, as if the user navigated into it.
+        let (last_target, last_slow) = finish_order("focus", 8, |control, base| {
+            control.set_focus(Some(base.join("target")))
+        });
         assert!(
             last_target < last_slow,
             "focused 'target' subtree should finish before 'slow' (target@{last_target}, slow@{last_slow})"
         );
+    }
 
-        fs::remove_dir_all(&base).unwrap();
+    /// End-to-end: inside the viewed directory, the directory to finish first is read before
+    /// its siblings. One thread, so nothing but the priority decides the order.
+    #[test]
+    fn first_priority_finishes_a_subtree_before_its_siblings() {
+        let (last_target, last_slow) = finish_order("first", 1, |control, base| {
+            control.set_priorities(Some(base.join("target")), Some(base.to_path_buf()))
+        });
+        // The 16 directories of `target/` come right after the root, apart from the few of
+        // `slow/` that were read before the priorities arrived. `slow/` has 151.
+        assert!(
+            last_target < 80 && last_target < last_slow,
+            "target@{last_target}, slow@{last_slow}"
+        );
+    }
+
+    /// What a change of priorities costs with a million directories queued. Not a pass/fail
+    /// test:
+    ///
+    /// ```sh
+    /// cargo test --release priority_change_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn priority_change_measurement() {
+        use std::time::Instant;
+        const JOBS: usize = 1_000_000;
+        let mut f = Frontier::new(job(0, "/data"));
+        drop(f.pop());
+        for i in 0..JOBS {
+            f.push(DirJob {
+                id: i as u64 + 1,
+                path: format!(
+                    "/data/cache/{:03}/{:03}/entry-{i}",
+                    i % 512,
+                    (i / 512) % 512
+                )
+                .into(),
+            });
+        }
+        let focus = Some(PathBuf::from("/data/cache/007"));
+
+        let t = Instant::now();
+        f.set_priorities(None, focus.clone());
+        println!("changing the priorities:          {:>9.2?}", t.elapsed());
+        let t = Instant::now();
+        let first = f.pop().unwrap();
+        println!("the first job taken afterwards:   {:>9.2?}", t.elapsed());
+        drop(first);
+
+        // What the old code did in one go, on the UI thread and with the lock held.
+        let t = Instant::now();
+        let hot = f
+            .stale
+            .iter()
+            .flat_map(|queue| queue.late.iter().chain(&queue.fresh))
+            .filter(|j| f.class_of(&j.path) == FOCUSED)
+            .count();
+        println!(
+            "classifying all the others at once: {:>7.2?} ({hot} of them focused)",
+            t.elapsed()
+        );
+    }
+
+    /// How the order in which directories are read plays out on a real tree. Not a pass/fail
+    /// test. It scans `ICDU_MEASURE_ROOT` (default `/usr`) with the focus on
+    /// `ICDU_MEASURE_FOCUS` (a directory below it, default `<root>/share`), as if the user
+    /// had gone there at once, and reports when things completed:
+    ///
+    /// ```sh
+    /// cargo test --release scan_order_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn scan_order_measurement() {
+        use std::time::Instant;
+        let root = PathBuf::from(std::env::var("ICDU_MEASURE_ROOT").unwrap_or("/usr".into()));
+        let focus = std::env::var("ICDU_MEASURE_FOCUS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| root.join("share"));
+        let threads: usize = std::env::var("ICDU_MEASURE_THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(8);
+        let meta = fs::symlink_metadata(&root).unwrap();
+        let mut tree = Tree::new(
+            root.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        // The node of the focused directory, once the scan has delivered it.
+        let find_focus = |tree: &Tree| -> Option<NodeIdx> {
+            let mut cur = tree.root;
+            for part in focus.strip_prefix(&root).unwrap().components() {
+                let name = part.as_os_str().to_string_lossy();
+                cur = *tree.nodes[cur]
+                    .children
+                    .iter()
+                    .find(|&&c| tree.nodes[c].name == name.as_ref())?;
+            }
+            Some(cur)
+        };
+
+        let started = Instant::now();
+        let scan = start(root.clone(), opts(threads, meta.dev()));
+        scan.control.set_focus(Some(focus.clone()));
+        let (mut first_sub, mut focus_done) = (None, None);
+        let mut batches = 0usize;
+        for batch in scan.events.iter() {
+            tree.apply(batch);
+            batches += 1;
+            let Some(f) = find_focus(&tree) else { continue };
+            if first_sub.is_none() {
+                // A subdirectory of some substance, not an empty one.
+                let done = tree.nodes[f].children.iter().any(|&c| {
+                    let n = &tree.nodes[c];
+                    n.is_dir() && n.scanned && n.unscanned == 0 && n.items >= 10
+                });
+                if done {
+                    first_sub = Some((batches, started.elapsed()));
+                }
+            }
+            if focus_done.is_none() && tree.subtree_complete(f) {
+                focus_done = Some((batches, started.elapsed()));
+            }
+        }
+        let total = started.elapsed();
+        let show = |what: &str, at: Option<(usize, std::time::Duration)>| match at {
+            Some((n, t)) => println!(
+                "{what:<44} after {n:>7} directories ({:>3}%), {t:>9.2?}",
+                n * 100 / batches
+            ),
+            None => println!("{what:<44} never"),
+        };
+        println!(
+            "scanned {} with {threads} threads, focus on {}",
+            root.display(),
+            focus.display()
+        );
+        show("first subdirectory of the focus complete", first_sub);
+        show("focused directory complete", focus_done);
+        println!(
+            "{:<44} after {batches:>7} directories (100%), {total:>9.2?}",
+            "scan complete"
+        );
+        println!(
+            "{:<44} {:>13}",
+            "most directories queued at once",
+            scan.control.peak_queued()
+        );
     }
 
     /// Subtree rescan end-to-end: after the whole tree is scanned, `Tree::begin_refresh` tears
