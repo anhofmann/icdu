@@ -631,6 +631,7 @@ fn render_help(f: &mut Frame) {
         Line::from(
             "  /                 search by name (Enter goes there, Tab: this directory only)",
         ),
+        Line::from("                    in the search: C-u clear, C-w delete word, paste works"),
         Line::from("  a                 toggle apparent ↔ disk usage"),
         Line::from("  c                 toggle item count column (entries below each dir)"),
         Line::from("  d                 delete selected (confirm; needs full scan)"),
@@ -644,6 +645,7 @@ fn render_help(f: &mut Frame) {
         Line::from("  ?                 toggle this help"),
         Line::from("  q / Ctrl-C        quit (during a delete: press twice to abort it)"),
         Line::from("  Esc               close a popup"),
+        Line::from("  C-l               redraw the screen"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  indicators: / dir   @ link   H hard-link dup   < excluded   ! error",

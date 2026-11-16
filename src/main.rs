@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use ratatui::crossterm::execute;
 
 use app::{App, InputMode, KeyAction};
 use model::Tree;
@@ -197,7 +200,8 @@ KEYS:
     o               open          i               entry details
     E               export JSON   b               shell in this directory
     x / !           next error    ?               help    q  quit
-    Home/End, G     top/bottom    c               item counts",
+    Home/End, G     top/bottom    c               item counts
+    C-l             redraw        (in the search: C-u clear, C-w delete word)",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -245,14 +249,7 @@ fn main() {
     app.show_item_count = args.show_item_count;
     app.attach_scan(scan, opts);
 
-    let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
-    ratatui::restore();
-
-    if let Err(e) = result {
-        eprintln!("icdu: {e}");
-        std::process::exit(1);
-    }
+    run_ui(&mut app);
 }
 
 fn unwrap_or_die<T>(res: std::io::Result<T>, ctx: &str) -> T {
@@ -379,10 +376,31 @@ fn write_export(tree: &Tree, dest: &str) -> std::io::Result<()> {
     }
 }
 
-fn run_ui(app: &mut App) {
-    let mut terminal = ratatui::init();
-    let result = run(&mut terminal, app);
+/// Enter the TUI: raw mode and the alternate screen (ratatui), plus bracketed paste, so that
+/// pasted text arrives as one event and not as a burst of key presses.
+fn init_terminal() -> ratatui::DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    terminal
+}
+
+/// Leave the TUI and give the terminal back as it was.
+fn restore_terminal() {
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
+}
+
+fn run_ui(app: &mut App) {
+    // ratatui's panic hook restores the screen but knows nothing of the paste mode. This hook
+    // is installed first, so ratatui's wraps it and calls it after its own restore.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        default_hook(info);
+    }));
+    let mut terminal = init_terminal();
+    let result = run(&mut terminal, app);
+    restore_terminal();
     if let Err(e) = result {
         eprintln!("icdu: {e}");
         std::process::exit(1);
@@ -432,20 +450,23 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
             timeout = timeout.min(due.saturating_duration_since(Instant::now()));
         }
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Page height = list rows (total minus header, footer, and the list's two
                     // border rows), used by PgUp/PgDn and C-d/C-u.
                     let page = terminal
                         .size()
                         .map(|s| (s.height.saturating_sub(5) as usize).max(1))
                         .unwrap_or(20);
-                    if let Some(action) =
-                        decode_key(key.code, key.modifiers, app.input_mode(), page)
-                    {
-                        app.on_key(action);
+                    match decode_key(key.code, key.modifiers, app.input_mode(), page) {
+                        // The one action that needs the terminal: repaint everything.
+                        Some(KeyAction::Redraw) => terminal.clear()?,
+                        Some(action) => app.on_key(action),
+                        None => {}
                     }
                 }
+                Event::Paste(text) => app.on_paste(&text),
+                _ => {}
             }
         }
         app.tick = app.tick.wrapping_add(1);
@@ -464,13 +485,13 @@ fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<Stri
     let Some(shell) = shell else {
         return Some("no SHELL set — cannot spawn a shell".into());
     };
-    ratatui::restore();
+    restore_terminal();
     let outcome = match Command::new(&shell).current_dir(dir).status() {
         Ok(status) if status.success() => format!("shell exited (was in {})", dir.display()),
         Ok(status) => format!("shell exited with {status}"),
         Err(e) => format!("shell failed: {e}"),
     };
-    *terminal = ratatui::init();
+    *terminal = init_terminal();
     Some(outcome)
 }
 
@@ -480,9 +501,34 @@ fn decode_key(
     mode: InputMode,
     page: usize,
 ) -> Option<KeyAction> {
-    // Ctrl-C quits even while a search query is being typed.
-    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
-        return Some(KeyAction::Quit);
+    // A letter with Ctrl, Alt or the like is not that letter: Ctrl-E must not export, Alt-D
+    // must not delete, Ctrl-W must not type a `w`. Only the Ctrl combinations bound here do
+    // anything, and none of them changes anything on disk. Shift is how capitals are typed
+    // and does not count.
+    let chord = KeyModifiers::CONTROL
+        | KeyModifiers::ALT
+        | KeyModifiers::SUPER
+        | KeyModifiers::HYPER
+        | KeyModifiers::META;
+    if let (KeyCode::Char(c), true) = (code, mods.intersects(chord)) {
+        if mods.intersection(chord) != KeyModifiers::CONTROL {
+            return None;
+        }
+        let find = mode == InputMode::Find;
+        return match c.to_ascii_lowercase() {
+            // Ctrl-C quits even while a search query is being typed.
+            'c' => Some(KeyAction::Quit),
+            'l' => Some(KeyAction::Redraw),
+            // Some terminals send ^H for the Backspace key.
+            'h' if find => Some(KeyAction::FindBackspace),
+            'h' => Some(KeyAction::Leave),
+            'u' if find => Some(KeyAction::FindClear),
+            'w' if find => Some(KeyAction::FindDeleteWord),
+            // Vim-style half-page keys; a full page here.
+            'd' if !find => Some(KeyAction::PageDown(page)),
+            'u' if !find => Some(KeyAction::PageUp(page)),
+            _ => None,
+        };
     }
     // The search popup: letters go to the query, so only non-letter keys navigate.
     if mode == InputMode::Find {
@@ -509,9 +555,6 @@ fn decode_key(
         KeyCode::Char('k') | KeyCode::Up => KeyAction::Up,
         KeyCode::PageDown => KeyAction::PageDown(page),
         KeyCode::PageUp => KeyAction::PageUp(page),
-        // Vim-style half-keys map to a full page; kept ahead of the plain `d` (delete) arm.
-        KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => KeyAction::PageDown(page),
-        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => KeyAction::PageUp(page),
         KeyCode::Home => KeyAction::Top,
         KeyCode::Char('G') | KeyCode::End => KeyAction::Bottom,
         KeyCode::Char('l') | KeyCode::Enter | KeyCode::Right => KeyAction::Enter,
@@ -520,7 +563,6 @@ fn decode_key(
         }
         KeyCode::Char('s') => KeyAction::ToggleSort,
         KeyCode::Char('a') => KeyAction::ToggleUsage,
-        // Plain `c` only: Ctrl-C was turned into Quit at the top.
         KeyCode::Char('c') => KeyAction::ToggleItemCount,
         KeyCode::Char('d') => KeyAction::Delete,
         KeyCode::Char('o') => KeyAction::Open,
@@ -721,6 +763,85 @@ mod tests {
                 "{code:?} with {mods:?}"
             );
         }
+    }
+
+    /// A letter with Ctrl or Alt is not that letter. Only the combinations that are bound do
+    /// anything, and none of them deletes, writes a file or starts a rescan.
+    #[test]
+    fn modified_letters_do_not_act_as_plain_ones() {
+        use KeyAction::*;
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+        let dec = |c, mods| decode_key(KeyCode::Char(c), mods, InputMode::Normal, 10);
+
+        // The bound combinations.
+        assert_eq!(dec('c', ctrl), Some(Quit));
+        assert_eq!(dec('d', ctrl), Some(PageDown(10)));
+        assert_eq!(dec('u', ctrl), Some(PageUp(10)));
+        assert_eq!(dec('l', ctrl), Some(Redraw));
+        // Terminals that send ^H for the Backspace key.
+        assert_eq!(dec('h', ctrl), Some(Leave));
+
+        let harmless = [Quit, PageDown(10), PageUp(10), Redraw, Leave];
+        let letters = ('a'..='z').chain('A'..='Z').chain("/?!<".chars());
+        for c in letters {
+            for mods in [
+                ctrl,
+                alt,
+                ctrl | alt,
+                KeyModifiers::SUPER,
+                KeyModifiers::META,
+            ] {
+                match dec(c, mods) {
+                    None => {}
+                    Some(action) => assert!(
+                        harmless.contains(&action),
+                        "{c:?} with {mods:?} gives {action:?}"
+                    ),
+                }
+            }
+            // Alt is never bound.
+            assert_eq!(dec(c, alt), None, "Alt-{c}");
+        }
+        // The examples from the bug report.
+        for (c, mods) in [
+            ('e', ctrl),
+            ('E', ctrl),
+            ('r', ctrl),
+            ('d', alt),
+            ('z', ctrl),
+        ] {
+            assert_eq!(dec(c, mods), None, "{c:?} with {mods:?}");
+        }
+        // Shift is how capitals are typed, not a modifier in this sense.
+        assert_eq!(dec('G', KeyModifiers::SHIFT), Some(Bottom));
+        assert_eq!(dec('E', KeyModifiers::SHIFT), Some(Export));
+    }
+
+    /// In the search, a modified letter never reaches the query. Ctrl-U, Ctrl-W and Ctrl-H
+    /// edit the line; Ctrl-L redraws in every mode.
+    #[test]
+    fn decode_key_edits_the_search_line() {
+        use KeyAction::*;
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+        let dec = |c, mods| decode_key(KeyCode::Char(c), mods, InputMode::Find, 10);
+        assert_eq!(dec('u', ctrl), Some(FindClear));
+        assert_eq!(dec('w', ctrl), Some(FindDeleteWord));
+        assert_eq!(dec('h', ctrl), Some(FindBackspace));
+        assert_eq!(dec('l', ctrl), Some(Redraw));
+        assert_eq!(dec('c', ctrl), Some(Quit));
+        for (c, mods) in [
+            ('d', ctrl),
+            ('z', ctrl),
+            ('a', ctrl),
+            ('x', alt),
+            ('u', alt),
+        ] {
+            assert_eq!(dec(c, mods), None, "{c:?} with {mods:?}");
+        }
+        assert_eq!(dec('U', KeyModifiers::SHIFT), Some(FindChar('U')));
+        assert_eq!(dec('u', KeyModifiers::NONE), Some(FindChar('u')));
     }
 
     /// `/` opens the search, and it is the only key that does; inside it letters (even `q`,

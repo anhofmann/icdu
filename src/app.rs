@@ -988,6 +988,16 @@ impl App {
         true
     }
 
+    /// Text pasted into the terminal. It belongs to the search query when the popup is open,
+    /// without line breaks and other control characters: a newline in the clipboard is not
+    /// Enter. Anywhere else a paste is dropped; the letters in it are not commands.
+    pub fn on_paste(&mut self, text: &str) {
+        if let Modal::Find(f) = &mut self.modal {
+            f.query.extend(text.chars().filter(|c| !c.is_control()));
+            f.edited = true;
+        }
+    }
+
     pub fn on_key(&mut self, action: KeyAction) {
         // Note: a background deletion does NOT block input — the user can keep browsing. Only
         // the subtree being deleted is locked (see `descend` and `request_delete`).
@@ -1050,6 +1060,22 @@ impl App {
                     }
                     KeyAction::FindBackspace => {
                         f.query.pop();
+                        f.edited = true;
+                        true
+                    }
+                    KeyAction::FindClear => {
+                        f.query.clear();
+                        f.edited = true;
+                        true
+                    }
+                    KeyAction::FindDeleteWord => {
+                        // The spaces after the last word go with it, as in a shell.
+                        let keep = f.query.trim_end().len();
+                        f.query.truncate(keep);
+                        let word = f.query.rfind(char::is_whitespace).map_or(0, |at| {
+                            at + f.query[at..].chars().next().map_or(1, char::len_utf8)
+                        });
+                        f.query.truncate(word);
                         f.edited = true;
                         true
                     }
@@ -1162,7 +1188,13 @@ impl App {
             // Esc and `n` answer dialogs; in the browser they do nothing (as in ncdu).
             KeyAction::Confirm | KeyAction::Cancel => {}
             // Only produced while the search popup is open, which handles them above.
-            KeyAction::FindChar(_) | KeyAction::FindBackspace | KeyAction::FindScope => {}
+            KeyAction::FindChar(_)
+            | KeyAction::FindBackspace
+            | KeyAction::FindClear
+            | KeyAction::FindDeleteWord
+            | KeyAction::FindScope => {}
+            // Handled by the event loop, which owns the terminal.
+            KeyAction::Redraw => {}
         }
     }
 
@@ -1511,8 +1543,14 @@ pub enum KeyAction {
     /// A character typed into the search popup's query.
     FindChar(char),
     FindBackspace,
+    /// Empty the search query (Ctrl-U).
+    FindClear,
+    /// Remove the last word of the search query (Ctrl-W).
+    FindDeleteWord,
     /// Switch the search between the whole tree and the viewed directory.
     FindScope,
+    /// Repaint the whole screen (Ctrl-L). The event loop does it; the app has nothing to do.
+    Redraw,
     /// A key whose function moved to another key: the footer says where.
     Moved(&'static str),
 }
@@ -3466,6 +3504,65 @@ mod tests {
         app.on_key(KeyAction::Enter);
         let sel = app.selected.expect("the hit is selected");
         assert!(app.sorted_children().contains(&sel));
+    }
+
+    /// Ctrl-U empties the query, Ctrl-W removes the last word, and each restarts the search.
+    #[test]
+    fn find_line_editing() {
+        let mut app = app_for_find();
+        let t0 = search(&mut app, "read me now");
+        app.on_key(KeyAction::FindDeleteWord);
+        assert_eq!(find_state(&app).query, "read me ");
+        app.on_key(KeyAction::FindDeleteWord);
+        assert_eq!(
+            find_state(&app).query,
+            "read ",
+            "trailing spaces go with the word"
+        );
+        app.on_key(KeyAction::FindDeleteWord);
+        assert_eq!(find_state(&app).query, "");
+        app.on_key(KeyAction::FindDeleteWord);
+        assert_eq!(find_state(&app).query, "", "nothing left to delete");
+
+        type_query(&mut app, "readme");
+        app.find_tick(t0, usize::MAX);
+        app.find_tick(t0 + FIND_DEBOUNCE, usize::MAX);
+        assert_eq!(find_state(&app).total, 3);
+        app.on_key(KeyAction::FindClear);
+        assert_eq!(find_state(&app).query, "");
+        app.find_tick(t0 + FIND_DEBOUNCE, usize::MAX);
+        app.find_tick(t0 + FIND_DEBOUNCE * 2, usize::MAX);
+        assert!(
+            find_state(&app).active.is_none(),
+            "an empty query searches nothing"
+        );
+        assert!(hit_names(&app).is_empty());
+    }
+
+    /// Pasted text goes into the query as typed text would, minus line breaks and other
+    /// control characters: a newline in the clipboard must not act as Enter.
+    #[test]
+    fn paste_goes_into_the_search_query() {
+        let mut app = app_for_find();
+        app.on_key(KeyAction::Down); // settle the selection (first key always selects)
+        let (cur, sel) = (app.cur, app.selected);
+        let t0 = search(&mut app, "");
+        app.on_paste("read\r\nme\t\u{7}");
+        assert_eq!(find_state(&app).query, "readme");
+        assert!(matches!(app.modal, Modal::Find(_)), "still open: no jump");
+        assert_eq!((app.cur, app.selected), (cur, sel));
+        app.find_tick(t0, usize::MAX);
+        app.find_tick(t0 + FIND_DEBOUNCE, usize::MAX);
+        assert_eq!(find_state(&app).total, 3, "and the search runs");
+
+        // Outside the search a paste is not a sequence of key presses.
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Down);
+        let before = (app.cur, app.selected);
+        app.on_paste("dqy\n");
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!((app.cur, app.selected), before);
+        assert!(!app.quit);
     }
 
     /// Enter moves the view to the hit's parent with the hit selected and closes the popup.

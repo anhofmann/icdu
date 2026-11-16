@@ -114,6 +114,11 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `?` | show the help dialog |
 | `q` | quit |
 | `Esc` | close a popup (it never quits) |
+| `Ctrl-l` | redraw the screen |
+
+A letter typed with Ctrl or Alt is never taken for the plain letter: `Ctrl-e` does not export and
+`Alt-d` does not delete. The only such combinations that do anything are `Ctrl-c`, `Ctrl-d`,
+`Ctrl-u` and `Ctrl-l`.
 
 Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` excluded · `!` read error.
 
@@ -133,6 +138,8 @@ Press `/` to ask: *where in this tree is anything called X?* Type part of a name
 matches are listed with their path and size, largest first, with the matched part highlighted.
 `↑`/`↓` and `PgUp`/`PgDn` move (letters all go to the query), `Enter` jumps to the directory
 containing the selected match with it highlighted, and `Esc` closes the popup without moving.
+To edit the query, `Backspace` deletes a character, `Ctrl-w` the last word and `Ctrl-u` the
+whole line. Pasted text goes into the query as it is, without its line breaks.
 
 `Tab` switches what is searched: the whole tree (the default), or only what lies below the
 directory you are viewing. Limited to a directory, paths are shown relative to it. The title
