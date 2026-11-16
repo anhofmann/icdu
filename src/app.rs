@@ -729,7 +729,11 @@ impl App {
                 continue;
             }
             if self.jump_to(idx) {
-                self.status = Some(format!("read error: {}", self.tree.path_of(idx)));
+                let path = self.tree.path_of(idx);
+                self.status = Some(match self.tree.error_of(idx) {
+                    Some(why) => format!("read error: {path}: {why}"),
+                    None => format!("read error: {path}"),
+                });
             }
             return;
         }
@@ -876,7 +880,9 @@ impl App {
             Excluded::No => {}
         }
         if n.read_error {
-            rows.push(("read error".to_string(), "yes".to_string()));
+            // The reason, when the scan recorded one; a dump only carries the flag.
+            let why = self.tree.error_of(idx).unwrap_or("yes");
+            rows.push(("read error".to_string(), why.to_string()));
         }
         if self.imported {
             // The path may belong to another machine; a local file of the same name would
@@ -2018,7 +2024,7 @@ mod tests {
             hlink: false,
             shared: false,
             excluded: Excluded::No,
-            read_error: false,
+            error: None,
             dir_id,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
@@ -2162,6 +2168,70 @@ mod tests {
         // Wrapped: both errors seen, back to the first.
         app.on_key(KeyAction::NextError);
         assert_eq!(app.tree.nodes[app.selected.unwrap()].name, "broken");
+    }
+
+    /// The reason a directory could not be read is shown where the error is reported: in the
+    /// info popup and in the footer when `x` jumps to it. Without a recorded reason (an
+    /// imported dump has only the flag) both fall back to the bare fact.
+    #[test]
+    fn read_errors_show_their_reason() {
+        use crate::scan::NewNode;
+        let dir = |name: &str, id| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind: NodeKind::Dir,
+            apparent: 0,
+            disk: 0,
+            dev: 1,
+            ino: id,
+            hlink: false,
+            shared: false,
+            excluded: Excluded::No,
+            error: None,
+            dir_id: Some(id),
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("locked", 1), dir("flagged", 2)],
+            error: None,
+        });
+        app.tree.apply(Batch {
+            parent_id: 1,
+            nodes: Vec::new(),
+            error: Some("Permission denied (os error 13)".into()),
+        });
+        app.tree.apply(Batch {
+            parent_id: 2,
+            nodes: Vec::new(),
+            error: None,
+        });
+        let (locked, flagged) = (idx_named(&app, "locked"), idx_named(&app, "flagged"));
+        app.tree.nodes[flagged].read_error = true; // as an import would
+
+        let row = |app: &App, idx| {
+            app.info_pairs(idx)
+                .into_iter()
+                .find(|(k, _)| k == "read error")
+                .map(|(_, v)| v)
+        };
+        assert_eq!(
+            row(&app, locked).as_deref(),
+            Some("Permission denied (os error 13)")
+        );
+        assert_eq!(row(&app, flagged).as_deref(), Some("yes"));
+        assert_eq!(row(&app, app.tree.root), None);
+
+        app.selected = Some(flagged);
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.selected, Some(locked));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("read error: /r/locked: Permission denied (os error 13)")
+        );
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.selected, Some(flagged));
+        assert_eq!(app.status.as_deref(), Some("read error: /r/flagged"));
     }
 
     /// With no errors anywhere, nothing moves and the footer says so.
@@ -2490,7 +2560,7 @@ mod tests {
             hlink: false,
             shared: false,
             excluded: Excluded::No,
-            read_error: false,
+            error: None,
             dir_id: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), false, false, true);
@@ -2527,7 +2597,7 @@ mod tests {
             hlink: false,
             shared: false,
             excluded: Excluded::No,
-            read_error: false,
+            error: None,
             dir_id,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
@@ -3232,7 +3302,7 @@ mod tests {
             hlink: false,
             shared: false,
             excluded: Excluded::No,
-            read_error: false,
+            error: None,
             dir_id,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);

@@ -108,7 +108,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `r` | rescan the current directory in place |
 | `i` | show details of the selected entry |
 | `E` | export the tree to an ncdu-format JSON file |
-| `x` | jump to the next read-error entry (`!` marker), wrapping around |
+| `x` | jump to the next read-error entry (`!` marker), wrapping around; the footer shows the reason |
 | `b` | spawn `$SHELL` in the current directory |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog |
@@ -195,6 +195,14 @@ exclusions, read errors) — plus, statted lazily from disk at open time, its pe
 numeric owner, modification time, inode, and link count. Nothing extra is stored per node, so
 the tree stays lean; if the path is gone (deleted mid-session) the popup says the on-disk
 details are unavailable. For an imported dump (`-f`) nothing is read from disk at all.
+
+### Read errors
+
+An entry the scan could not read is marked `!`: a directory it was not allowed to list or
+could not list to the end, or an entry it could not examine. The reason, in the words of the
+operating system ("Permission denied"), is shown in the info popup and in the footer when `x`
+jumps there. What a failed listing did return is kept. Entries that simply disappear while the
+scan runs (temporary files, processes in `/proc`) are not errors and are left out.
 
 ### Deleting
 

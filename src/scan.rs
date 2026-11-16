@@ -52,7 +52,9 @@ pub struct NewNode {
     pub hlink: bool,
     pub shared: bool,
     pub excluded: Excluded,
-    pub read_error: bool,
+    /// Why the entry could not be examined (its `lstat` failed), if it could not. Such an
+    /// entry is shown with the read-error flag and without a size.
+    pub error: Option<Box<str>>,
     /// For directories we will recurse into: the id future batches use as `parent_id`.
     pub dir_id: Option<u64>,
 }
@@ -61,7 +63,8 @@ pub struct NewNode {
 pub struct Batch {
     pub parent_id: u64,
     pub nodes: Vec<NewNode>,
-    /// Set if the directory could not be read (e.g. permission denied).
+    /// Set if the directory could not be read, or not to the end (e.g. permission denied, an
+    /// I/O error halfway through). `nodes` then holds what was listed before the error.
     pub error: Option<String>,
 }
 
@@ -163,6 +166,38 @@ struct Shared {
     seen_hardlinks: Mutex<HashSet<(u64, u64)>>,
     /// A rescan's starting directory: its job id and what it must still be when it is read.
     start_check: Option<(u64, Identity)>,
+    /// The id of the directory the scan starts at.
+    start_id: u64,
+}
+
+/// True if the error says the entry is gone. Between listing a directory and examining an
+/// entry, anything can be removed; in `/proc` that happens all the time. An entry that
+/// vanished is not a read error: nothing is wrong, it is just not there any more.
+fn vanished(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Yields the entries of a directory listing and keeps the first error the listing reports.
+/// An error in the middle (an I/O error, a stale network handle) must not be dropped: the
+/// directory was not read to the end, and has to say so.
+struct Listing<I> {
+    inner: I,
+    error: Option<String>,
+}
+
+impl<T, I: Iterator<Item = std::io::Result<T>>> Iterator for Listing<I> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        loop {
+            match self.inner.next()? {
+                Ok(entry) => return Some(entry),
+                Err(e) => {
+                    self.error.get_or_insert_with(|| e.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Device and inode of a directory, as the tree recorded them when it was scanned.
@@ -239,6 +274,7 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identi
         newer_than: opts.newer_than,
         seen_hardlinks: Mutex::new(HashSet::new()),
         start_check: identity.map(|identity| (id_base, identity)),
+        start_id: id_base,
     });
 
     for _ in 0..opts.threads {
@@ -297,6 +333,16 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     };
     let read = match std::fs::read_dir(&job.path) {
         Ok(r) => r,
+        // Removed since its parent was listed: an empty directory, not an error. The
+        // directory the scan was asked to start at is different: that one has to exist.
+        Err(e) if vanished(&e) && job.id != shared.start_id => {
+            let _ = shared.ev_tx.send(Batch {
+                parent_id: job.id,
+                nodes: Vec::new(),
+                error: None,
+            });
+            return;
+        }
         Err(e) => return failed(e.to_string()),
     };
     // Checked after the directory is open: had the path been a symlink when it was opened,
@@ -312,7 +358,11 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     let mut nodes = Vec::new();
     let mut child_jobs = Vec::new();
 
-    for entry in read.flatten() {
+    let mut listing = Listing {
+        inner: read,
+        error: None,
+    };
+    for entry in listing.by_ref() {
         let path = entry.path();
         let file_name = entry.file_name();
         let (name, raw_name) = match file_name.to_str() {
@@ -327,7 +377,8 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         // itself and never traversed (matching ncdu's default and avoiding cycles).
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => {
+            Err(e) if vanished(&e) => continue,
+            Err(e) => {
                 // Unreadable entry: record it with a read error, zero size.
                 nodes.push(NewNode {
                     name,
@@ -340,7 +391,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                     hlink: false,
                     shared: false,
                     excluded: Excluded::No,
-                    read_error: true,
+                    error: Some(e.to_string().into()),
                     dir_id: None,
                 });
                 continue;
@@ -403,7 +454,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
             hlink,
             shared: shared_hl,
             excluded,
-            read_error: false,
+            error: None,
             dir_id,
         });
         if let Some(id) = dir_id {
@@ -417,7 +468,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     let _ = shared.ev_tx.send(Batch {
         parent_id: job.id,
         nodes,
-        error: None,
+        error: listing.error,
     });
 
     // Enqueue the subdirectories, prioritizing those under the focused path, and wake idle
@@ -918,6 +969,138 @@ mod tests {
         assert_eq!(tree.nodes[tree.root].items, entries_on_disk(&base) - 2);
         assert_eq!(tree.nodes[tree.root].items, 10);
 
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// An entry that is gone is not an error; everything else is.
+    #[test]
+    fn only_a_missing_entry_counts_as_vanished() {
+        use std::io::{Error, ErrorKind};
+        assert!(vanished(&Error::from(ErrorKind::NotFound)));
+        assert!(vanished(
+            &fs::symlink_metadata("/nonexistent/icdu/path").unwrap_err()
+        ));
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(!vanished(&Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    /// An error in the middle of a listing is kept, and the entries around it still come out.
+    #[test]
+    fn listing_keeps_the_first_error() {
+        use std::io::Error;
+        let items: Vec<std::io::Result<u32>> = vec![
+            Ok(1),
+            Err(Error::other("first")),
+            Ok(2),
+            Err(Error::other("second")),
+        ];
+        let mut listing = Listing {
+            inner: items.into_iter(),
+            error: None,
+        };
+        assert_eq!(listing.by_ref().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(listing.error.as_deref(), Some("first"));
+
+        let mut clean = Listing {
+            inner: vec![Ok::<u32, Error>(7)].into_iter(),
+            error: None,
+        };
+        assert_eq!(clean.by_ref().count(), 1);
+        assert_eq!(clean.error, None);
+    }
+
+    /// Collect a whole scan into a tree.
+    fn scan_tree(root: &Path, threads: usize) -> Tree {
+        let meta = fs::symlink_metadata(root).unwrap();
+        let mut tree = Tree::new(
+            root.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        for batch in start(root.to_path_buf(), opts(threads, meta.dev()))
+            .events
+            .iter()
+        {
+            tree.apply(batch);
+        }
+        tree
+    }
+
+    /// A directory that cannot be read is flagged, and the tree keeps the reason.
+    #[test]
+    fn unreadable_directory_keeps_the_os_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("icdu_eacces_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("locked")).unwrap();
+        fs::write(base.join("locked/inside"), b"x").unwrap();
+        fs::write(base.join("plain"), b"x").unwrap();
+        fs::set_permissions(base.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let unlock =
+            || fs::set_permissions(base.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        if fs::read_dir(base.join("locked")).is_ok() {
+            eprintln!("skipped: running with privileges that ignore directory permissions");
+            unlock();
+            fs::remove_dir_all(&base).unwrap();
+            return;
+        }
+
+        let tree = scan_tree(&base, 2);
+        unlock();
+        let named = |name: &str| tree.nodes.iter().position(|n| n.name == name).unwrap();
+        let locked = named("locked");
+        assert!(tree.nodes[locked].read_error);
+        assert!(
+            tree.error_of(locked)
+                .is_some_and(|e| e.contains("Permission denied")),
+            "{:?}",
+            tree.error_of(locked)
+        );
+        assert!(!tree.nodes[named("plain")].read_error);
+        assert_eq!(tree.error_of(named("plain")), None);
+        assert!(!tree.nodes[tree.root].read_error);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Entries that disappear while the scan runs are not read errors. Which ones the scan
+    /// still catches is a race; that none of them is flagged must hold every time.
+    #[test]
+    fn entries_removed_during_the_scan_are_not_errors() {
+        let base = std::env::temp_dir().join(format!("icdu_vanish_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for d in 0..20 {
+            let dir = base.join(format!("d{d:02}"));
+            fs::create_dir_all(dir.join("sub")).unwrap();
+            for f in 0..100 {
+                fs::write(dir.join(format!("f{f:03}")), b"x").unwrap();
+            }
+        }
+        let remover = {
+            let base = base.clone();
+            thread::spawn(move || {
+                for d in (0..20).rev() {
+                    let _ = fs::remove_dir_all(base.join(format!("d{d:02}")));
+                }
+            })
+        };
+        let tree = scan_tree(&base, 1);
+        remover.join().unwrap();
+        let flagged: Vec<&str> = tree
+            .nodes
+            .iter()
+            .filter(|n| n.read_error)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(flagged.is_empty(), "flagged as read errors: {flagged:?}");
+        assert!(tree.subtree_complete(tree.root));
         fs::remove_dir_all(&base).unwrap();
     }
 

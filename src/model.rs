@@ -98,6 +98,9 @@ pub struct Tree {
     /// The on-disk bytes of the few names that are not valid UTF-8. `Node::name` holds their
     /// lossy form for display; kept here so that `Node` does not grow for a rare case.
     raw_names: HashMap<NodeIdx, Box<[u8]>>,
+    /// Why an entry is flagged with a read error, in the words of the OS. Only entries a scan
+    /// could not read have one; an imported dump carries the flag without a reason.
+    errors: HashMap<NodeIdx, Box<str>>,
     pub total_files: u64,
     pub total_dirs: u64,
     /// How many times a subtree has been detached (deleted or torn down for a rescan). While
@@ -134,6 +137,7 @@ impl Tree {
             dir_index,
             orphans: HashMap::new(),
             raw_names: HashMap::new(),
+            errors: HashMap::new(),
             total_dirs: 1,
             total_files: 0,
             detached: 0,
@@ -163,8 +167,9 @@ impl Tree {
             // This directory is now read: one fewer unscanned dir in every ancestor's subtree.
             self.bump_unscanned(parent_idx, -1);
         }
-        if batch.error.is_some() {
+        if let Some(error) = batch.error {
             self.nodes[parent_idx].read_error = true;
+            self.errors.insert(parent_idx, error.into());
         }
 
         let mut sum_apparent = 0u64;
@@ -197,6 +202,10 @@ impl Tree {
             if let Some(raw) = nn.raw_name {
                 self.raw_names.insert(idx, raw);
             }
+            let read_error = nn.error.is_some();
+            if let Some(error) = nn.error {
+                self.errors.insert(idx, error);
+            }
 
             self.nodes.push(Node {
                 name: nn.name,
@@ -210,7 +219,7 @@ impl Tree {
                 hlink: nn.hlink,
                 shared: nn.shared,
                 excluded: nn.excluded,
-                read_error: nn.read_error,
+                read_error,
                 scanned: false,
                 unscanned: 0,
                 items: 0,
@@ -415,6 +424,7 @@ impl Tree {
         let n = &mut self.nodes[idx];
         n.scanned = false;
         n.read_error = false;
+        self.errors.remove(&idx);
         // This directory is unread again, and every ancestor has to count it: the batch that
         // reads it takes one off the whole chain (see `graft`), and until then nothing above
         // it may pass the delete/rescan gate.
@@ -474,6 +484,11 @@ impl Tree {
         }
         parts.reverse();
         parts.join("/")
+    }
+
+    /// Why `idx` has a read error, if the scan recorded a reason.
+    pub fn error_of(&self, idx: NodeIdx) -> Option<&str> {
+        self.errors.get(&idx).map(|e| &**e)
     }
 
     /// The on-disk bytes of a name that is not valid UTF-8; `None` for every other entry.
@@ -626,7 +641,7 @@ mod tests {
             hlink: false,
             shared: false,
             excluded: Excluded::No,
-            read_error: false,
+            error: None,
             dir_id: Some(id),
         }
     }
@@ -653,6 +668,41 @@ mod tests {
         assert_eq!(t.rel_path_from(t.root, t.root), "");
         // Not an ancestor: the walk ends at the root.
         assert_eq!(t.rel_path_from(a, b), "a");
+    }
+
+    /// The tree keeps why something could not be read, for a directory and for a single
+    /// entry, and forgets it when the directory is read again.
+    #[test]
+    fn read_error_reasons_are_kept_and_cleared_by_a_rescan() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                dir("a", 1),
+                NewNode {
+                    error: Some("Input/output error (os error 5)".into()),
+                    ..file("broken", 10)
+                },
+            ],
+            error: None,
+        });
+        // The listing of `a` broke off after one entry.
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("seen", 11)],
+            error: Some("Stale file handle (os error 116)".into()),
+        });
+        let (a, broken) = (idx_of(&t, "a"), idx_of(&t, "broken"));
+        assert!(t.nodes[a].read_error && t.nodes[broken].read_error);
+        assert_eq!(t.error_of(a), Some("Stale file handle (os error 116)"));
+        assert_eq!(t.error_of(broken), Some("Input/output error (os error 5)"));
+        assert_eq!(t.nodes[a].children.len(), 1, "what was listed is kept");
+        assert_eq!(t.error_of(t.root), None);
+        assert!(t.subtree_complete(t.root), "a failed read is still a read");
+
+        t.begin_refresh(a, crate::scan::SCAN_ID_STRIDE);
+        assert!(!t.nodes[a].read_error);
+        assert_eq!(t.error_of(a), None);
     }
 
     /// A directory is not deletable until its entire subtree has been scanned.
