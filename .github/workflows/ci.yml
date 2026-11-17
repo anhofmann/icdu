@@ -51,7 +51,7 @@ jobs:
         with:
           args: -color
       - name: shellcheck
-        run: shellcheck install.sh tools/dist/build.sh tools/demo/record.sh
+        run: shellcheck install.sh tools/dist/*.sh tools/demo/record.sh
 
   # The release binaries, so that what a tag would build is built for every change.
   dist:

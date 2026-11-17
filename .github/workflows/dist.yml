@@ -1,7 +1,9 @@
 name: Dist
 
-# The release archives for the four targets: the binary built by the one recipe
-# (tools/dist/build.sh), packed with licence, README and changelog (tools/dist/package.py).
+# What a release consists of. For the four targets an archive: the binary built by the one
+# recipe (tools/dist/build.sh), packed with manual page, licence, README and changelog
+# (tools/dist/package.py). For the two Linux targets also a Debian package
+# (tools/dist/deb.sh).
 # CI calls this for every change, so a change that breaks a release build is seen then and
 # not when a tag is pushed. The release workflow calls it and publishes what it built.
 on:
@@ -59,4 +61,35 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+      # The two Linux builds also come as Debian packages.
+      - name: Debian package
+        if: runner.os == 'Linux'
+        run: |
+          deb=$(tools/dist/deb.sh "${{ matrix.target }}" "$BINARY" dist)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends lintian
+          lintian --fail-on error "$deb"
+          echo "DEB=$deb" >> "$GITHUB_ENV"
+
+      - name: Install the Debian package, use it, remove it
+        if: runner.os == 'Linux' && matrix.native
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          sudo dpkg -i "$DEB"
+          test "$(/usr/bin/icdu --version)" = "icdu $version"
+          man -w icdu
+          sudo apt-get remove -y -qq icdu
+          test ! -e /usr/bin/icdu
+          test ! -e /usr/share/man/man1/icdu.1.gz
+          test ! -e /usr/share/doc/icdu
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: runner.os == 'Linux'
+        with:
+          name: ${{ matrix.target }}-deb
+          path: ${{ env.DEB }}
           if-no-files-found: error

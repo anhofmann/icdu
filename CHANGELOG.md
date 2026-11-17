@@ -67,6 +67,7 @@ Everything since 0.4.1. It will be released as icdu 0.5.0.
   tool it is missing, installs the ARM build in an x86 shell on Apple Silicon, and verifies the
   attestation of the archive when the GitHub CLI is there.
 - **A manual page**, `icdu.1`, laid out like ncdu's. It is in the release archives.
+- **Debian packages** (`.deb`) for amd64 and arm64 with every release.
 - `Ctrl-Z` suspends icdu, and `Ctrl-L` redraws the screen.
 - The info popup shows the reason of a read error, and the number of hard links.
 

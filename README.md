@@ -39,8 +39,15 @@ SHA-256 checksums, and installs the binary to `~/.local/bin`.
   install one that was not. Without it, the script prints the command to check by hand. See
   [What a release contains, and how to check it](#what-a-release-contains-and-how-to-check-it).
 
-Other ways: download an archive from the releases page and unpack it, or build from source
-with a Rust toolchain: `cargo install --git https://github.com/anhofmann/icdu`.
+Other ways:
+
+- **Debian and Ubuntu.** From 0.5.0 on, each release has `icdu_<version>_amd64.deb` and
+  `icdu_<version>_arm64.deb`. Download the one for your machine and
+  `sudo apt install ./icdu_<version>_amd64.deb`. It installs the binary and the manual page
+  and depends on nothing. There is no apt repository, so an upgrade is the same step with
+  the newer file; `sudo apt remove icdu` takes it off again.
+- **By hand.** Download an archive from the releases page and unpack it.
+- **From source**, with a Rust toolchain: `cargo install --git https://github.com/anhofmann/icdu`.
 
 ### Uninstalling
 
@@ -689,13 +696,14 @@ Every [release](https://github.com/anhofmann/icdu/releases) has four archives na
 `icdu-<version>-<target>.tar.gz`, for `x86_64-unknown-linux-musl`,
 `aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. Each unpacks to
 one directory with the `icdu` binary, its manual page (`icdu.1`), the licence, this README and
-the changelog. (Releases up
+the changelog. For the two Linux targets there is also a Debian package, `icdu_<version>_amd64.deb`
+and `icdu_<version>_arm64.deb`. (Releases up
 to 0.4.1 consist of bare binaries named `rcdu-portable-<os>-<arch>`.)
 
-- **`sha256sums.txt`** tells you that a download arrived intact. It lies next to the archives,
+- **`sha256sums.txt`** tells you that a download arrived intact. It lies next to the files,
   so it cannot tell you who built them: whoever could replace an archive could replace the
   checksum too.
-- **The attestation** can. For each archive GitHub keeps a signed statement that it was built
+- **The attestation** can. For each archive and package GitHub keeps a signed statement that it was built
   by this repository's release workflow from the tagged commit. With the
   [GitHub CLI](https://cli.github.com):
 
