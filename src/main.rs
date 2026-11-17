@@ -24,7 +24,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 
 use app::{App, InputMode, KeyAction};
-use args::{Args, Parsed};
+use args::{Args, Feedback, Parsed};
 use model::Tree;
 use scan::Opts;
 use signals::Signals;
@@ -91,7 +91,7 @@ fn main() {
             unwrap_or_die(load_import(src), src)
         } else {
             let (tree, root, opts) = prepare_scan(&args);
-            scan_to_completion(tree, root, opts)
+            scan_to_completion(tree, root, opts, args.feedback_mode())
         };
         if let Err(e) = write_export(&tree, &dest) {
             eprintln!("icdu: export failed: {e}");
@@ -108,17 +108,28 @@ fn main() {
         app.show_item_count = args.show_item_count;
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
-        run_ui(&mut app);
+        run_ui(&mut app, args.slow_ui);
     }
 
-    // --- Interactive scan mode. ---
     let (tree, root, opts) = prepare_scan(&args);
+    let mode = args.feedback_mode();
+    if mode != Feedback::Browser {
+        // --- `-0` / `-1`: scan first, with little or no feedback, then browse. ---
+        let tree = scan_to_completion(tree, root, opts.clone(), mode);
+        let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
+        app.show_item_count = args.show_item_count;
+        // The scan is over, but `r` can still read a directory again.
+        app.set_scan_opts(opts);
+        run_ui(&mut app, args.slow_ui);
+    }
+
+    // --- Interactive scan mode: browse while the scan runs. ---
     let scan = scan::start(root, opts.clone());
     let mut app = App::new(tree, args.disk_usage, args.read_only > 0, true);
     app.show_item_count = args.show_item_count;
     app.attach_scan(scan, opts);
 
-    run_ui(&mut app);
+    run_ui(&mut app, args.slow_ui);
 }
 
 fn unwrap_or_die<T>(res: std::io::Result<T>, ctx: &str) -> T {
@@ -211,18 +222,55 @@ fn plain_path(p: &Path) -> String {
     reduced.unwrap_or_else(|| s.into_owned())
 }
 
-fn scan_to_completion(mut tree: Tree, root: PathBuf, opts: Opts) -> Tree {
+/// Scan to the end without the browser. `Feedback::Line` shows one line of progress on
+/// standard error, if that is a terminal; anything else shows nothing, so that a dump on
+/// standard output or a cron job is not disturbed.
+fn scan_to_completion(mut tree: Tree, root: PathBuf, opts: Opts, feedback: Feedback) -> Tree {
+    use std::io::IsTerminal;
+    let show = feedback == Feedback::Line && std::io::stderr().is_terminal();
     let scan = scan::start(root, opts);
+    let mut shown = Instant::now();
     for batch in scan.events.iter() {
         tree.apply(batch);
+        if show && shown.elapsed() >= Duration::from_millis(100) {
+            eprint!(
+                "\r{}",
+                progress_line(tree.total_dirs, tree.total_files, false)
+            );
+            shown = Instant::now();
+        }
     }
     tree.finish_scan();
-    eprintln!(
-        "icdu: scanned {} dirs, {} files",
-        tree.total_dirs, tree.total_files
-    );
+    if show {
+        eprintln!(
+            "\r{}",
+            progress_line(tree.total_dirs, tree.total_files, true)
+        );
+    }
     tree
 }
+
+/// The one line of progress of `-1`. It is padded so that a shorter line fully covers the
+/// longer one it replaces.
+fn progress_line(dirs: u64, files: u64, done: bool) -> String {
+    let line = format!(
+        "{} {} directories, {} files",
+        if done { "scanned" } else { "scanning:" },
+        ui::fmt_count(dirs as usize),
+        ui::fmt_count(files as usize)
+    );
+    format!("{line:<60}")
+}
+
+/// Whether the screen is to be drawn in this turn of the event loop. Normally always. With
+/// `-q`, while a scan runs, only every [`SLOW_REDRAW`]: over a slow remote connection every
+/// redraw costs. What the user does is still shown at once.
+fn draw_due(slow: bool, scanning: bool, acted: bool, since_last: Duration) -> bool {
+    !slow || !scanning || acted || since_last >= SLOW_REDRAW
+}
+
+/// How often `-q` redraws the screen while a scan runs.
+const SLOW_REDRAW: Duration = Duration::from_secs(2);
 
 fn load_import(src: &str) -> std::io::Result<Tree> {
     if src == "-" {
@@ -261,7 +309,7 @@ fn restore_terminal() {
 
 /// Run the TUI until the user quits or a signal ends it. Does not return: the process exits
 /// from here, with status 0 after a normal quit and 1 after a terminal error.
-fn run_ui(app: &mut App) -> ! {
+fn run_ui(app: &mut App, slow: bool) -> ! {
     // ratatui's panic hook restores the screen but knows nothing of the paste mode. This hook
     // is installed first, so ratatui's wraps it and calls it after its own restore.
     let default_hook = std::panic::take_hook();
@@ -271,7 +319,7 @@ fn run_ui(app: &mut App) -> ! {
     }));
     let signals = unwrap_or_die(Signals::install(), "cannot install signal handlers");
     let mut terminal = init_terminal();
-    let result = run(&mut terminal, app, &signals);
+    let result = run(&mut terminal, app, &signals, slow);
     restore_terminal();
     match result {
         // Asked to end by a signal: now that the terminal is back, let it take effect.
@@ -321,7 +369,11 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     signals: &Signals,
+    slow: bool,
 ) -> std::io::Result<Option<i32>> {
+    // For `-q`: when the screen was last drawn, and whether the user has acted since.
+    let mut drawn: Option<Instant> = None;
+    let mut acted = true;
     loop {
         // Signals only set flags (see `signals.rs`); this is where they take effect, at most
         // one poll interval later.
@@ -370,7 +422,12 @@ fn run(
         // What the keys act on must be what is highlighted, from the first frame on.
         app.begin_frame(Instant::now());
         app.settle_selection();
-        terminal.draw(|f| ui::render(f, app))?;
+        let since = drawn.map_or(Duration::MAX, |at| at.elapsed());
+        if draw_due(slow, app.scanning, acted, since) {
+            terminal.draw(|f| ui::render(f, app))?;
+            drawn = Some(Instant::now());
+            acted = false;
+        }
 
         // Poll faster while scanning or deleting so updates/spinners animate smoothly. While a
         // search pass has work left, don't wait at all (input is still checked every slice),
@@ -390,6 +447,7 @@ fn run(
         let mut handled = 0;
         while waiting && handled < MAX_EVENTS_PER_FRAME {
             handled += 1;
+            acted = true;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // What the page keys move by: the rows of the list they act on. For the
@@ -554,7 +612,9 @@ mod tests {
 
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    use super::{decode_key, page_rows, plain_path, version_line};
+    use std::time::Duration;
+
+    use super::{decode_key, draw_due, page_rows, plain_path, progress_line, version_line};
     use crate::app::{InputMode, KeyAction};
 
     #[test]
@@ -727,6 +787,43 @@ mod tests {
                 "{code:?} with {mods:?}"
             );
         }
+    }
+
+    /// `-q` holds redraws back while a scan runs, and only then; a key press is always shown.
+    #[test]
+    fn slow_ui_draws_every_two_seconds_while_scanning() {
+        let ms = Duration::from_millis;
+        // Normally every turn of the loop draws.
+        assert!(draw_due(false, true, false, ms(0)));
+        // With -q, during a scan: only after two seconds...
+        assert!(!draw_due(true, true, false, ms(80)));
+        assert!(!draw_due(true, true, false, ms(1_999)));
+        assert!(draw_due(true, true, false, ms(2_000)));
+        assert!(
+            draw_due(true, true, false, Duration::MAX),
+            "the first frame"
+        );
+        // ...or when the user did something...
+        assert!(draw_due(true, true, true, ms(80)));
+        // ...and without a scan nothing is held back.
+        assert!(draw_due(true, false, false, ms(80)));
+    }
+
+    /// The progress line of `-1` always covers the one before it.
+    #[test]
+    fn progress_line_keeps_its_width() {
+        let running = progress_line(12_345, 6_789_012, false);
+        let done = progress_line(12_345, 6_789_012, true);
+        assert_eq!(
+            running.trim_end(),
+            "scanning: 12,345 directories, 6,789,012 files"
+        );
+        assert_eq!(
+            done.trim_end(),
+            "scanned 12,345 directories, 6,789,012 files"
+        );
+        assert_eq!(running.len(), done.len());
+        assert_eq!(progress_line(0, 0, false).len(), running.len());
     }
 
     /// PgUp and PgDn move by the height of the list that has the focus. The search popup's

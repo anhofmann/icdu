@@ -75,9 +75,20 @@ OPTIONS:
                              show or hide the item count column (default: hide)
     -o, --output FILE        scan without UI, write ncdu JSON (- is stdout)
     -f, --file FILE          browse a tree from ncdu JSON (- is stdin)
+    -0                       no feedback while scanning (default with -o -)
+    -1                       one line of progress (default with -o FILE)
+    -2                       browse while scanning (default)
+    -q, --slow-ui-updates, --fast-ui-updates
+                             update the screen every 2 s, or 10 times a second
     -h, --help               show this help
     -V, --version            show version
 ```
+
+While a scan runs, icdu shows what ncdu shows: the live browser by default (`-2`); with `-o FILE`
+one line of progress on the terminal (`-1`); and with `-o -` nothing at all (`-0`), so that a
+pipe or a cron job gets only the dump. Each of the three can be asked for explicitly. `-0` and `-1`
+without `-o` scan first and open the browser when the scan is done. `-q` redraws the screen only
+every two seconds while scanning, which helps over a slow remote connection.
 
 Options are written as in ncdu: short flags can be bundled, and a value can be attached to its
 flag or follow it (`-xo-`, `-o file`, `--exclude=tmp`, `--exclude tmp`). `--` ends the options.

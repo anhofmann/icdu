@@ -185,7 +185,7 @@ fn render_top_files(f: &mut Frame, app: &App, tf: &TopFiles) {
 }
 
 /// `1234567` → `1,234,567`, for match counts.
-fn fmt_count(n: usize) -> String {
+pub fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {

@@ -36,9 +36,10 @@ pub struct Args {
     pub export: Option<String>,
     /// `-f FILE`: load a tree from ncdu JSON instead of scanning. `-` means stdin.
     pub import: Option<String>,
-    /// `-0`, `-1`, `-2`: how much to show while scanning without the browser. Accepted for
-    /// compatibility; the modes themselves are not implemented yet.
+    /// `-0`, `-1`, `-2`: how much to show while scanning; see [`Args::feedback_mode`].
     pub feedback: Option<u8>,
+    /// `-q`: redraw only every two seconds while scanning, for slow remote connections.
+    pub slow_ui: bool,
     /// `-e`: extended information. Accepted for compatibility; not implemented yet.
     pub extended: bool,
 }
@@ -58,7 +59,39 @@ impl Default for Args {
             export: None,
             import: None,
             feedback: None,
+            slow_ui: false,
             extended: false,
+        }
+    }
+}
+
+/// How much is shown while a scan runs, as in ncdu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feedback {
+    /// `-0`: nothing.
+    Silent,
+    /// `-1`: one line of progress, on a terminal.
+    Line,
+    /// `-2`: the browser, live. Only without `-o`.
+    Browser,
+}
+
+impl Args {
+    /// The feedback mode these arguments ask for. Without `-0`, `-1` or `-2` it follows from
+    /// where the output goes, as in ncdu: nothing when the dump goes to standard output (the
+    /// reader of the pipe must not get progress mixed in, and scripts want silence), one line
+    /// when it goes to a file, and the live browser when there is no dump to write. The
+    /// browser cannot be asked for together with `-o`; `-2` then means one line.
+    pub fn feedback_mode(&self) -> Feedback {
+        let exporting = self.export.is_some();
+        match (self.feedback, self.export.as_deref()) {
+            (Some(0), _) => Feedback::Silent,
+            (Some(1), _) => Feedback::Line,
+            (Some(_), _) if exporting => Feedback::Line,
+            (Some(_), _) => Feedback::Browser,
+            (None, Some("-")) => Feedback::Silent,
+            (None, Some(_)) => Feedback::Line,
+            (None, None) => Feedback::Browser,
         }
     }
 }
@@ -88,6 +121,7 @@ enum Action {
     Output,
     Input,
     Feedback(u8),
+    SlowUi(bool),
     Extended,
 }
 
@@ -210,11 +244,44 @@ pub const FLAGS: &[Flag] = &[
         "browse a tree from ncdu JSON (- is stdin)",
         Action::Input,
     ),
-    // ncdu's feedback modes and extended information: accepted, so that command lines written
-    // for ncdu run, but without effect yet. Not advertised until they have one.
-    flag(&['0'], &[], None, "", Action::Feedback(0)),
-    flag(&['1'], &[], None, "", Action::Feedback(1)),
-    flag(&['2'], &[], None, "", Action::Feedback(2)),
+    // Short only, as in ncdu.
+    flag(
+        &['0'],
+        &[],
+        None,
+        "no feedback while scanning (default with -o -)",
+        Action::Feedback(0),
+    ),
+    flag(
+        &['1'],
+        &[],
+        None,
+        "one line of progress (default with -o FILE)",
+        Action::Feedback(1),
+    ),
+    flag(
+        &['2'],
+        &[],
+        None,
+        "browse while scanning (default)",
+        Action::Feedback(2),
+    ),
+    Flag {
+        negation: Some("fast-ui-updates"),
+        ..flag(
+            &['q'],
+            &["slow-ui-updates"],
+            None,
+            "update the screen every 2 s, or 10 times a second",
+            Action::SlowUi(true),
+        )
+    },
+    Flag {
+        negation: Some("slow-ui-updates"),
+        ..flag(&[], &["fast-ui-updates"], None, "", Action::SlowUi(false))
+    },
+    // ncdu's extended information: accepted, so that command lines written for ncdu run, but
+    // without effect yet. Not advertised until it has one.
     flag(&['e'], &["extended"], None, "", Action::Extended),
     flag(&['h'], &["help"], None, "show this help", Action::Help),
     flag(
@@ -344,6 +411,7 @@ fn apply(
         Action::Output => args.export = Some(value),
         Action::Input => args.import = Some(value),
         Action::Feedback(level) => args.feedback = Some(level),
+        Action::SlowUi(slow) => args.slow_ui = slow,
         Action::Extended => args.extended = true,
     }
     Ok(None)
@@ -376,14 +444,13 @@ pub fn options_help() -> String {
     const SPEC_WIDTH: usize = 24;
     let mut out = String::new();
     for flag in FLAGS.iter().filter(|f| !f.help.is_empty()) {
-        let short = match flag.short.first() {
-            Some(c) => format!("-{c}, "),
-            None => "    ".to_string(),
+        // "-x, --long", "    --long" or "-x": whichever spellings the flag has.
+        let mut spec = match (flag.short.first(), flag.long.first()) {
+            (Some(c), Some(long)) => format!("-{c}, --{long}"),
+            (None, Some(long)) => format!("    --{long}"),
+            (Some(c), None) => format!("-{c}"),
+            (None, None) => continue,
         };
-        let mut spec = format!(
-            "{short}--{}",
-            flag.long.first().copied().unwrap_or_default()
-        );
         if let Some(value) = flag.value {
             spec.push(' ');
             spec.push_str(value);
@@ -684,7 +751,21 @@ mod tests {
                     ..d()
                 },
             ),
-            // ncdu's feedback modes and -e are accepted.
+            (
+                &["-q"],
+                Args {
+                    slow_ui: true,
+                    ..d()
+                },
+            ),
+            (
+                &["--slow-ui-updates"],
+                Args {
+                    slow_ui: true,
+                    ..d()
+                },
+            ),
+            (&["-q", "--fast-ui-updates"], d()),
             (
                 &["-0"],
                 Args {
@@ -779,6 +860,33 @@ mod tests {
         );
     }
 
+    /// Without `-0`, `-1` or `-2` the feedback follows from where the dump goes.
+    #[test]
+    fn feedback_mode_defaults_follow_the_output() {
+        let mode = |line: &[&str]| args(line).feedback_mode();
+        // Nothing to export: the live browser.
+        assert_eq!(mode(&[]), Feedback::Browser);
+        assert_eq!(mode(&["/tmp"]), Feedback::Browser);
+        // A dump on standard output: silence. A dump in a file: one line.
+        assert_eq!(mode(&["-o-"]), Feedback::Silent);
+        assert_eq!(mode(&["-o", "dump.json"]), Feedback::Line);
+        // Asked for explicitly.
+        assert_eq!(mode(&["-0"]), Feedback::Silent);
+        assert_eq!(mode(&["-1"]), Feedback::Line);
+        assert_eq!(mode(&["-2"]), Feedback::Browser);
+        assert_eq!(mode(&["-1", "-o-"]), Feedback::Line);
+        assert_eq!(mode(&["-0", "-o", "dump.json"]), Feedback::Silent);
+        // There is no browser while a dump is written.
+        assert_eq!(mode(&["-2", "-o-"]), Feedback::Line);
+        // The last of several wins.
+        assert_eq!(mode(&["-0", "-1", "-o-"]), Feedback::Line);
+        assert_eq!(
+            mode(&["-1xo-", "/"]),
+            Feedback::Line,
+            "ncdu's man page example"
+        );
+    }
+
     #[test]
     fn help_and_version_end_parsing() {
         for line in [
@@ -863,9 +971,6 @@ mod tests {
 
         for flag in FLAGS {
             assert!(!flag.short.is_empty() || !flag.long.is_empty());
-            if !flag.help.is_empty() {
-                assert!(!flag.long.is_empty(), "advertised without a long name");
-            }
             if let Some(negation) = flag.negation {
                 let other = FLAGS
                     .iter()
@@ -889,9 +994,21 @@ mod tests {
                 .any(|word| word == long)
         };
         for flag in FLAGS.iter().filter(|f| !f.help.is_empty()) {
-            let long = format!("--{}", flag.long[0]);
+            assert!(
+                help.contains(flag.help),
+                "{}: its text is missing",
+                flag.help
+            );
+            let Some(long) = flag.long.first().map(|long| format!("--{long}")) else {
+                // Short only: listed by its letter.
+                let short = format!("-{}", flag.short[0]);
+                assert!(
+                    help.lines().any(|l| l.trim_start().starts_with(&short)),
+                    "{short} is missing from --help"
+                );
+                continue;
+            };
             assert!(mentions(&long), "{long} is missing from --help");
-            assert!(help.contains(flag.help), "{long}: its text is missing");
             if let Some(c) = flag.short.first() {
                 assert!(help.contains(&format!("-{c}, {long}")), "{long}");
             }

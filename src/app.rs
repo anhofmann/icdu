@@ -626,6 +626,12 @@ impl App {
 
     /// Attach the initial scan: its batch stream, its steering handle, and the options future
     /// subtree rescans should reuse (interactive scan mode only).
+    /// Remember the options of a scan that has already finished (`-0`, `-1`), so that `r`
+    /// can read a directory again with the same excludes and limits.
+    pub fn set_scan_opts(&mut self, opts: Opts) {
+        self.scan_opts = Some(opts);
+    }
+
     pub fn attach_scan(&mut self, scan: Scan, opts: Opts) {
         self.scans
             .push(ScanHandle::new(scan.events, false, Instant::now()));
