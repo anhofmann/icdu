@@ -23,6 +23,7 @@ use crate::natsort::{natural_cmp, prefix, prefix_order};
 use crate::scan::{
     check_identity, start_at, Events, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
 };
+use crate::ui::GraphStyle;
 
 /// What the rows of a directory can be ordered by: ncdu's sort columns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -559,6 +560,12 @@ pub struct App {
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
     pub show_item_count: bool,
+    /// Show the bar that compares each row with the largest one (`g`, `--show-graph`).
+    pub show_graph: bool,
+    /// Show each row's share of the directory in percent (`g`, `--show-percent`).
+    pub show_percent: bool,
+    /// What the bar is drawn with (`--graph-style`).
+    pub graph_style: GraphStyle,
     /// Show the modification time column (`m`, `--show-mtime`). It has something to show
     /// only in extended mode (`-e`).
     pub show_mtime: bool,
@@ -647,6 +654,9 @@ impl App {
             },
             disk_usage,
             show_item_count: false,
+            show_graph: true,
+            show_percent: true,
+            graph_style: GraphStyle::default(),
             show_mtime: false,
             scanning,
             read_only,
@@ -1974,6 +1984,18 @@ impl App {
                 }
             }
             KeyAction::ToggleItemCount => self.show_item_count = !self.show_item_count,
+            // ncdu's round: nothing, the bar, the percentage, both.
+            KeyAction::CycleGraph => {
+                (self.show_graph, self.show_percent) = match (self.show_graph, self.show_percent) {
+                    (false, false) => (true, false),
+                    (true, false) => (false, true),
+                    (false, true) => (true, true),
+                    (true, true) => (false, false),
+                };
+            }
+            KeyAction::SharedColumn => {
+                self.status = Some("the shared size column is not available yet".into());
+            }
             KeyAction::ToggleMtime => {
                 if self.tree.is_extended() {
                     self.show_mtime = !self.show_mtime;
@@ -2349,6 +2371,10 @@ pub enum KeyAction {
     ToggleUsage,
     /// Show or hide the item count column.
     ToggleItemCount,
+    /// `g`: go through the combinations of bar and percentage.
+    CycleGraph,
+    /// `u`: ncdu 2's column for sizes shared through hard links. Not there yet.
+    SharedColumn,
     ToggleMtime,
     Help,
     Delete,
@@ -4636,6 +4662,30 @@ mod tests {
             Excluded::No,
             false,
         )
+    }
+
+    /// `g` goes through the combinations of bar and percentage in ncdu's order, starting
+    /// from both, which is what icdu shows unless told otherwise.
+    #[test]
+    fn g_goes_through_bar_and_percentage() {
+        let mut app = app_with_entries();
+        let shown = |app: &App| (app.show_graph, app.show_percent);
+        assert_eq!(shown(&app), (true, true));
+        for want in [(false, false), (true, false), (false, true), (true, true)] {
+            app.on_key(KeyAction::CycleGraph);
+            assert_eq!(shown(&app), want);
+        }
+    }
+
+    /// `u` is ncdu 2's key for a column that does not exist here yet. It says so and
+    /// changes nothing.
+    #[test]
+    fn u_says_that_the_shared_column_is_missing() {
+        let mut app = app_with_entries();
+        let before = row_names(&app);
+        app.on_key(KeyAction::SharedColumn);
+        assert!(app.status.as_deref().unwrap().contains("not available yet"));
+        assert_eq!(row_names(&app), before);
     }
 
     /// `m` shows the modification times, where the tree has any.

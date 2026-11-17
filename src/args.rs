@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use crate::app::SortColumn;
 use crate::scan;
+use crate::ui::GraphStyle;
 
 /// The settings a command line asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +31,12 @@ pub struct Args {
     pub exclude_kernfs: bool,
     /// `-L`: count a symlink to a file as that file.
     pub follow_symlinks: bool,
+    /// `--hide-graph` turns the size bar off.
+    pub show_graph: bool,
+    /// `--hide-percent` turns the percentage off.
+    pub show_percent: bool,
+    /// `--graph-style`: what the bar is drawn with.
+    pub graph_style: GraphStyle,
     /// `--sort`: the column the list starts sorted by, and whether it runs downwards.
     /// Without it the list is sorted by the size it shows, largest first.
     pub sort: Option<(SortColumn, bool)>,
@@ -70,6 +77,9 @@ impl Default for Args {
             exclude_caches: false,
             exclude_kernfs: false,
             follow_symlinks: false,
+            show_graph: true,
+            show_percent: true,
+            graph_style: GraphStyle::Hash,
             sort: None,
             dirs_first: false,
             natsort: true,
@@ -150,6 +160,10 @@ enum Action {
     Caches(bool),
     Kernfs(bool),
     FollowSymlinks(bool),
+    Graph(bool),
+    Percent(bool),
+    GraphStyle,
+    SharedColumn,
     Sort,
     DirsFirst(bool),
     Natsort(bool),
@@ -293,6 +307,49 @@ pub const FLAGS: &[Flag] = &[
         None,
         "disable the delete feature",
         Action::ReadOnly,
+    ),
+    Flag {
+        negation: Some("hide-graph"),
+        ..flag(
+            &[],
+            &["show-graph"],
+            None,
+            "show or hide the size bar (default: show)",
+            Action::Graph(true),
+        )
+    },
+    Flag {
+        negation: Some("show-graph"),
+        ..flag(&[], &["hide-graph"], None, "", Action::Graph(false))
+    },
+    Flag {
+        negation: Some("hide-percent"),
+        ..flag(
+            &[],
+            &["show-percent"],
+            None,
+            "show or hide the percentage (default: show)",
+            Action::Percent(true),
+        )
+    },
+    Flag {
+        negation: Some("show-percent"),
+        ..flag(&[], &["hide-percent"], None, "", Action::Percent(false))
+    },
+    flag(
+        &[],
+        &["graph-style"],
+        Some("STYLE"),
+        "the bar: hash, half-block or eighth-block",
+        Action::GraphStyle,
+    ),
+    // Accepted for ncdu's sake, without effect and so without a line in the help.
+    flag(
+        &[],
+        &["shared-column"],
+        Some("COLUMN"),
+        "",
+        Action::SharedColumn,
     ),
     flag(
         &[],
@@ -588,6 +645,29 @@ fn apply(
         Action::Caches(exclude) => args.exclude_caches = exclude,
         Action::Kernfs(exclude) => args.exclude_kernfs = exclude,
         Action::FollowSymlinks(follow) => args.follow_symlinks = follow,
+        Action::Graph(show) => args.show_graph = show,
+        Action::Percent(show) => args.show_percent = show,
+        Action::GraphStyle => {
+            args.graph_style = match value.as_str() {
+                "hash" => GraphStyle::Hash,
+                "half-block" => GraphStyle::HalfBlock,
+                "eighth-block" => GraphStyle::EighthBlock,
+                _ => {
+                    return Err(format!(
+                        "unknown --graph-style: {value} (hash, half-block or eighth-block)"
+                    ))
+                }
+            }
+        }
+        // ncdu 2's column for sizes shared through hard links does not exist here yet. The
+        // flag is taken, so that a command line or a config file written for ncdu runs.
+        Action::SharedColumn => {
+            if !matches!(value.as_str(), "off" | "shared" | "unique") {
+                return Err(format!(
+                    "unknown --shared-column: {value} (off, shared or unique)"
+                ));
+            }
+        }
         Action::Sort => args.sort = Some(parse_sort(&value)?),
         Action::DirsFirst(first) => args.dirs_first = first,
         Action::Natsort(natural) => args.natsort = natural,
@@ -1075,6 +1155,44 @@ mod tests {
                 },
             ),
             (&["--disable-natsort", "--enable-natsort"], d()),
+            (
+                &["--hide-graph"],
+                Args {
+                    show_graph: false,
+                    ..d()
+                },
+            ),
+            (&["--hide-graph", "--show-graph"], d()),
+            (
+                &["--hide-percent", "--hide-graph"],
+                Args {
+                    show_graph: false,
+                    show_percent: false,
+                    ..d()
+                },
+            ),
+            (&["--hide-percent", "--show-percent"], d()),
+            (
+                &["--graph-style", "half-block"],
+                Args {
+                    graph_style: GraphStyle::HalfBlock,
+                    ..d()
+                },
+            ),
+            (
+                &["--graph-style=eighth-block"],
+                Args {
+                    graph_style: GraphStyle::EighthBlock,
+                    ..d()
+                },
+            ),
+            (
+                &["--graph-style=eighth-block", "--graph-style", "hash"],
+                d(),
+            ),
+            // Taken and ignored.
+            (&["--shared-column", "unique"], d()),
+            (&["--shared-column=off"], d()),
             (
                 &["--no-follow-symlinks", "-xL"],
                 Args {

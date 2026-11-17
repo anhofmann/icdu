@@ -81,6 +81,11 @@ OPTIONS:
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
+        --show-graph, --hide-graph
+                             show or hide the size bar (default: show)
+        --show-percent, --hide-percent
+                             show or hide the percentage (default: show)
+        --graph-style STYLE  the bar: hash, half-block or eighth-block
         --sort COLUMN        disk-usage, name, apparent-size, itemcount, mtime
         --group-directories-first, --no-group-directories-first
                              list directories before files, or not (default)
@@ -141,6 +146,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
 | `]` / `[` | go to the next / previous match of the last search |
 | `a` | toggle apparent size ↔ on-disk usage |
+| `g` | bar and percentage: both, neither, the bar, the percentage |
 | `c` | toggle the item count column (entries below each directory) |
 | `m` | toggle the modification time column (needs `-e`) |
 | `d` | delete selected entry (asks to confirm) |
@@ -251,6 +257,21 @@ its whole subtree — "what exactly is eating this directory?" without descendin
 Sizes follow the active metric (`a` toggles disk usage vs. apparent before opening the popup).
 `j`/`k` move, `Enter` jumps to the selected file's parent directory with the file highlighted,
 `q` closes. The popup holds the top 100 files as of when you opened it.
+
+### Columns
+
+Next to its size, each row has a bar that compares it with the largest row of the directory,
+and its share of the directory in percent. `g` goes through the combinations: both, neither,
+the bar alone, the percentage alone. `--hide-graph` and `--hide-percent` start without one of
+them. `--graph-style` draws the bar with block characters, to half a cell (`half-block`) or to
+an eighth of one (`eighth-block`), instead of `#` (`hash`).
+
+`c` adds the item count and `m`, in extended mode, the modification time; both are described
+below.
+
+ncdu 2 has one more column, for the size a directory shares with others through hard links
+(`u`, `--shared-column`). icdu does not have it yet. The flag is accepted and ignored, so that
+a command line written for ncdu runs, and the key says that the column is missing.
 
 ### Item counts
 

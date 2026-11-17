@@ -71,13 +71,48 @@ fn mtime_cell(tree: &Tree, idx: NodeIdx) -> String {
     }
 }
 
-fn bar(frac: f64, width: usize) -> String {
-    let filled = ((frac * width as f64).round() as usize).min(width);
-    let mut s = String::with_capacity(width);
-    for _ in 0..filled {
-        s.push('#');
+/// What the size bar is drawn with (ncdu 2's `--graph-style`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GraphStyle {
+    /// `#` for every tenth.
+    #[default]
+    Hash,
+    /// Block characters, to half a cell.
+    HalfBlock,
+    /// Block characters, to an eighth of a cell.
+    EighthBlock,
+}
+
+/// The bar for `frac` (0 to 1) of the largest row, `width` cells wide.
+fn bar(frac: f64, width: usize, style: GraphStyle) -> String {
+    // The left part of a cell, from one eighth to seven.
+    const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let frac = if frac.is_finite() {
+        frac.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // How many steps of a cell the style can show.
+    let steps = match style {
+        GraphStyle::Hash => 1,
+        GraphStyle::HalfBlock => 2,
+        GraphStyle::EighthBlock => 8,
+    };
+    let filled = (frac * (width * steps) as f64).round() as usize;
+    let (full, part) = (filled / steps, filled % steps);
+    let mut s = String::with_capacity(width * 3);
+    for _ in 0..full {
+        s.push(if style == GraphStyle::Hash {
+            '#'
+        } else {
+            '█'
+        });
     }
-    for _ in filled..width {
+    if part > 0 {
+        // Half a cell is four eighths.
+        s.push(EIGHTHS[part * (8 / steps) - 1]);
+    }
+    for _ in full + usize::from(part > 0)..width {
         s.push(' ');
     }
     s
@@ -654,14 +689,20 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let incomplete = n.unscanned > 0;
-        let mut spans = vec![
-            Span::styled(size_cell(size, incomplete), size_style(incomplete)),
-            Span::styled(
-                format!("[{}] ", bar(frac, 10)),
+        let mut spans = vec![Span::styled(
+            size_cell(size, incomplete),
+            size_style(incomplete),
+        )];
+        // The two columns `g` goes through.
+        if app.show_graph {
+            spans.push(Span::styled(
+                format!("[{}] ", bar(frac, 10, app.graph_style)),
                 Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(format!("{pct:>5.1}% ")),
-        ];
+            ));
+        }
+        if app.show_percent {
+            spans.push(Span::raw(format!("{pct:>5.1}% ")));
+        }
         if app.show_item_count {
             spans.push(Span::raw(format!("{:>ITEMS_WIDTH$} ", item_cell(n))));
         }
@@ -881,6 +922,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("    C-u / C-w", "clear the query / delete a word"),
     ("] / [", "next / previous match of that search"),
     ("a", "toggle apparent ↔ disk usage"),
+    ("g", "bar and percentage: both, none, one"),
     ("c", "toggle the item count column"),
     ("m", "toggle the modification times (with -e)"),
     ("d", "delete the selected entry (asks first)"),
@@ -1174,11 +1216,12 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar_scale, confirm_export_text, dir_label, display_width, find_empty_message, find_rows,
-        find_title, fmt_count, fmt_items, followed_note, footer_split, hard_link_note, help_layout,
-        help_scroll_hint, item_cell, left_to_read, list_title, listing_state, mtime_cell,
-        scan_progress, size_cell, sort_label, truncate_left, HelpLayout, Listing,
-        HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
+        bar, bar_scale, confirm_export_text, dir_label, display_width, find_empty_message,
+        find_rows, find_title, fmt_count, fmt_items, followed_note, footer_split, hard_link_note,
+        help_layout, help_scroll_hint, item_cell, left_to_read, list_title, listing_state,
+        mtime_cell, scan_progress, size_cell, sort_label, truncate_left, GraphStyle, HelpLayout,
+        Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH,
+        MTIME_WIDTH,
     };
     use crate::app::{Sort, SortColumn};
     use crate::model::{Excluded, NodeKind, Tree};
@@ -1357,6 +1400,32 @@ mod tests {
             size_cell(0, true).chars().count(),
             size_cell(5 << 40, false).chars().count()
         );
+    }
+
+    /// The bar in each style: `#` to a whole cell, blocks to half a cell or to an eighth.
+    #[test]
+    fn bar_fills_in_the_steps_of_its_style() {
+        use GraphStyle::*;
+        assert_eq!(bar(0.0, 10, Hash), "          ");
+        assert_eq!(bar(1.0, 10, Hash), "##########");
+        assert_eq!(bar(0.34, 10, Hash), "###       ");
+        assert_eq!(bar(0.36, 10, Hash), "####      ");
+        assert_eq!(bar(0.36, 10, HalfBlock), "███▌      ");
+        assert_eq!(bar(0.5, 10, HalfBlock), "█████     ");
+        assert_eq!(bar(0.3125, 10, EighthBlock), "███▏      ");
+        assert_eq!(bar(0.55, 10, EighthBlock), "█████▌    ");
+        assert_eq!(bar(0.99, 10, EighthBlock), "█████████▉");
+        assert_eq!(bar(1.0, 10, EighthBlock), "██████████");
+        // Whatever the value, the bar is as wide as its column.
+        for style in [Hash, HalfBlock, EighthBlock] {
+            for thousandth in 0..=1000 {
+                let drawn = bar(f64::from(thousandth) / 1000.0, 10, style);
+                assert_eq!(drawn.chars().count(), 10, "{thousandth} {style:?}");
+            }
+            assert_eq!(bar(1.5, 10, style), bar(1.0, 10, style));
+            assert_eq!(bar(-1.0, 10, style), "          ");
+            assert_eq!(bar(f64::NAN, 10, style), "          ");
+        }
     }
 
     /// No row may be larger than what a full bar stands for.
