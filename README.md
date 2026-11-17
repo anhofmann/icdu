@@ -131,7 +131,10 @@ Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` exclude
 Sizes are live, so the screen says which of them are final:
 
 - A directory whose size is followed by `…` and shown dimmed has not been read completely
-  below. Its size is still growing, and `d` and `r` are not available on it yet.
+  below. Its size is still growing, and `d` and `r` are not available on it yet. If you
+  press one of them anyway, icdu says how many directories are left in it, reads that
+  directory before anything else, and tells you in the footer when it is ready. It does not
+  delete on its own: you press `d` again.
 - The header shows how many directories below the one you are viewing are still to be read
   (`2,281 directories left to read`). The number shrinks to nothing as the scan gets there.
 - The title of the list describes the directory itself: `reading…` until its entries have

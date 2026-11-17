@@ -439,6 +439,9 @@ pub struct App {
     pub list_offset: Cell<usize>,
     /// The sorted rows of the viewed directory, reused while they are still good.
     row_order: RefCell<Option<RowOrder>>,
+    /// A directory on which a delete or rescan was refused because it is not read completely
+    /// yet. The scans read it first, and the footer says when it is ready.
+    waiting_for: Option<NodeIdx>,
     /// When the frame being prepared started. The event loop sets it; without it (in tests)
     /// the rows are sorted again after every change, with it only when `resort_due` says so.
     frame_time: Option<Instant>,
@@ -480,6 +483,7 @@ impl App {
             confirm_hard_links: 0,
             list_offset: Cell::new(0),
             row_order: RefCell::new(None),
+            waiting_for: None,
             frame_time: None,
             tick: 0,
             tree,
@@ -496,18 +500,56 @@ impl App {
         self.refocus();
     }
 
-    /// Tell every live scan to prioritize the directory currently being viewed.
+    /// Tell every live scan what to read first: a directory the user is waiting for, if there
+    /// is one, then the directory currently being viewed.
     fn refocus(&mut self) {
         if !self.scanning {
             return;
         }
-        let Some(path) = self.tree.fs_path_of(self.cur) else {
+        let focus = self.tree.fs_path_of(self.cur);
+        let first = self.waiting_for.and_then(|idx| self.tree.fs_path_of(idx));
+        for ctrl in &self.controls {
+            ctrl.set_priorities(first.clone(), focus.clone());
+        }
+    }
+
+    /// `action` ("delete", "rescan") was refused on `idx` because the scan has not been
+    /// everywhere below it. Say how much is left, and remember the directory: the scans read
+    /// it before anything else, and the user is told when it is ready (see `check_wait`).
+    fn wait_for(&mut self, idx: NodeIdx, action: &str) {
+        let n = &self.tree.nodes[idx];
+        let left = match n.unscanned {
+            1 => "1 directory".to_string(),
+            left => format!("{left} directories"),
+        };
+        self.status = Some(format!(
+            "can't {action} {} yet: {left} left to read in it. Reading it first.",
+            n.name
+        ));
+        self.waiting_for = Some(idx);
+        self.refocus();
+    }
+
+    /// Look after the directory a refused delete or rescan is waiting for: once it is read
+    /// completely, say so and give the scans their usual order back. Nothing is deleted or
+    /// rescanned here; the user asks again. The event loop calls this once per frame.
+    pub fn check_wait(&mut self) {
+        let Some(idx) = self.waiting_for else {
             return;
         };
-        let focus = Some(path);
-        for ctrl in &self.controls {
-            ctrl.set_priorities(None, focus.clone());
+        if !self.tree.is_attached(idx) {
+            // Deleted or rescanned away in the meantime: nothing to wait for.
+            self.waiting_for = None;
+        } else if self.tree.subtree_complete(idx) {
+            self.waiting_for = None;
+            self.status = Some(format!(
+                "{} is completely read: it can be deleted or rescanned now",
+                self.tree.nodes[idx].name
+            ));
+        } else {
+            return;
         }
+        self.refocus();
     }
 
     /// Drain every live scan's batch stream into the tree (up to `cap` batches per frame, so a
@@ -621,7 +663,7 @@ impl App {
         // The subtree must be fully known before tearing it down — otherwise the original
         // scan could still deliver batches for it and double-count.
         if !self.tree.subtree_complete(sel) {
-            self.status = Some("cannot rescan: directory is still being scanned".into());
+            self.wait_for(sel, "rescan");
             return;
         }
         // Last, the disk: the path must still name the directory that was scanned. If it was
@@ -1538,10 +1580,7 @@ impl App {
             // The core safety rule: never delete a subtree that is still being scanned, or
             // its contents (and on-disk reality) aren't fully known yet.
             if !self.tree.subtree_complete(sel) {
-                self.status = Some(
-                    "cannot delete: directory is still being scanned — wait for it to finish"
-                        .into(),
-                );
+                self.wait_for(sel, "delete");
                 return;
             }
             // The same holds for a directory the scan never listed: nobody has seen what is
@@ -2517,6 +2556,132 @@ mod tests {
         assert_eq!(focus(&app, 1), (None, path("/r/docs/sub")));
     }
 
+    /// A scanning app whose root holds `busy/` (with `busy/more/` still unread), a finished
+    /// `done/` and a file; one idle scan control to observe the priorities on.
+    fn app_with_an_unfinished_directory() -> App {
+        use crate::scan::NewNode;
+        let dir = |name: &str, id: u64| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind: NodeKind::Dir,
+            apparent: id,
+            disk: id,
+            dev: 1,
+            ino: id,
+            hlink: false,
+            excluded: Excluded::No,
+            error: None,
+            dir_id: Some(id),
+        };
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.controls.push(ScanControl::idle());
+        app.scan_opts = Some(test_opts());
+        let mut root_batch = file_batch("file", 1);
+        root_batch.nodes.extend([dir("busy", 10), dir("done", 20)]);
+        app.tree.apply(root_batch);
+        app.tree.apply(Batch {
+            parent_id: 10,
+            nodes: vec![dir("more", 11), dir("other", 12)],
+            error: None,
+        });
+        app.tree.apply(Batch {
+            parent_id: 20,
+            nodes: Vec::new(),
+            error: None,
+        });
+        app
+    }
+
+    /// The batch that reads the (empty) directory with scanner id `id`.
+    fn read_empty(id: u64) -> Batch {
+        Batch {
+            parent_id: id,
+            nodes: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// A refused delete says how much is left, has the scanner read that directory first,
+    /// and reports when it is ready. It does not delete on its own.
+    #[test]
+    fn refused_delete_says_what_is_left_and_gets_it_read_first() {
+        let mut app = app_with_an_unfinished_directory();
+        let busy = idx_named(&app, "busy");
+        let first = |app: &App| app.controls[0].priorities().0;
+
+        // The selection is elsewhere; `busy` is asked for by the refused delete alone.
+        app.selected = Some(busy);
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no dialog");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't delete busy yet: 2 directories left to read in it. Reading it first.")
+        );
+        app.selected = Some(idx_named(&app, "file"));
+        app.check_wait();
+        assert_eq!(first(&app), Some(PathBuf::from("/r/busy")), "still first");
+
+        // One of the two arrives: not ready yet, and nothing new to say.
+        app.status = None;
+        app.tree.apply(read_empty(11));
+        app.check_wait();
+        assert_eq!(app.status, None);
+        assert_eq!(first(&app), Some(PathBuf::from("/r/busy")));
+
+        // The last one arrives.
+        app.tree.apply(read_empty(12));
+        app.check_wait();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("busy is completely read: it can be deleted or rescanned now")
+        );
+        assert_eq!(first(&app), None, "the request is over");
+        assert!(
+            matches!(app.modal, Modal::None),
+            "nothing is deleted unasked"
+        );
+        assert!(app.tree.is_attached(busy));
+
+        // Said once.
+        app.status = None;
+        app.check_wait();
+        assert_eq!(app.status, None);
+    }
+
+    /// The same for a rescan, which acts on the viewed directory.
+    #[test]
+    fn refused_rescan_says_what_is_left() {
+        let mut app = app_with_an_unfinished_directory();
+        app.cur = idx_named(&app, "busy");
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't rescan busy yet: 2 directories left to read in it. Reading it first.")
+        );
+        // One left: the wording follows.
+        app.tree.apply(read_empty(11));
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't rescan busy yet: 1 directory left to read in it. Reading it first.")
+        );
+    }
+
+    /// If the directory the user waits for leaves the tree, the wait is dropped quietly.
+    #[test]
+    fn a_wait_ends_when_its_directory_is_gone() {
+        let mut app = app_with_an_unfinished_directory();
+        let busy = idx_named(&app, "busy");
+        app.selected = Some(busy);
+        app.on_key(KeyAction::Delete);
+        app.status = None;
+        app.tree.delete_subtree(busy);
+        app.check_wait();
+        assert_eq!(app.status, None);
+        assert_eq!(app.controls[0].priorities().0, None);
+    }
+
     /// Attach a scan stream that started at `started`; the sender feeds it.
     fn add_stream(app: &mut App, refresh: bool, started: Instant) -> Sender<Batch> {
         let (tx, rx) = unbounded();
@@ -3462,10 +3627,10 @@ mod tests {
             matches!(app.modal, Modal::None),
             "no confirm dialog for a directory with a rescan running below it"
         );
-        assert!(app
-            .status
-            .as_deref()
-            .is_some_and(|s| s.contains("still being scanned")));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't delete docs yet: 1 directory left to read in it. Reading it first.")
+        );
     }
 
     /// Scan options for tests that need the rescan key to get past "imported dump".

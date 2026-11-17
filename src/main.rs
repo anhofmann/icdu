@@ -476,6 +476,8 @@ fn run(
         // Fold in the result of any background deletion / system open.
         app.poll_delete();
         app.poll_open();
+        // A directory the user is waiting for may have become complete.
+        app.check_wait();
 
         // A requested shell: fully tear down the TUI, hand the tty to the user's shell in the
         // target directory, and rebuild the UI when it exits. The scan keeps running in the

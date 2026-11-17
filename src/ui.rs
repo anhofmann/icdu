@@ -643,13 +643,14 @@ fn scan_progress(rate: Option<u64>, dirs: u64, files: u64, left: u32) -> String 
 
 /// How the footer line is shared when a status message and an activity (scan progress, a
 /// running deletion) both want it: the columns for the message and for the activity. The
-/// activity is shown in full or not at all, and only if the message keeps a usable width.
-fn footer_split(width: u16, activity: usize) -> (u16, u16) {
-    const MESSAGE_MIN: u16 = 24;
-    // Two columns of space between the two.
-    let wanted = u16::try_from(activity.saturating_add(2)).unwrap_or(u16::MAX);
-    if width >= wanted.saturating_add(MESSAGE_MIN) {
-        (width - wanted, wanted)
+/// message comes first: the activity is shown only if both fit in full, and never at the
+/// cost of a message that would be cut off.
+fn footer_split(width: u16, message: usize, activity: usize) -> (u16, u16) {
+    // One column before the message, two between it and the activity.
+    let message = u16::try_from(message.saturating_add(1)).unwrap_or(u16::MAX);
+    let activity = u16::try_from(activity.saturating_add(2)).unwrap_or(u16::MAX);
+    if width >= message.saturating_add(activity) {
+        (width - activity, activity)
     } else {
         (width, 0)
     }
@@ -688,7 +689,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     // as "opened …", must not hide the progress of the scan for as long as no key is pressed.
     if let Some(msg) = &app.status {
         let (msg_width, activity_width) = match &activity {
-            Some((text, _)) => footer_split(area.width, text.chars().count()),
+            Some((text, _)) => footer_split(area.width, msg.chars().count(), text.chars().count()),
             None => (area.width, 0),
         };
         let [msg_area, activity_area] = Layout::horizontal([
@@ -1174,24 +1175,23 @@ mod tests {
         );
     }
 
-    /// A status message and the scan progress share the footer when both fit; otherwise the
-    /// message has it alone. The progress is never cut off in the middle.
+    /// A status message and the scan progress share the footer when both fit in full;
+    /// otherwise the message has the line alone. Neither is ever cut off for the other.
     #[test]
-    fn footer_split_keeps_the_progress_whole() {
-        assert_eq!(footer_split(120, 60), (58, 62));
+    fn footer_split_never_cuts_the_message_for_the_progress() {
+        // A 20-column message and a 60-column progress need 1 + 20 + 2 + 60 columns.
+        assert_eq!(footer_split(120, 20, 60), (58, 62));
+        assert_eq!(footer_split(83, 20, 60), (21, 62), "exactly enough");
         assert_eq!(
-            footer_split(86, 60),
-            (24, 62),
-            "just enough for the message"
+            footer_split(82, 20, 60),
+            (82, 0),
+            "one short: the message alone"
         );
-        assert_eq!(
-            footer_split(85, 60),
-            (85, 0),
-            "too narrow: the message alone"
-        );
-        assert_eq!(footer_split(40, 60), (40, 0));
-        assert_eq!(footer_split(0, 0), (0, 0));
-        assert_eq!(footer_split(100, usize::MAX), (100, 0));
+        // A long message keeps the whole line even on a wide terminal.
+        assert_eq!(footer_split(130, 72, 60), (130, 0));
+        assert_eq!(footer_split(0, 0, 0), (0, 0));
+        assert_eq!(footer_split(100, usize::MAX, 10), (100, 0));
+        assert_eq!(footer_split(100, 10, usize::MAX), (100, 0));
     }
 
     #[test]
