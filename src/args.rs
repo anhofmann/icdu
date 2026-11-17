@@ -25,6 +25,8 @@ pub struct Args {
     pub one_file_system: bool,
     /// `--exclude-caches`: leave out directories tagged with a `CACHEDIR.TAG`.
     pub exclude_caches: bool,
+    /// `--exclude-kernfs`: leave out Linux pseudo filesystems such as `/proc` and `/sys`.
+    pub exclude_kernfs: bool,
     /// How many times `-r` was given. Once disables deleting.
     pub read_only: u8,
     /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
@@ -56,6 +58,7 @@ impl Default for Args {
             disk_usage: true,
             one_file_system: false,
             exclude_caches: false,
+            exclude_kernfs: false,
             read_only: 0,
             show_item_count: false,
             excludes: Vec::new(),
@@ -131,6 +134,7 @@ enum Action {
     Extended(bool),
     Mtime(bool),
     Caches(bool),
+    Kernfs(bool),
 }
 
 /// One flag: how it is spelled, whether it takes a value, and what `--help` says about it.
@@ -216,6 +220,20 @@ pub const FLAGS: &[Flag] = &[
     Flag {
         negation: Some("exclude-caches"),
         ..flag(&[], &["include-caches"], None, "", Action::Caches(false))
+    },
+    Flag {
+        negation: Some("include-kernfs"),
+        ..flag(
+            &[],
+            &["exclude-kernfs"],
+            None,
+            "leave out Linux pseudo filesystems (/proc, /sys)",
+            Action::Kernfs(true),
+        )
+    },
+    Flag {
+        negation: Some("exclude-kernfs"),
+        ..flag(&[], &["include-kernfs"], None, "", Action::Kernfs(false))
     },
     flag(
         &[],
@@ -465,6 +483,7 @@ fn apply(
         Action::Extended(on) => args.extended = on,
         Action::Mtime(show) => args.show_mtime = show,
         Action::Caches(exclude) => args.exclude_caches = exclude,
+        Action::Kernfs(exclude) => args.exclude_kernfs = exclude,
     }
     Ok(None)
 }
@@ -865,6 +884,14 @@ mod tests {
                 },
             ),
             (&["--exclude-caches", "--include-caches"], d()),
+            (
+                &["--exclude-kernfs"],
+                Args {
+                    exclude_kernfs: true,
+                    ..d()
+                },
+            ),
+            (&["--exclude-kernfs", "--include-kernfs"], d()),
             (
                 &["--include-caches", "--exclude-caches"],
                 Args {

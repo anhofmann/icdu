@@ -4687,6 +4687,7 @@ mod tests {
             newer_than: None,
             extended: false,
             exclude_caches: false,
+            exclude_kernfs: false,
         }
     }
 
