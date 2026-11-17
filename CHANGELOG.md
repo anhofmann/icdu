@@ -37,6 +37,9 @@ Everything since 0.4.1. It will be released as icdu 0.5.0.
 - Dumps written by icdu leave out what ncdu leaves out (sizes of zero, the device where it
   is the parent's, the inode except for hard links). Readers of the format are not affected.
 - Building from source needs Rust 1.88 or newer.
+- **Releases are archives** named `icdu-<version>-<target>.tar.gz`, with the licence, the README
+  and the changelog next to the binary, and GitHub keeps an attestation of where each was
+  built. The bare binaries `…-portable-<os>-<arch>` are no longer published.
 
 ### Added
 

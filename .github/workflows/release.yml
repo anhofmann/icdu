@@ -51,6 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For the attestation: a signed statement of which workflow run built each archive.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -62,22 +65,27 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum icdu-* > sha256sums.txt
+          sha256sum icdu-*.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
       - name: What was built says it is this version
         run: |
-          chmod +x dist/icdu-portable-linux-x86_64
-          said=$(dist/icdu-portable-linux-x86_64 --version)
+          version=${GITHUB_REF_NAME#v}
+          tar -xzf "dist/icdu-$version-x86_64-unknown-linux-musl.tar.gz"
+          said=$("icdu-$version-x86_64-unknown-linux-musl/icdu" --version)
           echo "$said"
-          test "$said" = "icdu ${GITHUB_REF_NAME#v}"
+          test "$said" = "icdu $version"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/icdu-*.tar.gz
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tools/dist/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
-          gh release create "$GITHUB_REF_NAME" dist/icdu-* dist/sha256sums.txt \
+          gh release create "$GITHUB_REF_NAME" dist/icdu-*.tar.gz dist/sha256sums.txt \
             --repo "$GITHUB_REPOSITORY" \
             --title "icdu $GITHUB_REF_NAME" \
             --notes-file notes.md

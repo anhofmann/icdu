@@ -15,6 +15,12 @@ categories = ["command-line-utilities", "filesystem"]
 # install script, the workflows or the tools for the README's recording.
 include = ["/src", "/fixtures", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 
+# Where `cargo binstall icdu` finds the release archives, and the binary inside one.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 # Only what icdu draws with: the crossterm backend and the layout cache. The defaults
 # also bring a macro crate, a calendar widget and with it a date library.

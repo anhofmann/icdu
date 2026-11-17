@@ -599,9 +599,29 @@ shell. The binaries are self-contained:
 - **macOS** builds link only `libSystem`/`libiconv`, which are part of every macOS install
   (Apple does not support fully static binaries; this is the portability ceiling on macOS).
 
-Prebuilt binaries for every release (Linux x86_64 and ARM64, macOS Apple Silicon and Intel,
-plus SHA-256 checksums) are attached to the
-[GitHub Releases](https://github.com/anhofmann/icdu/releases) page.
+### What a release contains, and how to check it
+
+Every [release](https://github.com/anhofmann/icdu/releases) has four archives named
+`icdu-<version>-<target>.tar.gz`, for `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. Each unpacks to
+one directory with the `icdu` binary, the licence, this README and the changelog. (Releases up
+to 0.4.1 consist of bare binaries named `rcdu-portable-<os>-<arch>`.)
+
+- **`sha256sums.txt`** tells you that a download arrived intact. It lies next to the archives,
+  so it cannot tell you who built them: whoever could replace an archive could replace the
+  checksum too.
+- **The attestation** can. For each archive GitHub keeps a signed statement that it was built
+  by this repository's release workflow from the tagged commit. With the
+  [GitHub CLI](https://cli.github.com):
+
+  ```sh
+  gh attestation verify icdu-0.5.0-x86_64-unknown-linux-musl.tar.gz --repo anhofmann/icdu
+  ```
+
+- **On macOS** the binaries are not signed with an Apple developer certificate. Downloaded with
+  a browser, an archive is put in quarantine and the binary refused until you take that off:
+  `xattr -d com.apple.quarantine icdu`. A download with `curl`, which is what the install
+  script does, is not affected.
 
 ### Building them yourself
 
