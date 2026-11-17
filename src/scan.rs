@@ -411,7 +411,8 @@ pub struct Opts {
     pub threads: usize,
     /// Don't cross filesystem boundaries (ncdu `-x`).
     pub one_file_system: bool,
-    /// Glob patterns matched against entry basenames (ncdu `--exclude`).
+    /// Glob patterns for entries to leave out (ncdu `--exclude`), matched against names and
+    /// paths as described in `glob.rs`.
     pub excludes: Vec<String>,
     /// Device id of the root, used for `one_file_system`.
     pub root_dev: u64,
@@ -429,7 +430,8 @@ struct Shared {
     next_id: AtomicU64,
     one_file_system: bool,
     root_dev: u64,
-    excludes: Vec<String>,
+    /// The `--exclude` patterns, compiled.
+    excludes: Vec<glob::Pattern>,
     /// `--older-than` cutoff in Unix seconds; entries modified before it are excluded.
     older_than: Option<i64>,
     /// `--newer-than` cutoff in Unix seconds; entries modified after it are excluded.
@@ -546,7 +548,11 @@ fn start_limited(
         next_id: AtomicU64::new(id_base + 1),
         one_file_system: opts.one_file_system,
         root_dev: opts.root_dev,
-        excludes: opts.excludes,
+        excludes: opts
+            .excludes
+            .iter()
+            .map(|pattern| glob::Pattern::new(pattern))
+            .collect(),
         older_than: opts.older_than,
         newer_than: opts.newer_than,
         start_check: identity.map(|identity| (id_base, identity)),
@@ -635,6 +641,9 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
 
     let mut nodes = Vec::new();
     let mut child_jobs = Vec::new();
+    // For the exclude patterns: this directory's path, and room to build an entry's path in.
+    let dir_bytes = job.path.as_os_str().as_bytes();
+    let mut scratch = Vec::new();
 
     let mut listing = Listing {
         inner: read,
@@ -698,7 +707,12 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
 
         // Determine exclusion / whether to recurse.
         let mut excluded = Excluded::No;
-        if name_excluded(&name, &shared.excludes) {
+        // Patterns see the entry's path as well as its name, as in ncdu.
+        if shared
+            .excludes
+            .iter()
+            .any(|p| p.excludes(dir_bytes, file_name.as_bytes(), &mut scratch))
+        {
             excluded = Excluded::Pattern;
         } else if age_excluded(mtime, shared) {
             excluded = Excluded::Age;
@@ -759,10 +773,6 @@ fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>) {
         f.push(cj);
     }
     cv.notify_all();
-}
-
-fn name_excluded(name: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| glob::matches(p, name))
 }
 
 /// Outside the `--older-than`/`--newer-than` window: `older_than` excludes entries modified
@@ -1754,6 +1764,104 @@ mod tests {
             "only the root says its device"
         );
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `--exclude` patterns against a real tree, with the results ncdu 1.18 gives for the
+    /// same tree and patterns (recorded with `ncdu -o - --exclude PATTERN`). A pattern is
+    /// tried against the whole path of an entry and against every tail of it, and what is
+    /// excluded is not entered, so nothing below it is listed.
+    #[test]
+    fn excludes_match_paths_like_ncdu() {
+        let parent = std::env::temp_dir().join(format!("icdu_excl_paths_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        // The name of the scanned directory is part of every path, so it is fixed.
+        let base = parent.join("excl");
+        for dir in ["a/sub/deep", "b/sub", "sub", "a/other", "pad dir", "c"] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        for file in [
+            "a/sub/deep/f1",
+            "a/sub/f2",
+            "b/sub/f3",
+            "sub/f4",
+            "a/other/f5",
+            "a/x.o",
+            "b/y.o",
+            "c/file1",
+            "c/file2",
+            "c/File3",
+            "pad dir/f6",
+            "#hash",
+            " lead",
+            "trail ",
+        ] {
+            fs::write(base.join(file), b"x").unwrap();
+        }
+        let root = base.to_string_lossy().to_string();
+        let absolute_a = format!("{root}/a");
+        let absolute_sub = format!("{root}/a/sub");
+        let table: &[(&str, &[&str])] = &[
+            ("sub", &["a/sub", "b/sub", "sub"]),
+            ("a/sub", &["a/sub"]),
+            ("*/sub", &["a/sub", "b/sub", "sub"]),
+            ("sub/*", &["a/sub/deep", "a/sub/f2", "b/sub/f3", "sub/f4"]),
+            ("a/*", &["a/other", "a/sub", "a/x.o"]),
+            ("*.o", &["a/x.o", "b/y.o"]),
+            ("a/*.o", &["a/x.o"]),
+            (&absolute_a, &["a"]),
+            (&absolute_sub, &["a/sub"]),
+            // A leading slash is the root of the filesystem, not of the scan.
+            ("/a", &[]),
+            ("file[12]", &["c/file1", "c/file2"]),
+            ("file[!1]", &["c/file2"]),
+            ("[Ff]ile?", &["c/File3", "c/file1", "c/file2"]),
+            ("file[[:digit:]]", &["c/file1", "c/file2"]),
+            ("f?le*", &["c/file1", "c/file2"]),
+            ("deep", &["a/sub/deep"]),
+            ("sub/deep", &["a/sub/deep"]),
+            ("b*", &["b"]),
+            // `a/sub` and `sub` because a star also takes slashes: "…/a/su" + "b".
+            ("*b", &["a/sub", "b", "sub"]),
+            ("a/sub/deep/f1", &["a/sub/deep/f1"]),
+            // The scanned directory's own name is part of the path.
+            ("excl/a", &["a"]),
+            ("pad dir", &["pad dir"]),
+            ("pad*", &["pad dir"]),
+            ("su", &[]),
+            (r"a\/sub", &["a/sub"]),
+            (r"fil\e1", &["c/file1"]),
+            ("[a-c]", &["a", "b", "c"]),
+            (
+                "*",
+                &[" lead", "#hash", "a", "b", "c", "pad dir", "sub", "trail "],
+            ),
+            // No entry's path ends in a slash.
+            ("c/", &[]),
+            // The scanned directory itself is never excluded.
+            ("excl", &[]),
+        ];
+        let meta = fs::symlink_metadata(&base).unwrap();
+        for (pattern, expected) in table {
+            let mut o = opts(4, meta.dev());
+            o.excludes = vec![pattern.to_string()];
+            let mut tree = Tree::new(
+                root.clone().into(),
+                meta.len(),
+                meta.blocks() * 512,
+                meta.dev(),
+                meta.ino(),
+            );
+            for batch in start(base.clone(), o).events.iter() {
+                tree.apply(batch);
+            }
+            let mut excluded: Vec<String> = (0..tree.nodes.len())
+                .filter(|&i| tree.nodes[i].excluded == Excluded::Pattern)
+                .map(|i| tree.rel_path_from(i, tree.root))
+                .collect();
+            excluded.sort();
+            assert_eq!(excluded, *expected, "--exclude {pattern:?}");
+        }
+        fs::remove_dir_all(&parent).unwrap();
     }
 
     /// An entry that is gone is not an error; everything else is.

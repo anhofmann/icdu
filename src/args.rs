@@ -396,11 +396,14 @@ fn apply(
         Action::Exclude => args.excludes.push(value),
         Action::ExcludeFrom => {
             let content = std::fs::read_to_string(&value).map_err(|e| format!("{value}: {e}"))?;
+            // One pattern per line, taken as it stands, as ncdu does: a line is not trimmed,
+            // and one that starts with `#` is a pattern like any other. Only the line ending
+            // is removed, and empty lines are skipped.
             args.excludes.extend(
                 content
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .split('\n')
+                    .map(|line| line.trim_end_matches('\r'))
+                    .filter(|line| !line.is_empty())
                     .map(str::to_string),
             );
         }
@@ -937,20 +940,37 @@ mod tests {
         }
     }
 
-    /// `-X` reads patterns from a file: one per line, without blank lines and comments.
+    /// `-X` reads patterns from a file, one per line, exactly as ncdu 1.18 does (checked
+    /// with files of each kind): a line is a pattern as it stands, with its spaces, and also
+    /// when it starts with `#`. Line endings are removed and empty lines skipped.
     #[test]
     fn exclude_from_reads_patterns() {
         let file = std::env::temp_dir().join(format!("icdu_args_{}", std::process::id()));
-        std::fs::write(&file, "*.o\n\n  # a comment\n  node_modules  \n").unwrap();
+        std::fs::write(
+            &file,
+            "*.o\n\n#hash\n lead\ntrail \n  padded  \r\nlast-without-newline",
+        )
+        .unwrap();
         let file_arg = file.to_string_lossy().to_string();
         let parsed = args(&["--exclude", "first", "-X", &file_arg]);
-        assert_eq!(parsed.excludes, vec!["first", "*.o", "node_modules"]);
-        assert_eq!(args(&[&format!("-X{file_arg}")]).excludes.len(), 2);
+        assert_eq!(
+            parsed.excludes,
+            vec![
+                "first",
+                "*.o",
+                "#hash",
+                " lead",
+                "trail ",
+                "  padded  ",
+                "last-without-newline"
+            ]
+        );
+        assert_eq!(args(&[&format!("-X{file_arg}")]).excludes.len(), 6);
         assert_eq!(
             args(&[&format!("--exclude-from={file_arg}")])
                 .excludes
                 .len(),
-            2
+            6
         );
         std::fs::remove_file(&file).unwrap();
     }

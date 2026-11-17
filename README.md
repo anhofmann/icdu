@@ -53,6 +53,9 @@ Up to version 0.4.1 this program was called rcdu. Coming from it:
   act on the directory you are viewing. The full list is under [Keys](#keys).
 - Exports written from the UI are named `icdu-dump.json`, and dumps carry `icdu` as the program
   name. Dumps written by rcdu load as before.
+- `--exclude` patterns also see the path, as in ncdu: one with a `/` in it now has an effect,
+  and a pattern with a wildcard can match across directories (`lib*.so` also matches
+  `lib/x/y.so`). An exclude file (`-X`) no longer has comments, and its lines are not trimmed.
 
 ## Usage
 
@@ -306,8 +309,15 @@ leaves the rest on disk. Any other key disarms the prompt.
   size moves to one of them instead of dropping out of the totals. The delete dialog says when
   the selection contains hard-linked files: their space is only freed once the last link is
   gone.
-- `--exclude PATTERN` matches an entry's **basename** with shell globbing (`*`, `?`, `[...]`).
+- `--exclude PATTERN` takes a shell pattern (`*`, `?`, `[...]` with ranges, `[!...]` and
+  `[[:alpha:]]`, `\` before a character to take it literally) and matches it the way ncdu does:
+  against an entry's whole path, and against every tail of that path that starts after a `/`.
+  So `node_modules` excludes every entry of that name, `src/build` only a `build` inside a
+  `src`, and `/var/cache` exactly that directory. A `*` or `?` also matches a `/`: `build/*`
+  excludes everything directly inside any `build` and leaves the directory itself.
   Excluded entries stay visible (marked `<`) but are not descended into and don't count.
+- `-X FILE` reads one pattern per line. As in ncdu a line is taken as it stands: spaces belong
+  to the pattern and a `#` does not start a comment. Empty lines are skipped.
 - `-x` keeps the scan on the root's filesystem; mount points on other devices are shown but not
   traversed.
 - `--older-than DUR` / `--newer-than DUR` exclude entries by modification time (durations:
@@ -404,7 +414,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). Entries arrive in batches, a huge directory in several; excludes, one-filesystem. |
 | `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, counts each hard-linked inode once, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
 | `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
-| `glob.rs` | `fnmatch`-style globbing for `--exclude`. |
+| `glob.rs` | The `--exclude` patterns: `fnmatch`-style, compiled once, matched against paths as ncdu does. |
 | `matcher.rs` | Matching a search query against names: case-insensitive for all letters, and across the two Unicode spellings of accented Latin letters. |
 | `dump.rs` | ncdu-compatible JSON import/export, both streaming: a hand-written writer, and a pull parser for exactly this format. |
 | `app.rs` | App state + key handling, modals (help/confirm), background delete and open. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
