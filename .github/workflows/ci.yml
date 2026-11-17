@@ -29,3 +29,24 @@ jobs:
         run: cargo test
       - name: Build (release)
         run: cargo build --release
+
+  # The oldest Rust that icdu promises to build with: `rust-version` in Cargo.toml.
+  msrv:
+    name: minimum Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install the declared minimum
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$version"
+          rustup toolchain install "$version" --profile minimal
+          echo "MSRV=$version" >> "$GITHUB_ENV"
+      - name: Tests
+        run: cargo "+$MSRV" test --locked
+      - name: Build (release)
+        run: cargo "+$MSRV" build --release --locked

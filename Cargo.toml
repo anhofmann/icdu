@@ -2,8 +2,18 @@
 name = "icdu"
 version = "0.4.1"
 edition = "2021"
+# What the newest dependency needs (ratatui 0.30). CI builds and tests with exactly this
+# version, taken from this line.
+rust-version = "1.88"
 description = "A disk usage explorer you can browse and search while it is still scanning; compatible with ncdu"
 license = "MIT"
+repository = "https://github.com/anhofmann/icdu"
+readme = "README.md"
+keywords = ["ncdu", "disk-usage", "du", "tui", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+# The crate is the program and what its tests read. Not the notes for contributors, the
+# install script, the workflows or the tools for the README's recording.
+include = ["/src", "/fixtures", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 
 [dependencies]
 # Only what icdu draws with: the crossterm backend and the layout cache. The defaults
@@ -21,3 +31,5 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+# Also for `cargo install`: the release workflow strips its builds anyway.
+strip = true
