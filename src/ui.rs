@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    fmt_mtime, indicator, scroll_offset, size_column, App, Find, HelpView, Modal, Sort, SortColumn,
+    flag_of, fmt_mtime, scroll_offset, size_column, App, Find, HelpView, Modal, Sort, SortColumn,
     TopFiles, FIND_CAP,
 };
 use crate::matcher::Matcher;
@@ -693,7 +693,9 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             Some(_) => NodeKind::Link,
             None => n.kind,
         };
-        let ind = indicator(kind, n.shared, n.excluded != Excluded::No, n.read_error);
+        // ncdu's layout: the flag leads the row, and a directory's name starts with a slash.
+        let flag = flag_of(&app.tree, k);
+        let slash = if n.is_dir() { '/' } else { ' ' };
         let name_style = if n.read_error || n.excluded != Excluded::No {
             Style::default().fg(Color::DarkGray)
         } else if n.shared {
@@ -738,10 +740,10 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let incomplete = n.unscanned > 0;
-        let mut spans = vec![Span::styled(
-            size_cell(size, incomplete),
-            size_style(incomplete),
-        )];
+        let mut spans = vec![
+            Span::raw(format!("{flag} ")),
+            Span::styled(size_cell(size, incomplete), size_style(incomplete)),
+        ];
         // The two columns `g` goes through.
         if app.show_graph {
             spans.push(Span::styled(
@@ -761,7 +763,10 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
                 mtime_cell(&app.tree, k)
             )));
         }
-        spans.push(Span::styled(format!("{ind}{}{suffix}", n.name), name_style));
+        spans.push(Span::styled(
+            format!("{slash}{}{suffix}", n.name),
+            name_style,
+        ));
         items.push(ListItem::new(Line::from(spans)));
     }
 
@@ -999,8 +1004,12 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("q / C-c", "quit (twice during a deletion)"),
 ];
 
-/// What the flag in front of a name means. `*` is a special file: device, socket, fifo.
-const HELP_FLAGS: &str = "/ dir  @ link  * special  H hard link  < excluded  ! error";
+/// What the flag at the start of a row means (see `app::flag_of`).
+const HELP_FLAGS: [&str; 3] = [
+    "! not read   . error further down   < excluded   e empty",
+    "> other filesystem   ^ kernel filesystem   F firmlink",
+    "H hard link, counted elsewhere   @ symlink or special file",
+];
 
 /// Columns of one help entry: two of margin, the key, the description.
 const HELP_KEY_WIDTH: usize = 24;
@@ -1008,7 +1017,7 @@ const HELP_COLUMN_WIDTH: u16 = 2 + HELP_KEY_WIDTH as u16 + 40;
 
 /// Lines of the popup that are not keys: title, a blank line above and below the keys, the
 /// flags, the hint at the bottom, and the border.
-const HELP_FIXED_ROWS: u16 = 7;
+const HELP_FIXED_ROWS: u16 = 6 + HELP_FLAGS.len() as u16;
 
 /// How the help popup is laid out in a terminal of a given size.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1082,7 +1091,9 @@ fn render_help(f: &mut Frame, view: &HelpView) {
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(format!("  {HELP_FLAGS}"), dim)));
+    for flags in HELP_FLAGS {
+        lines.push(Line::from(Span::styled(format!("  {flags}"), dim)));
+    }
     let hint = if layout.max_scroll > 0 {
         help_scroll_hint(scroll, layout.rows, per_column)
     } else {
@@ -1339,8 +1350,8 @@ mod tests {
         find_empty_message, find_rows, find_title, fmt_count, fmt_items, fmt_size_in,
         followed_note, footer_split, hard_link_note, help_layout, help_scroll_hint, hidden_title,
         item_cell, left_to_read, list_title, listing_state, mtime_cell, scan_progress, size_cell,
-        sort_label, truncate_left, GraphStyle, HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS,
-        HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
+        sort_label, truncate_left, GraphStyle, HelpLayout, Listing, HELP_COLUMN_WIDTH,
+        HELP_FIXED_ROWS, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
     };
     use crate::app::{Sort, SortColumn};
     use crate::model::{Excluded, NodeKind, Tree};
@@ -1760,19 +1771,26 @@ mod tests {
             rows,
             max_scroll,
         };
+        // Heights are given as rows of keys that fit, on top of the lines that are not keys.
+        let h = |rows: u16| rows + HELP_FIXED_ROWS;
         // Tall enough: one column, whatever the width.
-        assert_eq!(help_layout(80, 30, keys), one(23, 0));
-        assert_eq!(help_layout(200, 30, keys), one(23, 0));
+        assert_eq!(help_layout(80, h(23), keys), one(23, 0));
+        assert_eq!(help_layout(200, h(23), keys), one(23, 0));
         assert_eq!(help_layout(200, 60, keys), one(23, 0));
-        // A standard 80×24 terminal: 17 rows of keys, the other 6 by scrolling.
-        assert_eq!(help_layout(80, 24, keys), one(17, 6));
+        // Room for 17 rows of keys: the other 6 by scrolling.
+        assert_eq!(help_layout(80, h(17), keys), one(17, 6));
+        // A standard 80×24 terminal scrolls, and shows what it has room for.
+        let standard = help_layout(80, 24, keys);
+        assert_eq!(standard.columns, 1);
+        assert_eq!(standard.rows as u16, 24 - HELP_FIXED_ROWS);
+        assert_eq!(standard.rows + standard.max_scroll, keys);
         // Short but wide: two columns of 12, and they fit.
-        assert_eq!(help_layout(140, 24, keys), two(12, 0));
-        assert_eq!(help_layout(134, 19, keys), two(12, 0));
+        assert_eq!(help_layout(140, h(17), keys), two(12, 0));
+        assert_eq!(help_layout(134, h(12), keys), two(12, 0));
         // One column short of two: back to scrolling.
-        assert_eq!(help_layout(133, 24, keys), one(17, 6));
+        assert_eq!(help_layout(133, h(17), keys), one(17, 6));
         // Wide and very short: two columns, scrolling.
-        assert_eq!(help_layout(140, 12, keys), two(5, 7));
+        assert_eq!(help_layout(140, h(5), keys), two(5, 7));
         // Tiny: one row at a time, and no panic.
         assert_eq!(help_layout(20, 3, keys), one(1, 22));
         assert_eq!(help_layout(0, 0, keys), one(1, 22));
@@ -1790,13 +1808,19 @@ mod tests {
             );
         }
         // Every flag the list can show is explained, and the lines below the keys fit too.
-        for flag in ["/", "@", "*", "H", "<", "!"] {
-            assert!(HELP_FLAGS.contains(flag), "{flag}");
+        let legend = HELP_FLAGS.join("   ");
+        for flag in ['!', '.', '<', '>', '^', 'F', 'H', '@', 'e'] {
+            let explained = legend
+                .split("   ")
+                .any(|entry| entry.trim_start().starts_with(&format!("{flag} ")));
+            assert!(explained, "{flag}");
         }
         let width = HELP_COLUMN_WIDTH as usize;
-        assert!(2 + HELP_FLAGS.chars().count() <= width);
+        for flags in HELP_FLAGS {
+            assert!(2 + flags.chars().count() <= width, "{flags}");
+        }
         assert!(help_scroll_hint(100, 100, 999).chars().count() <= width);
-        let tall = HELP_KEYS.len() as u16 + 7;
+        let tall = HELP_KEYS.len() as u16 + HELP_FIXED_ROWS;
         assert_eq!(help_layout(80, tall, HELP_KEYS.len()).max_scroll, 0);
     }
 

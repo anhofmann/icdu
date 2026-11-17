@@ -2547,21 +2547,47 @@ fn opener_command(path: &Path) -> Command {
     cmd
 }
 
-/// A short type indicator for an entry (mirrors ncdu's column).
-pub fn indicator(kind: NodeKind, shared: bool, excluded: bool, read_error: bool) -> char {
-    if read_error {
-        '!'
-    } else if excluded {
+/// The flag in front of an entry: ncdu's characters, and where several apply ncdu's choice
+/// among them.
+///
+/// | Flag | Meaning |
+/// |---|---|
+/// | `<` | excluded by a pattern, a cache tag or icdu's mtime filter |
+/// | `!` | could not be read |
+/// | `.` | something further down could not be read, so the size may be too small |
+/// | `>` | a directory on another filesystem (`-x`) |
+/// | `^` | a kernel filesystem (`--exclude-kernfs`) |
+/// | `F` | a firmlink (only in dumps written by ncdu on macOS) |
+/// | `H` | a hard link whose file is counted at another of its names |
+/// | `@` | neither a file nor a directory: a symlink, device, socket or fifo |
+/// | `e` | an empty directory |
+///
+/// A directory that has not been read yet is not called empty, and a symlink that is
+/// counted as its target (`-L`) is still shown as one.
+pub fn flag_of(tree: &Tree, idx: NodeIdx) -> char {
+    let n = &tree.nodes[idx];
+    if matches!(n.excluded, Excluded::Pattern | Excluded::Age) {
         '<'
-    } else if shared {
+    } else if n.read_error {
+        '!'
+    } else if tree.errors_below(idx) > 0 {
+        '.'
+    } else if n.excluded == Excluded::OtherFs {
+        '>'
+    } else if n.excluded == Excluded::Kernfs {
+        '^'
+    } else if n.excluded == Excluded::FrmLink {
+        'F'
+    } else if n.shared {
         'H'
+    } else if matches!(n.kind, NodeKind::Link | NodeKind::Other)
+        || tree.followed_link(idx).is_some()
+    {
+        '@'
+    } else if n.is_dir() && n.scanned && n.children.is_empty() {
+        'e'
     } else {
-        match kind {
-            NodeKind::Dir => '/',
-            NodeKind::Link => '@',
-            NodeKind::Other => '*',
-            NodeKind::File => ' ',
-        }
+        ' '
     }
 }
 
@@ -2709,7 +2735,7 @@ pub fn fmt_mtime(mtime: u64) -> String {
 mod tests {
     use super::*;
     use crate::model::{Excluded, NodeKind};
-    use crate::scan::Batch;
+    use crate::scan::{Batch, NewNode};
     use crossbeam_channel::Sender;
 
     fn app() -> App {
@@ -3672,6 +3698,140 @@ mod tests {
             .unwrap()
             .contains("something else now"));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The flag of an entry in each situation ncdu has a flag for, and which one wins where
+    /// two apply.
+    #[test]
+    fn flags_are_ncdus() {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        let node = |name: &str, kind, excluded, dir_id| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind,
+            apparent: 10,
+            disk: 10,
+            dev: 1,
+            ino: 1,
+            hlink: false,
+            nlink: 1,
+            excluded,
+            error: None,
+            dir_id,
+            followed: None,
+        };
+        let dir = |name: &str, id| node(name, NodeKind::Dir, Excluded::No, Some(id));
+        let left_out = |name: &str, why| node(name, NodeKind::Dir, why, None);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                node("file", NodeKind::File, Excluded::No, None),
+                dir("full", 1),
+                dir("empty", 2),
+                dir("unread", 3),
+                dir("unreadable", 4),
+                dir("trouble-below", 5),
+                left_out("by-pattern", Excluded::Pattern),
+                left_out("by-age", Excluded::Age),
+                left_out("other-fs", Excluded::OtherFs),
+                left_out("kernfs", Excluded::Kernfs),
+                left_out("firmlink", Excluded::FrmLink),
+                node("symlink", NodeKind::Link, Excluded::No, None),
+                node("socket", NodeKind::Other, Excluded::No, None),
+                NewNode {
+                    hlink: true,
+                    nlink: 2,
+                    ino: 77,
+                    ..node("link-one", NodeKind::File, Excluded::No, None)
+                },
+                NewNode {
+                    hlink: true,
+                    nlink: 2,
+                    ino: 77,
+                    ..node("link-two", NodeKind::File, Excluded::No, None)
+                },
+                NewNode {
+                    followed: Some(Box::new((1, 99))),
+                    ..node("followed", NodeKind::File, Excluded::No, None)
+                },
+                NewNode {
+                    error: Some("Permission denied".into()),
+                    ..node("no-stat", NodeKind::Other, Excluded::No, None)
+                },
+            ],
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        });
+        let batch = |parent_id, nodes, error: Option<&str>| Batch {
+            parent_id,
+            nodes,
+            error: error.map(String::from),
+            more: false,
+            ext: Vec::new(),
+        };
+        t.apply(batch(
+            1,
+            vec![node("inside", NodeKind::File, Excluded::No, None)],
+            None,
+        ));
+        t.apply(batch(2, Vec::new(), None));
+        t.apply(batch(4, Vec::new(), Some("Permission denied")));
+        t.apply(batch(5, vec![dir("deeper", 6)], None));
+        t.apply(batch(6, Vec::new(), Some("Input/output error")));
+
+        let flag = |name: &str| {
+            let idx = t.nodes.iter().position(|n| n.name == name).unwrap();
+            flag_of(&t, idx)
+        };
+        // One row for each line of ncdu's list of flags.
+        assert_eq!(flag("unreadable"), '!', "error reading this directory");
+        assert_eq!(flag("no-stat"), '!', "or this entry");
+        assert_eq!(flag("trouble-below"), '.', "error reading a subdirectory");
+        assert_eq!(flag("by-pattern"), '<', "excluded by a pattern");
+        assert_eq!(flag("other-fs"), '>', "on another filesystem");
+        assert_eq!(flag("kernfs"), '^', "an excluded pseudo filesystem");
+        assert_eq!(flag("symlink"), '@', "neither file nor directory");
+        assert_eq!(flag("socket"), '@', "of any kind");
+        assert_eq!(flag("link-two"), 'H', "hard link already counted");
+        assert_eq!(flag("empty"), 'e', "empty directory");
+        // And those that have none.
+        assert_eq!(flag("file"), ' ');
+        assert_eq!(flag("full"), ' ');
+        assert_eq!(flag("link-one"), ' ', "the link that is counted");
+        assert_eq!(flag("deeper"), '!');
+        // icdu's own cases.
+        assert_eq!(flag("by-age"), '<', "the mtime filter excludes too");
+        assert_eq!(flag("firmlink"), 'F');
+        assert_eq!(flag("unread"), ' ', "not read yet is not empty");
+        assert_eq!(
+            flag("followed"),
+            '@',
+            "a link counted as its target is a link"
+        );
+        // The root has an error below it as well.
+        assert_eq!(flag_of(&t, t.root), '.');
+
+        // A directory that is being read again is not empty either.
+        let empty = t.nodes.iter().position(|n| n.name == "empty").unwrap();
+        t.begin_refresh(empty, SCAN_ID_STRIDE);
+        assert_eq!(flag_of(&t, empty), ' ');
+        // An imported directory without entries is.
+        let mut imported = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let d = imported.import_child(
+            0,
+            "d".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        assert_eq!(flag_of(&imported, d), 'e');
     }
 
     /// A batch for the root with one file, as a running scan would deliver it.

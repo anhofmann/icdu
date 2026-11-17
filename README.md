@@ -229,8 +229,22 @@ A letter typed with Ctrl or Alt is never taken for the plain letter: `Ctrl-e` do
 When icdu is ended from outside (`kill`, a closed terminal window), it gives the terminal back
 in a usable state first.
 
-Row indicators: `/` dir · `@` symlink · `*` special file (device, socket, fifo) · `H` hard-link
-duplicate · `<` excluded · `!` read error.
+Every row starts with a flag, the same ones as in ncdu, and the name of a directory starts
+with `/`:
+
+| Flag | Meaning |
+|---|---|
+| `!` | the directory or entry could not be read |
+| `.` | something further down could not be read, so the size may be too small |
+| `<` | excluded: by a pattern, as a cache directory, or by the mtime filters |
+| `>` | a directory on another filesystem, not entered (`-x`) |
+| `^` | a kernel filesystem, not entered (`--exclude-kernfs`) |
+| `H` | a hard link whose file is counted at another of its names |
+| `@` | neither a file nor a directory: a symlink, device, socket or fifo |
+| `e` | an empty directory |
+| `F` | a firmlink (only in dumps that ncdu wrote on macOS) |
+
+A directory that has not been read yet is not flagged as empty.
 
 ### While the scan is running
 
