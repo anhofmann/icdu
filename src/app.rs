@@ -322,10 +322,20 @@ pub enum InputMode {
     Find,
 }
 
+/// State of the help popup. Drawing decides how it is laid out, because only drawing knows
+/// the size of the terminal, and leaves the result here for the key handling.
+#[derive(Default)]
+pub struct HelpView {
+    /// First row of keys on screen, when they do not all fit.
+    pub scroll: Cell<usize>,
+    /// The last row the popup can be scrolled to; 0 when everything fits.
+    pub max_scroll: Cell<usize>,
+}
+
 /// A transient modal overlay.
 pub enum Modal {
     None,
-    Help,
+    Help(HelpView),
     /// Confirm deletion of the given node.
     ConfirmDelete(NodeIdx),
     /// Confirm an export while directories are still unread: the dump will be partial.
@@ -1267,7 +1277,27 @@ impl App {
         // Modal overlays capture input first. The modal is taken out (popups carry state), so
         // every arm that keeps it open must put it back.
         match std::mem::replace(&mut self.modal, Modal::None) {
-            Modal::Help => return,
+            Modal::Help(view) => {
+                // When the keys do not all fit, the movement keys scroll. Everything else,
+                // and every key when nothing can be scrolled, closes the popup.
+                let max = view.max_scroll.get();
+                let at = view.scroll.get();
+                let to = match action {
+                    KeyAction::Down => at + 1,
+                    KeyAction::Up => at.saturating_sub(1),
+                    KeyAction::PageDown(page) => at.saturating_add(page),
+                    KeyAction::PageUp(page) => at.saturating_sub(page),
+                    KeyAction::Top => 0,
+                    KeyAction::Bottom => max,
+                    _ => return,
+                };
+                if max == 0 {
+                    return;
+                }
+                view.scroll.set(to.min(max));
+                self.modal = Modal::Help(view);
+                return;
+            }
             Modal::ConfirmDelete(idx) => {
                 match action {
                     KeyAction::Confirm => self.perform_delete(idx),
@@ -1464,7 +1494,7 @@ impl App {
             }
             KeyAction::ToggleUsage => self.disk_usage = !self.disk_usage,
             KeyAction::ToggleItemCount => self.show_item_count = !self.show_item_count,
-            KeyAction::Help => self.modal = Modal::Help,
+            KeyAction::Help => self.modal = Modal::Help(HelpView::default()),
             KeyAction::Delete => self.request_delete(),
             KeyAction::Open => self.open_selected(),
             KeyAction::TopFiles => self.open_top_files(),
@@ -3339,6 +3369,56 @@ mod tests {
         pump(&mut app, "the rescan", |a| !a.scanning);
         assert_eq!(app.tree.nodes[top].items, items, "and finds it all again");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// When the help does not fit the terminal, the movement keys scroll it and stop at its
+    /// ends. Any other key closes it; so does every key when there is nothing to scroll.
+    #[test]
+    fn help_scrolls_when_it_does_not_fit() {
+        let scroll = |app: &App| match &app.modal {
+            Modal::Help(view) => Some(view.scroll.get()),
+            _ => None,
+        };
+        let open = |max: usize| {
+            let mut app = app_with_entries();
+            app.on_key(KeyAction::Help);
+            // What drawing on a short terminal would report.
+            if let Modal::Help(view) = &app.modal {
+                view.max_scroll.set(max);
+            }
+            app
+        };
+
+        let mut app = open(10);
+        for (key, want) in [
+            (KeyAction::Down, 1),
+            (KeyAction::Down, 2),
+            (KeyAction::Up, 1),
+            (KeyAction::PageDown(6), 7),
+            (KeyAction::PageDown(6), 10),
+            (KeyAction::Down, 10),
+            (KeyAction::PageUp(6), 4),
+            (KeyAction::Top, 0),
+            (KeyAction::Up, 0),
+            (KeyAction::Bottom, 10),
+        ] {
+            app.on_key(key);
+            assert_eq!(scroll(&app), Some(want), "after {key:?}");
+        }
+        app.on_key(KeyAction::ToggleSort);
+        assert_eq!(scroll(&app), None, "any other key closes it");
+        assert!(matches!(app.sort, SortKey::Size), "and does nothing else");
+
+        // Everything fits: every key closes, as the popup says.
+        for key in [KeyAction::Down, KeyAction::PageDown(5), KeyAction::Help] {
+            let mut app = open(0);
+            app.on_key(key);
+            assert_eq!(scroll(&app), None, "{key:?}");
+        }
+        // q closes the help and does not quit.
+        let mut app = open(10);
+        app.on_key(KeyAction::Quit);
+        assert!(scroll(&app).is_none() && !app.quit);
     }
 
     /// Esc closes popups and nothing else. It used to quit, so a second tap on the key that

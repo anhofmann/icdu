@@ -111,7 +111,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `x` | jump to the next read-error entry (`!` marker), wrapping around; the footer shows the reason |
 | `b` | spawn `$SHELL` in the current directory |
 | `o` | open selected entry (default app; directories in the file manager) |
-| `?` | show the help dialog |
+| `?` | show the help dialog (it scrolls with `j` / `k` when the terminal is too small for it) |
 | `q` | quit |
 | `Esc` | close a popup (it never quits) |
 | `Ctrl-l` | redraw the screen |
@@ -124,7 +124,8 @@ A letter typed with Ctrl or Alt is never taken for the plain letter: `Ctrl-e` do
 When icdu is ended from outside (`kill`, a closed terminal window), it gives the terminal back
 in a usable state first.
 
-Row indicators: `/` dir · `@` symlink · `H` hard-link duplicate · `<` excluded · `!` read error.
+Row indicators: `/` dir · `@` symlink · `*` special file (device, socket, fifo) · `H` hard-link
+duplicate · `<` excluded · `!` read error.
 
 ### While the scan is running
 

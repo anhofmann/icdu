@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{find_ci, indicator, scroll_offset, App, Find, Modal, SortKey, TopFiles};
+use crate::app::{
+    find_ci, indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles,
+};
 use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -80,7 +82,7 @@ pub fn render(f: &mut Frame, app: &App) {
     render_footer(f, app, chunks[2]);
 
     match &app.modal {
-        Modal::Help => render_help(f),
+        Modal::Help(view) => render_help(f, view),
         Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
         Modal::ConfirmExport => render_confirm_export(f, app),
         Modal::TopFiles(tf) => render_top_files(f, app, tf),
@@ -771,58 +773,133 @@ fn wrapped_height(lines: &[Line], inner_width: u16) -> u16 {
         .sum()
 }
 
-fn render_help(f: &mut Frame) {
-    let lines = vec![
-        Line::from(vec![Span::styled(
+/// The keys, as the help popup lists them: what to press and what it does.
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("j / k, ↓ / ↑", "move the selection"),
+    ("l / Enter / →", "enter the directory"),
+    ("h / < / Backspace / ←", "go up"),
+    ("Home / End, G", "jump to top / bottom"),
+    ("PgUp / PgDn, C-d / C-u", "page up / down"),
+    ("s", "toggle sort (size ↔ name)"),
+    ("/", "search by name; Enter goes there"),
+    ("    Tab", "search this directory only"),
+    ("    C-u / C-w", "clear the query / delete a word"),
+    ("a", "toggle apparent ↔ disk usage"),
+    ("c", "toggle the item count column"),
+    ("d", "delete the selected entry (asks first)"),
+    ("o", "open it in the default application"),
+    ("T", "largest files under this directory"),
+    ("i", "details of the selected entry"),
+    ("r", "rescan this directory"),
+    ("E", "export the tree as ncdu JSON"),
+    ("x / !", "jump to the next read error"),
+    ("b", "shell in this directory"),
+    ("C-l / C-z", "redraw / suspend to the shell"),
+    ("?", "this help"),
+    ("Esc", "close a popup"),
+    ("q / C-c", "quit (twice during a deletion)"),
+];
+
+/// What the flag in front of a name means. `*` is a special file: device, socket, fifo.
+const HELP_FLAGS: &str = "/ dir  @ link  * special  H hard link  < excluded  ! error";
+
+/// Columns of one help entry: two of margin, the key, the description.
+const HELP_KEY_WIDTH: usize = 24;
+const HELP_COLUMN_WIDTH: u16 = 2 + HELP_KEY_WIDTH as u16 + 40;
+
+/// Lines of the popup that are not keys: title, a blank line above and below the keys, the
+/// flags, the hint at the bottom, and the border.
+const HELP_FIXED_ROWS: u16 = 7;
+
+/// How the help popup is laid out in a terminal of a given size.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct HelpLayout {
+    /// Columns the keys are set in: 1 or 2.
+    columns: usize,
+    /// Rows of keys on screen.
+    rows: usize,
+    /// How far the keys can be scrolled; 0 when they all fit.
+    max_scroll: usize,
+}
+
+/// Lay the help out: one column when the terminal is tall enough for all `keys`; otherwise two
+/// columns when it is wide enough; and scrolling when even that does not fit. A terminal of
+/// 80×24 gets one scrolling column, so every line can be reached there.
+fn help_layout(width: u16, height: u16, keys: usize) -> HelpLayout {
+    let available = height.saturating_sub(HELP_FIXED_ROWS).max(1) as usize;
+    let fits = |columns: usize| keys.div_ceil(columns) <= available;
+    let two_fit_side_by_side = width >= 2 * HELP_COLUMN_WIDTH + 2;
+    let columns = if !fits(1) && two_fit_side_by_side {
+        2
+    } else {
+        1
+    };
+    let needed = keys.div_ceil(columns);
+    HelpLayout {
+        columns,
+        rows: needed.min(available),
+        max_scroll: needed.saturating_sub(available),
+    }
+}
+
+/// The bottom line of a help popup that scrolls: how, and which rows are on screen.
+fn help_scroll_hint(scroll: usize, rows: usize, of: usize) -> String {
+    format!(
+        "  j/k PgUp/PgDn scroll ({}–{} of {of}) · other keys close",
+        scroll + 1,
+        scroll + rows
+    )
+}
+
+fn render_help(f: &mut Frame, view: &HelpView) {
+    let layout = help_layout(f.area().width, f.area().height, HELP_KEYS.len());
+    // Tell the key handling how far it may scroll, and keep the position within that.
+    view.max_scroll.set(layout.max_scroll);
+    let scroll = view.scroll.get().min(layout.max_scroll);
+    view.scroll.set(scroll);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(Span::styled(
             "icdu — keys",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )]),
+        )),
         Line::from(""),
-        Line::from("  j / k, ↓ / ↑      move selection"),
-        Line::from("  l / Enter / →     enter directory"),
-        Line::from("  h / < / Backspace / ←  go up"),
-        Line::from("  Home / End, G     jump to top / bottom"),
-        Line::from("  PgUp / PgDn, C-d / C-u  page up / down"),
-        Line::from("  s                 toggle sort (size ↔ name)"),
-        Line::from(
-            "  /                 search by name (Enter goes there, Tab: this directory only)",
-        ),
-        Line::from("                    in the search: C-u clear, C-w delete word, paste works"),
-        Line::from("  a                 toggle apparent ↔ disk usage"),
-        Line::from("  c                 toggle item count column (entries below each dir)"),
-        Line::from("  d                 delete selected (confirm; needs full scan)"),
-        Line::from("  o                 open selected in default app / file manager"),
-        Line::from("  T                 largest files under this directory"),
-        Line::from("  i                 show details of the selected entry"),
-        Line::from("  r                 rescan this directory in place"),
-        Line::from("  E                 export the tree to an ncdu-format JSON file"),
-        Line::from("  x / !             jump to the next read-error entry"),
-        Line::from("  b                 spawn $SHELL in this directory"),
-        Line::from("  ?                 toggle this help"),
-        Line::from("  q / Ctrl-C        quit (during a delete: press twice to abort it)"),
-        Line::from("  Esc               close a popup"),
-        Line::from("  C-l / C-z         redraw the screen / suspend to the shell"),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  indicators: / dir   @ link   H hard-link dup   < excluded   ! error",
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  press any key to close",
-            Style::default().add_modifier(Modifier::ITALIC),
-        )]),
     ];
-    let width = 74u16;
-    let height = wrapped_height(&lines, width - 2) + 2;
+    // Keys fill the columns top to bottom, the left one first.
+    let per_column = HELP_KEYS.len().div_ceil(layout.columns);
+    for row in scroll..scroll + layout.rows {
+        let mut spans = Vec::new();
+        for column in 0..layout.columns {
+            let Some((key, what)) = HELP_KEYS.get(column * per_column + row) else {
+                continue;
+            };
+            let text = format!("  {key:<HELP_KEY_WIDTH$}{what}");
+            let cell = HELP_COLUMN_WIDTH as usize;
+            spans.push(Span::raw(format!("{text:<cell$}")));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(format!("  {HELP_FLAGS}"), dim)));
+    let hint = if layout.max_scroll > 0 {
+        help_scroll_hint(scroll, layout.rows, per_column)
+    } else {
+        "  press any key to close".to_string()
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().add_modifier(Modifier::ITALIC),
+    )));
+
+    let width = layout.columns as u16 * HELP_COLUMN_WIDTH + 2;
+    let height = lines.len() as u16 + 2;
     let area = popup(f.area(), width, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" Help ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Help ")),
         area,
     );
 }
@@ -972,8 +1049,9 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 mod tests {
     use super::{
         bar_scale, confirm_export_text, dir_label, find_title, fmt_count, fmt_items, footer_split,
-        hard_link_note, item_cell, left_to_read, list_title, listing_state, scan_progress,
-        size_cell, truncate_left, Listing, ITEMS_WIDTH,
+        hard_link_note, help_layout, help_scroll_hint, item_cell, left_to_read, list_title,
+        listing_state, scan_progress, size_cell, truncate_left, HelpLayout, Listing,
+        HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
 
@@ -1205,6 +1283,60 @@ mod tests {
             left_to_read(12_345).as_deref(),
             Some("12,345 directories left to read")
         );
+    }
+
+    /// One column when everything fits, two when the terminal is too short but wide enough,
+    /// and scrolling when neither does: every key can be reached on any terminal.
+    #[test]
+    fn help_layout_adapts_to_the_terminal() {
+        let keys = 23;
+        let one = |rows, max_scroll| HelpLayout {
+            columns: 1,
+            rows,
+            max_scroll,
+        };
+        let two = |rows, max_scroll| HelpLayout {
+            columns: 2,
+            rows,
+            max_scroll,
+        };
+        // Tall enough: one column, whatever the width.
+        assert_eq!(help_layout(80, 30, keys), one(23, 0));
+        assert_eq!(help_layout(200, 30, keys), one(23, 0));
+        assert_eq!(help_layout(200, 60, keys), one(23, 0));
+        // A standard 80×24 terminal: 17 rows of keys, the other 6 by scrolling.
+        assert_eq!(help_layout(80, 24, keys), one(17, 6));
+        // Short but wide: two columns of 12, and they fit.
+        assert_eq!(help_layout(140, 24, keys), two(12, 0));
+        assert_eq!(help_layout(134, 19, keys), two(12, 0));
+        // One column short of two: back to scrolling.
+        assert_eq!(help_layout(133, 24, keys), one(17, 6));
+        // Wide and very short: two columns, scrolling.
+        assert_eq!(help_layout(140, 12, keys), two(5, 7));
+        // Tiny: one row at a time, and no panic.
+        assert_eq!(help_layout(20, 3, keys), one(1, 22));
+        assert_eq!(help_layout(0, 0, keys), one(1, 22));
+    }
+
+    /// The list of keys covers every key the help should explain, and each entry fits its
+    /// column.
+    #[test]
+    fn help_entries_fit_their_column() {
+        for (key, what) in HELP_KEYS {
+            assert!(key.chars().count() < HELP_KEY_WIDTH, "{key}");
+            assert!(
+                2 + HELP_KEY_WIDTH + what.chars().count() <= HELP_COLUMN_WIDTH as usize,
+                "{what}"
+            );
+        }
+        // Every flag the list can show is explained, and the lines below the keys fit too.
+        for flag in ["/", "@", "*", "H", "<", "!"] {
+            assert!(HELP_FLAGS.contains(flag), "{flag}");
+        }
+        let width = HELP_COLUMN_WIDTH as usize;
+        assert!(2 + HELP_FLAGS.chars().count() <= width);
+        assert!(help_scroll_hint(100, 100, 999).chars().count() <= width);
+        assert_eq!(help_layout(80, 30, HELP_KEYS.len()).max_scroll, 0);
     }
 
     /// The delete dialog warns that deleting a hard link may free nothing.
