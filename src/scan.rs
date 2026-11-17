@@ -555,6 +555,22 @@ fn start_limited(
     identity: Option<Identity>,
     queued_entries: usize,
 ) -> Scan {
+    start_steered(root, opts, id_base, identity, queued_entries, |_| {})
+}
+
+/// Start a scan whose priorities are set by `steer` before the first directory is read.
+///
+/// The browser steers a scan while it runs, and what was read before then does not matter
+/// to it. A test of the scan order needs the order to hold from the first directory on, so
+/// that its result does not depend on which thread got to run first.
+fn start_steered(
+    root: PathBuf,
+    opts: Opts,
+    id_base: u64,
+    identity: Option<Identity>,
+    queued_entries: usize,
+    steer: impl FnOnce(&ScanControl),
+) -> Scan {
     let (ev_tx, ev_rx) = unbounded::<Batch>();
     let gate = Arc::new(Gate::new(queued_entries));
 
@@ -591,6 +607,11 @@ fn start_limited(
         start_id: id_base,
     });
 
+    let control = ScanControl {
+        frontier: Arc::clone(&frontier),
+    };
+    steer(&control);
+
     for _ in 0..opts.threads {
         let frontier = Arc::clone(&frontier);
         let shared = Arc::clone(&shared);
@@ -606,7 +627,7 @@ fn start_limited(
             rx: ev_rx,
             gate: Some(gate),
         },
-        control: ScanControl { frontier },
+        control,
     }
 }
 
@@ -1302,13 +1323,17 @@ mod tests {
         }
 
         let meta = fs::symlink_metadata(&base).unwrap();
-        // The workers start reading at once, and the priorities are set from this thread a
-        // moment later. How much is read in that moment must not depend on how busy the
-        // machine is. So the scan may have only one batch on its way at a time: until this
-        // thread takes the first one, which it does after steering, each worker gets as far
-        // as one directory and waits.
-        let scan = start_limited(base.clone(), opts(threads, meta.dev()), 0, None, 1);
-        steer(&scan.control, &base);
+        // The priorities are set before the first directory is read. Set a moment after the
+        // start, as the browser does it, how much had been read by then depended on which
+        // thread got to run first, and with it the order this function reports.
+        let scan = start_steered(
+            base.clone(),
+            opts(threads, meta.dev()),
+            0,
+            None,
+            QUEUED_ENTRIES,
+            |control| steer(control, &base),
+        );
 
         // Track which directory ids belong to each branch (batches arrive parent-first).
         let mut target_ids: HashSet<u64> = HashSet::new();
@@ -1346,12 +1371,15 @@ mod tests {
     /// End-to-end: focusing `target/` makes its subtree finish scanning before `slow/` does.
     #[test]
     fn focus_prioritizes_navigated_subtree() {
-        // Prioritize the target subtree immediately, as if the user navigated into it.
-        let (last_target, last_slow) = finish_order("focus", 8, |control, base| {
+        // Prioritize the target subtree, as if the user had navigated into it. One worker,
+        // so that the order of the batches is the order the frontier hands the jobs out in,
+        // and not also a matter of which thread gets to send first.
+        let (last_target, last_slow) = finish_order("focus", 1, |control, base| {
             control.set_focus(Some(base.join("target")))
         });
+        // The root, then the 16 directories of `target/`, then the 151 of `slow/`.
         assert!(
-            last_target < last_slow,
+            last_target == 16 && last_slow > last_target,
             "focused 'target' subtree should finish before 'slow' (target@{last_target}, slow@{last_slow})"
         );
     }
@@ -1363,10 +1391,9 @@ mod tests {
         let (last_target, last_slow) = finish_order("first", 1, |control, base| {
             control.set_priorities(Some(base.join("target")), Some(base.to_path_buf()))
         });
-        // The 16 directories of `target/` come right after the root, apart from the few of
-        // `slow/` that were read before the priorities arrived. `slow/` has 151.
+        // The 16 directories of `target/` come right after the root. `slow/` has 151.
         assert!(
-            last_target < 80 && last_target < last_slow,
+            last_target == 16 && last_slow > last_target,
             "target@{last_target}, slow@{last_slow}"
         );
     }
