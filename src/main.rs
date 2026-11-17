@@ -62,6 +62,7 @@ KEYS:
     x / !           next error    ?               help    q  quit
     Home/End, G     top/bottom    c               item counts
     g               bar and percentage: both, none, one or the other
+    e               show / hide dot files and excluded entries
     m               modification times (with -e)
     C-l             redraw        C-z             suspend (fg resumes)
     in the search:  C-u clear the line, C-w delete a word",
@@ -140,6 +141,7 @@ fn main() {
 fn apply_view_options(app: &mut App, args: &Args) {
     app.show_item_count = args.show_item_count;
     app.show_mtime = args.show_mtime;
+    app.show_hidden = args.show_hidden;
     app.show_graph = args.show_graph;
     app.show_percent = args.show_percent;
     app.graph_style = args.graph_style;
@@ -633,10 +635,9 @@ fn decode_key(
         KeyCode::Char('n') => KeyAction::SortByName,
         KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
-        // An ncdu key whose ncdu function is not implemented yet (hidden entries), and the old
-        // search key. Each used to do something else
-        // here, so say where that went instead of doing nothing.
-        KeyCode::Char('e') => KeyAction::Moved("export is now on E"),
+        KeyCode::Char('e') => KeyAction::ToggleHidden,
+        // The old search key, which is no key of ncdu's: say where the search went instead
+        // of doing nothing.
         KeyCode::Char('f') => KeyAction::Moved("search is now on /"),
         _ => return None,
     })
@@ -813,7 +814,7 @@ mod tests {
             (ch('N'), none, Some(Cancel)),
             (ch('?'), none, Some(Help)),
             // Keys that used to do something else.
-            (ch('e'), none, Some(Moved("export is now on E"))),
+            (ch('e'), none, Some(ToggleHidden)),
             (ch('f'), none, Some(Moved("search is now on /"))),
             // Unbound.
             (ch('z'), none, None),

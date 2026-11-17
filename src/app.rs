@@ -69,6 +69,9 @@ pub fn size_column(disk_usage: bool) -> SortColumn {
     }
 }
 
+/// What the status line says when a jump brought the hidden entries back.
+const SHOWN_AGAIN: &str = "hidden entries are shown again";
+
 /// What the keys that need modification times say when there are none.
 const NEEDS_EXTENDED: &str = "modification times are recorded only with -e (extended mode)";
 
@@ -108,6 +111,9 @@ struct RowOrder {
     cur: NodeIdx,
     sort: Sort,
     disk_usage: bool,
+    show_hidden: bool,
+    /// How many entries of the directory are left out of `rows` because they are hidden.
+    hidden: usize,
     /// `Tree::generation` at that moment: equal means nothing has changed since.
     generation: u64,
     /// `Tree::detached` at that moment: a difference means entries were removed.
@@ -560,6 +566,9 @@ pub struct App {
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
     pub show_item_count: bool,
+    /// List hidden entries too (`e`, `--show-hidden`): those whose name starts with a dot,
+    /// and excluded ones. Hiding them changes what is listed, never a size.
+    pub show_hidden: bool,
     /// Show the bar that compares each row with the largest one (`g`, `--show-graph`).
     pub show_graph: bool,
     /// Show each row's share of the directory in percent (`g`, `--show-percent`).
@@ -654,6 +663,7 @@ impl App {
             },
             disk_usage,
             show_item_count: false,
+            show_hidden: true,
             show_graph: true,
             show_percent: true,
             graph_style: GraphStyle::default(),
@@ -1123,6 +1133,18 @@ impl App {
         self.with_row_order(|order| Rc::clone(&order.rows))
     }
 
+    /// How many entries of the viewed directory are not listed because they are hidden.
+    pub fn hidden_rows(&self) -> usize {
+        self.with_row_order(|order| order.hidden)
+    }
+
+    /// What `e` hides, as in ncdu: an entry whose name starts with a dot, and one that was
+    /// excluded from the scan.
+    pub fn is_hidden(&self, idx: NodeIdx) -> bool {
+        let n = &self.tree.nodes[idx];
+        n.excluded != Excluded::No || n.name.starts_with('.')
+    }
+
     /// The largest size among the rows of the viewed directory (0 if it has none).
     pub fn max_row_size(&self) -> u64 {
         self.with_row_order(|order| order.max_size)
@@ -1141,6 +1163,7 @@ impl App {
         let same_view = order.cur == self.cur
             && order.sort == self.sort
             && order.disk_usage == self.disk_usage
+            && order.show_hidden == self.show_hidden
             && order.detached == self.tree.detached;
         if !same_view {
             return false;
@@ -1157,9 +1180,13 @@ impl App {
 
     fn compute_row_order(&self) -> RowOrder {
         let started = Instant::now();
-        let rows: Rc<[NodeIdx]> = self
-            .order_children(self.tree.nodes[self.cur].children.clone())
-            .into();
+        let mut kids = self.tree.nodes[self.cur].children.clone();
+        let all = kids.len();
+        if !self.show_hidden {
+            kids.retain(|&k| !self.is_hidden(k));
+        }
+        let hidden = all - kids.len();
+        let rows: Rc<[NodeIdx]> = self.order_children(kids).into();
         // Sorted by the size on screen, largest first, the first row is the largest.
         let largest_first = self.sort.column == size_column(self.disk_usage)
             && self.sort.descending
@@ -1173,6 +1200,8 @@ impl App {
             cur: self.cur,
             sort: self.sort,
             disk_usage: self.disk_usage,
+            show_hidden: self.show_hidden,
+            hidden,
             generation: self.tree.generation,
             detached: self.tree.detached,
             rows,
@@ -1346,12 +1375,14 @@ impl App {
                 locked = true;
                 continue;
             }
+            let hiding = !self.show_hidden;
             if self.jump_to(idx) {
                 let path = self.tree.path_of(idx);
-                self.status = Some(match self.tree.error_of(idx) {
+                let status = match self.tree.error_of(idx) {
                     Some(why) => format!("read error: {path}: {why}"),
                     None => format!("read error: {path}"),
-                });
+                };
+                self.jumped(hiding, status);
             }
             return;
         }
@@ -1390,9 +1421,10 @@ impl App {
     /// loop calls this before every frame, so what Enter and `d` would act on is always the
     /// row the user sees highlighted, from the first batch on.
     pub fn settle_selection(&mut self) {
-        let in_view = self
-            .selected
-            .is_some_and(|sel| self.tree.nodes[sel].parent == Some(self.cur));
+        let in_view = self.selected.is_some_and(|sel| {
+            self.tree.nodes[sel].parent == Some(self.cur)
+                && (self.show_hidden || !self.is_hidden(sel))
+        });
         if !in_view {
             self.selected = self.sorted_children().first().copied();
         }
@@ -1681,8 +1713,9 @@ impl App {
         let target = find.hits[next];
         find.selected = Some(target);
         find.stepped = Some(target);
+        let hiding = !self.show_hidden;
         if self.jump_to(target) {
-            self.status = Some(if find.capped() {
+            let status = if find.capped() {
                 format!(
                     "match {} of the largest {count} ({} in all): {query}",
                     next + 1,
@@ -1690,7 +1723,8 @@ impl App {
                 )
             } else {
                 format!("match {} of {count}: {query}", next + 1)
-            });
+            };
+            self.jumped(hiding, status);
         }
         self.last_find = Some(find);
     }
@@ -1718,10 +1752,26 @@ impl App {
                 self.selected = None;
             }
         }
+        // A jump must land on a row that is there. If the target is one of the entries that
+        // are hidden, they are shown again, and the status line says why.
+        if !self.show_hidden && self.selected.is_some_and(|sel| self.is_hidden(sel)) {
+            self.show_hidden = true;
+            self.status = Some(format!("{SHOWN_AGAIN}: this is one of them"));
+        }
         // The target may be newer than the cached rows; it has to be among them now.
         *self.row_order.borrow_mut() = None;
         self.refocus();
         true
+    }
+
+    /// A status text after a jump, with a note if the jump had to bring the hidden entries
+    /// back (`hiding` is whether they were hidden before it).
+    fn jumped(&mut self, hiding: bool, mut status: String) {
+        if hiding && self.show_hidden {
+            status.push_str(" · ");
+            status.push_str(SHOWN_AGAIN);
+        }
+        self.status = Some(status);
     }
 
     /// Text pasted into the terminal. It belongs to the search query when the popup is open,
@@ -1984,6 +2034,22 @@ impl App {
                 }
             }
             KeyAction::ToggleItemCount => self.show_item_count = !self.show_item_count,
+            KeyAction::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                // If the highlighted row is one of those that just went, the nearest row
+                // that stays takes over: the next one down, or else the next one up.
+                if let Some(sel) = self.selected.filter(|&sel| self.is_hidden(sel)) {
+                    if !self.show_hidden {
+                        let at = kids.iter().position(|&k| k == sel).unwrap_or(0);
+                        let (above, below) = kids.split_at(at);
+                        self.selected = below
+                            .iter()
+                            .chain(above.iter().rev())
+                            .copied()
+                            .find(|&k| !self.is_hidden(k));
+                    }
+                }
+            }
             // ncdu's round: nothing, the bar, the percentage, both.
             KeyAction::CycleGraph => {
                 (self.show_graph, self.show_percent) = match (self.show_graph, self.show_percent) {
@@ -2371,6 +2437,8 @@ pub enum KeyAction {
     ToggleUsage,
     /// Show or hide the item count column.
     ToggleItemCount,
+    /// `e`: list hidden and excluded entries, or not.
+    ToggleHidden,
     /// `g`: go through the combinations of bar and percentage.
     CycleGraph,
     /// `u`: ncdu 2's column for sizes shared through hard links. Not there yet.
@@ -3040,6 +3108,188 @@ mod tests {
             });
             println!("  {:<34}{took:>10.2?}", "(reference: name, as before)");
         }
+    }
+
+    /// A directory with dot files, an excluded entry and ordinary ones, sizes descending in
+    /// this order: `.cache`, `big`, `.env`, `skipped` (excluded), `small`, `tiny`.
+    fn app_with_hidden_entries() -> App {
+        let mut app = app_of(&[
+            (".cache", NodeKind::Dir, 600, 600),
+            ("big", NodeKind::File, 500, 500),
+            (".env", NodeKind::File, 400, 400),
+            ("small", NodeKind::File, 200, 200),
+            ("tiny", NodeKind::File, 100, 100),
+        ]);
+        let root = app.tree.root;
+        app.tree.import_child(
+            root,
+            "skipped".into(),
+            NodeKind::Dir,
+            300,
+            300,
+            1,
+            1,
+            false,
+            false,
+            Excluded::Pattern,
+            false,
+        );
+        let cache = idx_named(&app, ".cache");
+        app.tree.import_child(
+            cache,
+            "blob".into(),
+            NodeKind::File,
+            50,
+            50,
+            1,
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        app
+    }
+
+    /// `e` takes dot files and excluded entries out of the list and puts them back. What is
+    /// hidden is still counted: no size changes.
+    #[test]
+    fn e_hides_dot_files_and_excluded_entries() {
+        let mut app = app_with_hidden_entries();
+        let total = app.tree.nodes[app.tree.root].disk;
+        assert_eq!(
+            row_names(&app),
+            [".cache", "big", ".env", "skipped", "small", "tiny"]
+        );
+        assert_eq!(app.hidden_rows(), 0);
+
+        app.on_key(KeyAction::ToggleHidden);
+        assert!(!app.show_hidden);
+        assert_eq!(row_names(&app), ["big", "small", "tiny"]);
+        assert_eq!(app.hidden_rows(), 3);
+        assert_eq!(app.tree.nodes[app.tree.root].disk, total);
+        // The bar is scaled by what is listed.
+        assert_eq!(app.max_row_size(), 500);
+
+        app.on_key(KeyAction::ToggleHidden);
+        assert!(app.show_hidden);
+        assert_eq!(row_names(&app).len(), 6);
+        assert_eq!(app.hidden_rows(), 0);
+    }
+
+    /// When the highlighted row is hidden, the highlight goes to the nearest row that stays:
+    /// the next one down, and at the end of the list the next one up.
+    #[test]
+    fn hiding_moves_the_selection_to_a_visible_neighbour() {
+        let mut app = app_with_hidden_entries();
+        app.selected = Some(idx_named(&app, ".env"));
+        app.on_key(KeyAction::ToggleHidden);
+        assert_eq!(
+            app.selected,
+            Some(idx_named(&app, "small")),
+            "the next one down"
+        );
+        // A row that stays keeps the highlight.
+        app.on_key(KeyAction::ToggleHidden);
+        app.selected = Some(idx_named(&app, "big"));
+        app.on_key(KeyAction::ToggleHidden);
+        assert_eq!(app.selected, Some(idx_named(&app, "big")));
+
+        // Nothing below it stays: the next one up.
+        let mut app = app_of(&[
+            ("first", NodeKind::File, 30, 30),
+            (".second", NodeKind::File, 20, 20),
+            (".third", NodeKind::File, 10, 10),
+        ]);
+        app.selected = Some(idx_named(&app, ".third"));
+        app.on_key(KeyAction::ToggleHidden);
+        assert_eq!(app.selected, Some(idx_named(&app, "first")));
+
+        // Nothing stays at all: nothing is highlighted, and keys have nothing to act on.
+        let mut app = app_of(&[(".only", NodeKind::File, 1, 1)]);
+        app.selected = Some(idx_named(&app, ".only"));
+        app.on_key(KeyAction::ToggleHidden);
+        assert_eq!(app.selected, None);
+        assert!(row_names(&app).is_empty());
+        assert_eq!(app.hidden_rows(), 1);
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "nothing to delete");
+    }
+
+    /// The highlight never rests on a row that is not listed: coming up out of a hidden
+    /// directory, the first row is highlighted instead of the directory.
+    #[test]
+    fn leaving_a_hidden_directory_highlights_a_listed_row() {
+        let mut app = app_with_hidden_entries();
+        app.show_hidden = false;
+        app.cur = idx_named(&app, ".cache");
+        app.selected = Some(idx_named(&app, "blob"));
+        app.on_key(KeyAction::Leave);
+        app.settle_selection();
+        assert_eq!(app.cur, app.tree.root);
+        assert_eq!(app.selected, Some(idx_named(&app, "big")));
+    }
+
+    /// A jump has to land on a row that is there. If its target is hidden, hidden entries
+    /// are shown again, and the status line says so. A jump to a listed entry inside a
+    /// hidden directory changes nothing.
+    #[test]
+    fn a_jump_to_a_hidden_entry_shows_hidden_entries_again() {
+        let mut app = app_with_hidden_entries();
+        app.show_hidden = false;
+        let blob = idx_named(&app, "blob");
+        assert!(app.jump_to(blob));
+        assert!(!app.show_hidden, "`blob` itself is not hidden");
+        assert_eq!(app.status, None);
+        assert_eq!(row_names(&app), ["blob"]);
+
+        let env = idx_named(&app, ".env");
+        assert!(app.jump_to(env));
+        assert!(app.show_hidden);
+        assert_eq!(app.selected, Some(env));
+        assert!(row_names(&app).contains(&".env".to_string()));
+        assert!(app.status.as_deref().unwrap().contains("shown again"));
+    }
+
+    /// The jumps that write a status of their own keep the note about it.
+    #[test]
+    fn jumps_with_a_status_of_their_own_say_it_too() {
+        // The next read error is on a dot directory.
+        let mut app = app_with_hidden_entries();
+        let cache = idx_named(&app, ".cache");
+        app.tree.set_read_error(cache, true);
+        app.show_hidden = false;
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.selected, Some(cache));
+        assert!(app.show_hidden);
+        let status = app.status.clone().unwrap();
+        assert!(status.starts_with("read error:"), "{status}");
+        assert!(
+            status.ends_with("hidden entries are shown again"),
+            "{status}"
+        );
+
+        // An error on a listed entry: the note is not there, and nothing is shown again.
+        let mut app = app_with_hidden_entries();
+        let small = idx_named(&app, "small");
+        app.tree.set_read_error(small, true);
+        app.show_hidden = false;
+        app.on_key(KeyAction::NextError);
+        assert_eq!(app.selected, Some(small));
+        assert!(!app.show_hidden);
+        assert!(!app.status.clone().unwrap().contains("shown again"));
+    }
+
+    /// The search finds hidden entries whether they are listed or not, and going to one
+    /// lists them again.
+    #[test]
+    fn the_search_finds_hidden_entries_and_reveals_them() {
+        let mut app = app_with_hidden_entries();
+        app.show_hidden = false;
+        search(&mut app, "env");
+        app.on_key(KeyAction::Enter);
+        assert_eq!(app.selected, Some(idx_named(&app, ".env")));
+        assert!(app.show_hidden);
     }
 
     /// A batch for the root with one file, as a running scan would deliver it.

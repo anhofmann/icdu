@@ -31,6 +31,8 @@ pub struct Args {
     pub exclude_kernfs: bool,
     /// `-L`: count a symlink to a file as that file.
     pub follow_symlinks: bool,
+    /// `--hide-hidden` starts without dot files and excluded entries in the list.
+    pub show_hidden: bool,
     /// `--hide-graph` turns the size bar off.
     pub show_graph: bool,
     /// `--hide-percent` turns the percentage off.
@@ -77,6 +79,7 @@ impl Default for Args {
             exclude_caches: false,
             exclude_kernfs: false,
             follow_symlinks: false,
+            show_hidden: true,
             show_graph: true,
             show_percent: true,
             graph_style: GraphStyle::Hash,
@@ -160,6 +163,7 @@ enum Action {
     Caches(bool),
     Kernfs(bool),
     FollowSymlinks(bool),
+    Hidden(bool),
     Graph(bool),
     Percent(bool),
     GraphStyle,
@@ -308,6 +312,20 @@ pub const FLAGS: &[Flag] = &[
         "disable the delete feature",
         Action::ReadOnly,
     ),
+    Flag {
+        negation: Some("hide-hidden"),
+        ..flag(
+            &[],
+            &["show-hidden"],
+            None,
+            "list dot files and excluded entries, or not",
+            Action::Hidden(true),
+        )
+    },
+    Flag {
+        negation: Some("show-hidden"),
+        ..flag(&[], &["hide-hidden"], None, "", Action::Hidden(false))
+    },
     Flag {
         negation: Some("hide-graph"),
         ..flag(
@@ -645,6 +663,7 @@ fn apply(
         Action::Caches(exclude) => args.exclude_caches = exclude,
         Action::Kernfs(exclude) => args.exclude_kernfs = exclude,
         Action::FollowSymlinks(follow) => args.follow_symlinks = follow,
+        Action::Hidden(show) => args.show_hidden = show,
         Action::Graph(show) => args.show_graph = show,
         Action::Percent(show) => args.show_percent = show,
         Action::GraphStyle => {
@@ -1163,6 +1182,14 @@ mod tests {
                 },
             ),
             (&["--hide-graph", "--show-graph"], d()),
+            (
+                &["--hide-hidden"],
+                Args {
+                    show_hidden: false,
+                    ..d()
+                },
+            ),
+            (&["--hide-hidden", "--show-hidden"], d()),
             (
                 &["--hide-percent", "--hide-graph"],
                 Args {

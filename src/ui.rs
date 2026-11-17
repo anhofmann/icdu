@@ -543,6 +543,20 @@ fn list_title(state: Listing, items: usize) -> String {
     }
 }
 
+/// The listing's title with the number of entries that `e` has hidden, if any. The sizes
+/// above the list still include them, so the list must not look complete without them. A
+/// directory in which everything is hidden is not "empty".
+fn hidden_title(title: String, items: usize, hidden: usize) -> String {
+    let note = match hidden {
+        0 => return title,
+        hidden => format!("{} hidden", fmt_count(hidden)),
+    };
+    if items == 0 && title == " (empty) " {
+        return format!(" {note} ");
+    }
+    format!("{} · {note} ", title.trim_end())
+}
+
 /// The size a full bar stands for: the largest size among the rows as last sorted and the
 /// rows now on screen. Never 0, so it can be divided by.
 fn bar_scale(sorted_max: u64, visible: impl Iterator<Item = u64>) -> u64 {
@@ -722,7 +736,11 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
             .filter(|&p| p < visible.len()),
     );
 
-    let title = list_title(listing_state(&app.tree, app.cur), kids.len());
+    let title = hidden_title(
+        list_title(listing_state(&app.tree, app.cur), kids.len()),
+        kids.len(),
+        app.hidden_rows(),
+    );
 
     let list = List::new(items)
         .block(
@@ -922,6 +940,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("    C-u / C-w", "clear the query / delete a word"),
     ("] / [", "next / previous match of that search"),
     ("a", "toggle apparent ↔ disk usage"),
+    ("e", "show / hide dot files and excluded"),
     ("g", "bar and percentage: both, none, one"),
     ("c", "toggle the item count column"),
     ("m", "toggle the modification times (with -e)"),
@@ -1218,9 +1237,9 @@ mod tests {
     use super::{
         bar, bar_scale, confirm_export_text, dir_label, display_width, find_empty_message,
         find_rows, find_title, fmt_count, fmt_items, followed_note, footer_split, hard_link_note,
-        help_layout, help_scroll_hint, item_cell, left_to_read, list_title, listing_state,
-        mtime_cell, scan_progress, size_cell, sort_label, truncate_left, GraphStyle, HelpLayout,
-        Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH,
+        help_layout, help_scroll_hint, hidden_title, item_cell, left_to_read, list_title,
+        listing_state, mtime_cell, scan_progress, size_cell, sort_label, truncate_left, GraphStyle,
+        HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH,
         MTIME_WIDTH,
     };
     use crate::app::{Sort, SortColumn};
@@ -1426,6 +1445,31 @@ mod tests {
             assert_eq!(bar(-1.0, 10, style), "          ");
             assert_eq!(bar(f64::NAN, 10, style), "          ");
         }
+    }
+
+    /// The title counts what `e` has hidden, so that the list does not pass for all there
+    /// is, and a directory whose entries are all hidden is not called empty.
+    #[test]
+    fn hidden_title_adds_the_number_of_hidden_entries() {
+        let title = |state, items| list_title(state, items);
+        assert_eq!(hidden_title(title(Listing::Complete, 5), 5, 0), " 5 items ");
+        assert_eq!(
+            hidden_title(title(Listing::Complete, 5), 5, 12),
+            " 5 items · 12 hidden "
+        );
+        assert_eq!(
+            hidden_title(title(Listing::Complete, 0), 0, 3),
+            " 3 hidden "
+        );
+        assert_eq!(
+            hidden_title(title(Listing::Reading, 40), 40, 1_500),
+            " 40 items · reading… · 1,500 hidden "
+        );
+        assert_eq!(
+            hidden_title(title(Listing::Reading, 0), 0, 2),
+            " reading… · 2 hidden "
+        );
+        assert_eq!(hidden_title(title(Listing::Complete, 0), 0, 0), " (empty) ");
     }
 
     /// No row may be larger than what a full bar stands for.

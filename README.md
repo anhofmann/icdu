@@ -81,6 +81,8 @@ OPTIONS:
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
+        --show-hidden, --hide-hidden
+                             list dot files and excluded entries, or not
         --show-graph, --hide-graph
                              show or hide the size bar (default: show)
         --show-percent, --hide-percent
@@ -146,6 +148,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
 | `]` / `[` | go to the next / previous match of the last search |
 | `a` | toggle apparent size ↔ on-disk usage |
+| `e` | show or hide hidden entries: dot files, and what the scan excluded |
 | `g` | bar and percentage: both, neither, the bar, the percentage |
 | `c` | toggle the item count column (entries below each directory) |
 | `m` | toggle the modification time column (needs `-e`) |
@@ -272,6 +275,16 @@ below.
 ncdu 2 has one more column, for the size a directory shares with others through hard links
 (`u`, `--shared-column`). icdu does not have it yet. The flag is accepted and ignored, so that
 a command line written for ncdu runs, and the key says that the column is missing.
+
+### Hidden entries
+
+`e` takes the hidden entries out of the list and puts them back: those whose name starts with
+a dot, and those the scan excluded. `--hide-hidden` starts without them. As in ncdu this only
+changes what is listed. The hidden entries are still part of every size, so the title of
+the list says how many there are (`5 items · 12 hidden`).
+
+Nothing gets lost behind it: the search finds hidden entries as well, and a jump to one (a
+search hit, a largest file, the next read error) lists the hidden entries again and says so.
 
 ### Item counts
 
