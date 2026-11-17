@@ -142,6 +142,7 @@ fn main() {
 
 /// What the command line says about the browser: what it may do, and how the list looks.
 fn apply_options(app: &mut App, args: &Args) {
+    app.delete_command = args.delete_command.clone();
     app.no_shell = !args.can_shell;
     app.no_refresh = !args.can_refresh;
     app.no_export = !args.can_export;
@@ -455,6 +456,14 @@ fn run(
         // A requested shell: fully tear down the TUI, hand the tty to the user's shell in the
         // target directory, and rebuild the UI when it exits. The scan keeps running in the
         // background; its events buffer until we're back.
+        // A deletion by the user's delete command, which gets the terminal like a shell.
+        if let Some(request) = app.take_delete_command() {
+            let ran = run_delete_command(terminal, &request.command, &request.path);
+            app.finish_delete_command(&request, ran);
+            while event::poll(Duration::from_millis(0))? {
+                let _ = event::read();
+            }
+        }
         if let Some(dir) = app.take_shell_request() {
             app.status = run_shell(terminal, &dir);
             // Swallow any keys typed at the moment the shell exited.
@@ -514,7 +523,7 @@ fn run(
                 _ => {}
             }
             // Quitting and the shell take effect before anything typed after them.
-            if app.quit || app.shell_requested() {
+            if app.quit || app.shell_requested() || app.delete_command_requested() {
                 break;
             }
             waiting = event::poll(Duration::ZERO)?;
@@ -557,6 +566,44 @@ fn shell_to_run(
         .and_then(|l| l.trim().parse::<u32>().ok())
         .unwrap_or(0);
     (run, outer.saturating_add(1))
+}
+
+/// The command that deletes `path` for `--delete-command CMD`, as ncdu builds it:
+/// `/bin/sh -c 'CMD "$NCDU_DELETE_PATH"'`, with the path in that variable.
+///
+/// The path reaches the command through the environment and is never pasted into the
+/// command line, so no name, whatever characters it has, is read as shell syntax. It is
+/// passed as the bytes it is. The command runs in the directory icdu was started in.
+fn delete_command(command: &str, path: &Path, level: u32) -> Command {
+    let mut sh = Command::new("/bin/sh");
+    sh.arg("-c")
+        .arg(format!("{command} \"$NCDU_DELETE_PATH\""))
+        .env("NCDU_DELETE_PATH", path)
+        .env("NCDU_LEVEL", level.to_string());
+    sh
+}
+
+/// Suspend the TUI, run the delete command on `path` with the terminal (it may ask, as
+/// `rm -ri` does), and rebuild the UI. `Err` says how the command failed. A command that
+/// fails has usually said why, so the user gets to read that before the list comes back.
+fn run_delete_command(
+    terminal: &mut ratatui::DefaultTerminal,
+    command: &str,
+    path: &Path,
+) -> Result<(), String> {
+    let level = shell_to_run(None, None, std::env::var("NCDU_LEVEL").ok().as_deref()).1;
+    restore_terminal();
+    let ran = match delete_command(command, path, level).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("the delete command ended with {status}")),
+        Err(e) => Err(format!("the delete command could not be run: {e}")),
+    };
+    if let Err(why) = &ran {
+        eprintln!("\nicdu: {why}. Press Enter to go back.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    *terminal = init_terminal();
+    ran
 }
 
 /// Suspend the TUI, run a shell interactively in `dir`, and rebuild the UI when it exits.
@@ -715,8 +762,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        decode_key, draw_due, page_rows, plain_path, progress_line, shell_to_run, version_line,
-        Shell,
+        decode_key, delete_command, draw_due, page_rows, plain_path, progress_line, shell_to_run,
+        version_line, Shell,
     };
     use crate::app::{InputMode, KeyAction};
 
@@ -1027,6 +1074,58 @@ mod tests {
         // what to do with it.
         assert_eq!(key('s', InputMode::Confirm), Some(KeyAction::SortBySize));
         assert_eq!(key('q', InputMode::Confirm), Some(KeyAction::Quit));
+    }
+
+    /// The delete command gets the path through the environment. Whatever is in a name, it
+    /// is that entry that goes, and nothing in the name is run.
+    #[test]
+    fn delete_command_passes_the_path_as_it_is() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("icdu_delcmd_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("bystander"), b"y").unwrap();
+        let run = |command: &str, path: &Path| {
+            let status = delete_command(command, path, 1)
+                .current_dir(&base)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{command} on {path:?}");
+        };
+        for name in [
+            "plain",
+            "with space",
+            "-starts-with-a-dash",
+            "quotes \" and ' and `",
+            "$(touch pwned) ; touch pwned2 & $HOME",
+            "new\nline",
+            "*",
+        ] {
+            let path = base.join(name);
+            fs::write(&path, b"x").unwrap();
+            run("rm --", &path);
+            assert!(fs::symlink_metadata(&path).is_err(), "{name:?} is gone");
+        }
+        let left: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["bystander"], "nothing else was touched or created");
+
+        // The command sees the path and the level in its environment, and the path once
+        // more as its last argument.
+        let out = delete_command(
+            "printf '%s|%s|%s' \"$NCDU_LEVEL\" \"$NCDU_DELETE_PATH\"",
+            Path::new("/some/where else"),
+            3,
+        )
+        .output()
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "3|/some/where else|/some/where else"
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// The shell key: `NCDU_SHELL` before `SHELL` before `/bin/sh`, and a level one deeper

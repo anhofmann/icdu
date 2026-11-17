@@ -61,6 +61,8 @@ pub struct Args {
     pub can_refresh: bool,
     /// The export key works. A second `-r` turns it off: it writes a file.
     pub can_export: bool,
+    /// `--delete-command CMD`: delete by running CMD on the path.
+    pub delete_command: Option<String>,
     /// `--confirm-quit`: ask before quitting.
     pub confirm_quit: bool,
     /// Ask before deleting. `--no-confirm-delete` turns it off.
@@ -110,6 +112,7 @@ impl Default for Args {
             can_shell: true,
             can_refresh: true,
             can_export: true,
+            delete_command: None,
             confirm_quit: false,
             confirm_delete: true,
             show_item_count: false,
@@ -183,6 +186,7 @@ enum Action {
     Refresh(bool),
     ConfirmQuit(bool),
     ConfirmDelete(bool),
+    DeleteCommand,
     ItemCount(bool),
     Output,
     Input,
@@ -408,6 +412,13 @@ pub const FLAGS: &[Flag] = &[
         negation: Some("disable-refresh"),
         ..flag(&[], &["enable-refresh"], None, "", Action::Refresh(true))
     },
+    flag(
+        &[],
+        &["delete-command"],
+        Some("CMD"),
+        "run CMD on the path instead of deleting it",
+        Action::DeleteCommand,
+    ),
     Flag {
         negation: Some("no-confirm-quit"),
         ..flag(
@@ -872,6 +883,8 @@ fn apply(
         Action::Delete(on) => args.can_delete = on,
         Action::Shell(on) => args.can_shell = on,
         Action::Refresh(on) => args.can_refresh = on,
+        // An empty command is none: that is how a config file's setting is taken back.
+        Action::DeleteCommand => args.delete_command = Some(value).filter(|c| !c.is_empty()),
         Action::ConfirmQuit(ask) => args.confirm_quit = ask,
         Action::ConfirmDelete(ask) => args.confirm_delete = ask,
         Action::ItemCount(show) => args.show_item_count = show,
@@ -1519,6 +1532,21 @@ mod tests {
                 },
             ),
             (&["--no-confirm-delete", "--confirm-delete"], d()),
+            (
+                &["--delete-command", "gio trash --"],
+                Args {
+                    delete_command: Some("gio trash --".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["--delete-command=rm -ri --"],
+                Args {
+                    delete_command: Some("rm -ri --".into()),
+                    ..d()
+                },
+            ),
+            (&["--delete-command=trash", "--delete-command="], d()),
             (
                 &["--cross-file-system", "-x"],
                 Args {

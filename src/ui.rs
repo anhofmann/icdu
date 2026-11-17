@@ -1130,7 +1130,11 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
         )]),
         Line::from(""),
         Line::from(format!("  {path}")),
-        Line::from(format!("  This removes the {what} from disk.")),
+        Line::from(match &app.delete_command {
+            None => format!("  This removes the {what} from disk."),
+            // What happens to it then is up to that command.
+            Some(command) => format!("  This runs `{command}` on the {what}."),
+        }),
     ];
     if let Some(note) = hard_link_note(app.confirm_hard_links, n.is_dir()) {
         lines.push(Line::from(format!("  {note}")));

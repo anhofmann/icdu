@@ -257,7 +257,7 @@ impl Plan {
 }
 
 /// The type of an entry on disk, in the scanner's terms.
-fn kind_of(meta: &std::fs::Metadata) -> NodeKind {
+pub fn kind_of(meta: &std::fs::Metadata) -> NodeKind {
     let ft = meta.file_type();
     if ft.is_dir() {
         NodeKind::Dir

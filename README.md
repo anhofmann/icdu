@@ -89,6 +89,7 @@ OPTIONS:
                              turn shell and opener off, or on (default)
         --disable-refresh, --enable-refresh
                              turn rescanning off, or on (default)
+        --delete-command CMD run CMD on the path instead of deleting it
         --confirm-quit, --no-confirm-quit
                              ask before quitting, or not (default)
         --confirm-delete, --no-confirm-delete
@@ -437,6 +438,16 @@ What icdu may do to the filesystem can be limited from the command line, as in n
 A key that is switched off says so. Each switch has an `--enable-…` counterpart, and the later
 of two wins. Browsing an imported dump (`-f`) has delete, shell, opener and rescan off whatever
 the flags say.
+
+`--delete-command CMD` replaces the built-in delete with a shell command of your choice, as in
+ncdu 2: `icdu --delete-command 'gio trash --'` moves entries to the trash, and
+`--delete-command 'rm -ri --'` asks about every file. `d` and its question work as always.
+The command then gets the terminal, runs as `CMD "$NCDU_DELETE_PATH"` in the directory icdu
+was started in, and has the absolute path of the entry in that variable (and `NCDU_LEVEL`, as
+a shell would). Afterwards icdu looks at what is there: an entry that is gone leaves the list,
+and a directory that is still there is read again. The guards of the built-in delete that
+concern single files inside a directory (only what the scan listed, nothing that changed
+since) do not apply to a command: what it removes is up to the command.
 
 `--confirm-quit` makes `q` ask before leaving, which helps against a slip of the finger in the
 middle of a long scan. `--no-confirm-delete` makes `d` delete without its question; everything

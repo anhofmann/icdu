@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver};
 
-use crate::delete::{Plan, Report};
+use crate::delete::{kind_of, Plan, Report};
 use crate::dump::Exporter;
 use crate::matcher::Matcher;
 use crate::model::{Excluded, Ext, NodeIdx, NodeKind, Tree};
@@ -510,6 +510,13 @@ pub enum Modal {
     Find(Box<Find>),
 }
 
+/// A deletion that the delete command (`--delete-command`) is to carry out.
+pub struct DeleteByCommand {
+    pub idx: NodeIdx,
+    pub path: PathBuf,
+    pub command: String,
+}
+
 /// An in-progress deletion running on a background thread, so the UI stays responsive and shows
 /// a spinner while a large directory is removed.
 struct PendingDelete {
@@ -568,6 +575,12 @@ pub struct App {
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
     pub show_item_count: bool,
+    /// `--delete-command`: `d` hands the entry to this shell command instead of removing
+    /// it (for example `gio trash --`).
+    pub delete_command: Option<String>,
+    /// A deletion that is to be carried out by that command. The event loop owns the
+    /// terminal, so it takes this, runs the command and reports back.
+    delete_command_request: Option<DeleteByCommand>,
     /// `--disable-shell`, `-rr`: nothing is run: no shell (`b`) and no opener (`o`).
     pub no_shell: bool,
     /// `--disable-refresh`: no rescan (`r`).
@@ -677,6 +690,8 @@ impl App {
             },
             disk_usage,
             show_item_count: false,
+            delete_command: None,
+            delete_command_request: None,
             no_shell: false,
             no_refresh: false,
             no_export: false,
@@ -2316,6 +2331,18 @@ impl App {
             self.status = Some("cannot delete: subtree not fully scanned".into());
             return;
         }
+        // With `--delete-command` the entry goes to that command, which the event loop runs
+        // with the terminal handed over, like a shell.
+        if let Some(command) = self.delete_command.clone() {
+            match self.tree.fs_path_of(idx) {
+                Some(path) => {
+                    self.status = None;
+                    self.delete_command_request = Some(DeleteByCommand { idx, path, command });
+                }
+                None => self.status = Some(GONE.into()),
+            }
+            return;
+        }
         // Only what the scan listed is removed: the worker gets a copy of the subtree and
         // checks every entry against it (see `delete.rs`).
         let (Some(path), Some(plan)) = (self.tree.fs_path_of(idx), Plan::of(&self.tree, idx))
@@ -2336,6 +2363,83 @@ impl App {
 
     /// Check whether a background deletion has finished and, if so, fold the result into the
     /// tree. Called once per frame by the event loop.
+    /// Take an entry that is gone from the disk out of the tree, and keep the view sane.
+    fn forget_deleted(&mut self, idx: NodeIdx) {
+        // If the removed node is in the view the user is looking at, land the highlight
+        // on a neighbour; if they browsed elsewhere, leave their selection untouched.
+        let kids = self.sorted_children();
+        let pos = kids.iter().position(|&k| k == idx);
+        let parent = self.tree.nodes[idx].parent;
+        // A node that is no longer part of the tree has already been taken out of
+        // every total; removing it again would subtract it a second time.
+        if self.tree.is_attached(idx) {
+            self.tree.delete_subtree(idx);
+        }
+        self.prune_find();
+        if !self.rehome_view(parent) {
+            if let Some(p) = pos {
+                let kids = self.sorted_children();
+                self.selected = (!kids.is_empty()).then(|| kids[p.min(kids.len() - 1)]);
+            }
+        }
+    }
+
+    /// The deletion the event loop is to carry out with the delete command, if one is due.
+    pub fn take_delete_command(&mut self) -> Option<DeleteByCommand> {
+        self.delete_command_request.take()
+    }
+
+    pub fn delete_command_requested(&self) -> bool {
+        self.delete_command_request.is_some()
+    }
+
+    /// The delete command has run. Look at what it left and bring the tree in step: what
+    /// the command did is its own business (it may have moved the entry to a trash can,
+    /// asked the user and been told no, or removed half of a directory).
+    ///
+    /// - The entry is gone: it leaves the tree, as after a deletion.
+    /// - It is still the directory that was scanned: it is read again.
+    /// - Anything else that is still there is left as it is.
+    pub fn finish_delete_command(&mut self, request: &DeleteByCommand, ran: Result<(), String>) {
+        let idx = request.idx;
+        if !self.tree.is_attached(idx) {
+            return;
+        }
+        let name = self.tree.nodes[idx].name.to_string();
+        let outcome = match &ran {
+            Ok(()) => String::new(),
+            Err(why) => format!(" ({why})"),
+        };
+        // What the scan saw under this name: its type, device and inode. (An inode number
+        // alone can come back for something new at once.)
+        let node = &self.tree.nodes[idx];
+        let scanned = match self.tree.followed_link(idx) {
+            Some((dev, ino)) => (NodeKind::Link, dev, ino),
+            None => (node.kind, node.dev, node.ino),
+        };
+        let found = |meta: &std::fs::Metadata| (kind_of(meta), meta.dev(), meta.ino());
+        self.status = Some(match std::fs::symlink_metadata(&request.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.forget_deleted(idx);
+                format!("deleted {}{outcome}", request.path.display())
+            }
+            Ok(meta) if found(&meta) == scanned && meta.is_dir() => {
+                if self.resync(idx) {
+                    format!("{name} is still there{outcome}: reading it again")
+                } else {
+                    format!("{name} is still there{outcome}")
+                }
+            }
+            Ok(meta) if found(&meta) == scanned => {
+                format!("{name} is still there{outcome}")
+            }
+            Ok(_) => format!(
+                "{name} is something else now{outcome}: rescan its directory (r) to see what"
+            ),
+            Err(e) => format!("{name}: {e}{outcome}"),
+        });
+    }
+
     pub fn poll_delete(&mut self) {
         let Some(pd) = self.pending_delete.as_ref() else {
             return;
@@ -2351,23 +2455,7 @@ impl App {
         self.quit_armed = false;
 
         if report.complete {
-            // If the removed node is in the view the user is looking at, land the highlight
-            // on a neighbour; if they browsed elsewhere, leave their selection untouched.
-            let kids = self.sorted_children();
-            let pos = kids.iter().position(|&k| k == pd.idx);
-            let parent = self.tree.nodes[pd.idx].parent;
-            // A node that is no longer part of the tree has already been taken out of
-            // every total; removing it again would subtract it a second time.
-            if self.tree.is_attached(pd.idx) {
-                self.tree.delete_subtree(pd.idx);
-            }
-            self.prune_find();
-            if !self.rehome_view(parent) {
-                if let Some(p) = pos {
-                    let kids = self.sorted_children();
-                    self.selected = (!kids.is_empty()).then(|| kids[p.min(kids.len() - 1)]);
-                }
-            }
+            self.forget_deleted(pd.idx);
             self.status = Some(format!("deleted {}", pd.path.display()));
             return;
         }
@@ -3495,6 +3583,94 @@ mod tests {
         app.on_key(KeyAction::Delete);
         assert!(!app.is_deleting());
         assert!(base.join("sub").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `--delete-command`: `d` and its question are the same, but what is confirmed goes to
+    /// the event loop as a request to run the command, and nothing is removed here.
+    #[test]
+    fn delete_command_takes_the_place_of_the_built_in_delete() {
+        let (mut app, base) = app_on_disk("delcmd_request");
+        app.delete_command = Some("gio trash --".into());
+        app.on_key(KeyAction::Delete);
+        assert!(
+            matches!(app.modal, Modal::ConfirmDelete(_)),
+            "it still asks"
+        );
+        assert!(app.take_delete_command().is_none(), "not before the answer");
+        app.on_key(KeyAction::Confirm);
+        assert!(!app.is_deleting(), "the built-in delete did not start");
+        assert!(app.delete_command_requested());
+        let request = app.take_delete_command().unwrap();
+        assert_eq!(request.path, base.join("file"));
+        assert_eq!(request.command, "gio trash --");
+        assert_eq!(request.idx, idx_named(&app, "file"));
+        assert!(app.take_delete_command().is_none(), "taken once");
+        assert!(base.join("file").exists());
+
+        // The switches in front of a deletion hold for the command as well.
+        app.read_only = true;
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.take_delete_command().is_none());
+        app.read_only = false;
+        app.imported = true;
+        app.on_key(KeyAction::Delete);
+        assert!(app.take_delete_command().is_none());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// After the command has run, the tree follows what is on disk, whatever the command
+    /// did and however it ended.
+    #[test]
+    fn after_the_delete_command_the_tree_follows_the_disk() {
+        let request = |app: &App, name: &str, base: &Path| DeleteByCommand {
+            idx: idx_named(app, name),
+            path: base.join(name),
+            command: "true".into(),
+        };
+        // The entry is gone: it leaves the tree, and the highlight moves on.
+        let (mut app, base) = app_on_disk("delcmd_gone");
+        let file = idx_named(&app, "file");
+        let before = app.tree.nodes[app.tree.root].apparent;
+        std::fs::remove_file(base.join("file")).unwrap();
+        app.finish_delete_command(&request(&app, "file", &base), Ok(()));
+        assert!(!app.tree.is_attached(file));
+        assert_eq!(app.tree.nodes[app.tree.root].apparent, before - 10);
+        assert_eq!(app.selected, Some(idx_named(&app, "sub")));
+        assert!(app.status.as_deref().unwrap().starts_with("deleted "));
+
+        // A directory that is still there (the user said no, or only part of it went) is
+        // read again.
+        let sub = idx_named(&app, "sub");
+        app.finish_delete_command(&request(&app, "sub", &base), Ok(()));
+        assert!(app.tree.is_attached(sub));
+        assert_eq!(app.refreshing_idx, Some(sub));
+        assert!(app.status.as_deref().unwrap().contains("reading it again"));
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // A file that is still there stays, and a command that failed is quoted.
+        let (mut app, base) = app_on_disk("delcmd_kept");
+        let file = idx_named(&app, "file");
+        let failed = Err("the delete command ended with exit status: 1".to_string());
+        app.finish_delete_command(&request(&app, "file", &base), failed);
+        assert!(app.tree.is_attached(file));
+        assert_eq!(app.refreshing_idx, None);
+        let status = app.status.clone().unwrap();
+        assert!(status.starts_with("file is still there"), "{status}");
+        assert!(status.contains("exit status: 1"), "{status}");
+
+        // Something else under the same name: the tree is not touched, and the status says
+        // how to find out.
+        std::fs::remove_file(base.join("file")).unwrap();
+        std::fs::create_dir(base.join("file")).unwrap();
+        app.finish_delete_command(&request(&app, "file", &base), Ok(()));
+        assert!(app.tree.is_attached(file));
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("something else now"));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
