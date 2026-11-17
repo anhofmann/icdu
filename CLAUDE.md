@@ -29,7 +29,7 @@ The TUI needs a real terminal, so check behavior headlessly with `-o -` or throu
 
 Unix only (`std::os::unix::fs::MetadataExt` for dev/ino/blocks/nlink). Platform-specific code uses `#[cfg(target_os = ...)]`, e.g. the three `opener_command` variants in `app.rs`. Anything you change has to build and pass on both Linux and macOS.
 
-Dependencies are deliberately few (`ratatui`, `crossbeam-channel`, `compact_str`, and `signal-hook`, which crossterm brings into the build anyway). There is no JSON library: `dump.rs` writes and parses the dump format itself. The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
+Dependencies are deliberately few (`ratatui` with only the features icdu uses, `crossbeam-channel`, `compact_str` in the version ratatui uses, and `signal-hook`, which crossterm brings into the build anyway). There is no JSON library: `dump.rs` writes and parses the dump format itself. The core never spawns external processes. The only exceptions are `o` (the platform opener) and `b` (`$SHELL`). Nothing in the binary uses the network.
 
 ## Architecture
 

@@ -6,9 +6,13 @@ description = "A disk usage explorer you can browse and search while it is still
 license = "MIT"
 
 [dependencies]
-ratatui = "0.29"
+# Only what icdu draws with: the crossterm backend and the layout cache. The defaults
+# also bring a macro crate, a calendar widget and with it a date library.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 crossbeam-channel = "0.5"
-compact_str = "0.8"
+# The version ratatui uses, so that the build has one copy of it. (0.10 is out; ratatui 0.30
+# is on 0.9.)
+compact_str = "0.9"
 # Already in the build as a dependency of crossterm (via ratatui): naming it adds no code.
 signal-hook = "0.3"
 

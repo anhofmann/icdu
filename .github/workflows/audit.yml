@@ -1,0 +1,31 @@
+name: Audit
+
+# Known vulnerabilities in the locked dependencies (the RustSec advisory database). Daily,
+# because an advisory can appear without anything changing here, and on every change of the
+# dependencies.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/audit.yml]
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/audit.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-audit
+      # Fails on a vulnerability, and on a dependency that is unsound or was yanked. One that
+      # is merely unmaintained is listed, and does not fail the job: that is rarely ours to
+      # fix within a day.
+      - name: cargo audit
+        run: cargo audit --deny unsound --deny yanked

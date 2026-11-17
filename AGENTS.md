@@ -43,4 +43,4 @@ CI runs all of these on both `ubuntu-latest` and `macos-latest`. A change that o
 - Keep changes minimal and focused. Fix the problem at hand; no drive-by refactors or reformatting of unrelated code.
 - Match the style of the surrounding code.
 - Avoid adding new dependencies. If one is genuinely needed, justify it in the commit message and PR description.
-- Do not bump the version in `Cargo.toml` or touch `Cargo.lock` unless the task is a release.
+- Do not bump the version in `Cargo.toml` unless the task is a release. `Cargo.lock` changes with a release, with a dependency update (the monthly Dependabot pull request, or a fix for an advisory the Audit workflow reports), and with nothing else.
