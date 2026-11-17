@@ -5,20 +5,55 @@ on:
     tags:
       - 'v*'
 
+# Only the job that publishes may write. The jobs that check and build get a token that
+# cannot change a release or push.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Nothing is built for a tag that does not name the version of the code it points to, or
+  # whose code does not pass what every change has to pass.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: The tag is the version in Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says version $version"
+            exit 1
+          fi
+
+      - name: The changelog has this version
+        run: tools/dist/release-notes.sh "${GITHUB_REF_NAME#v}" > /dev/null
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+
   build:
+    needs: check
     uses: ./.github/workflows/dist.yml
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
@@ -30,16 +65,19 @@ jobs:
           sha256sum icdu-* > sha256sums.txt
           cat sha256sums.txt
 
-      - name: Smoke test linux-x86_64 on the runner
+      - name: What was built says it is this version
         run: |
           chmod +x dist/icdu-portable-linux-x86_64
-          dist/icdu-portable-linux-x86_64 --version
+          said=$(dist/icdu-portable-linux-x86_64 --version)
+          echo "$said"
+          test "$said" = "icdu ${GITHUB_REF_NAME#v}"
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          tools/dist/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
           gh release create "$GITHUB_REF_NAME" dist/icdu-* dist/sha256sums.txt \
             --repo "$GITHUB_REPOSITORY" \
             --title "icdu $GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file notes.md

@@ -85,6 +85,21 @@ When CI is green on both platforms, the maintainer moves `main` forward to the c
 pull request as they are. There are no merge or squash commits, so the history of `main` is
 the history you wrote. Keep it tidy.
 
+## Making a release
+
+For the maintainer. A release is a tag; a workflow does the rest.
+
+1. In `CHANGELOG.md`, turn "Unreleased" into `## [X.Y.Z] - YYYY-MM-DD`, start a new empty
+   "Unreleased" above it, and update the links at the bottom.
+2. Set `version = "X.Y.Z"` in `Cargo.toml` and run `cargo build`, so that `Cargo.lock` follows.
+3. Land that as a pull request like any other.
+4. Tag the commit on `main` as `vX.Y.Z` and push the tag.
+
+The release workflow then checks that the tag is the version in `Cargo.toml` and that the
+changelog has a section for it, runs the four gates on the tagged commit, builds the binaries
+with `tools/dist/build.sh`, and publishes them with that section of the changelog as the notes.
+If a check fails, nothing is published: fix it, and move the tag.
+
 ## Security problems
 
 Not in a public issue, please: see `SECURITY.md`.

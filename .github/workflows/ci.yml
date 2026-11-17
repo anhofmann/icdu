@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -23,12 +27,27 @@ jobs:
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --check
+      # `--locked`: with the versions in Cargo.lock, which are the ones a release is built
+      # with, and failing if the lock file is not up to date.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --locked --release
+
+  # The workflows and the shell scripts themselves.
+  lint:
+    name: workflows and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
+      - name: shellcheck
+        run: shellcheck install.sh tools/dist/build.sh tools/demo/record.sh
 
   # The release binaries, so that what a tag would build is built for every change.
   dist:
