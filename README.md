@@ -661,6 +661,13 @@ Possible future work: in-place refresh (`r`) of a subtree, the ncdu "shared/uniq
 breakdown column, and a file-info panel. Further memory wins are available if needed (`u32`
 node indices, splitting file/dir storage, a per-tree device table).
 
+## Contributing, changes, security
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and propose a change.
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release.
+- [SECURITY.md](SECURITY.md): how to report a problem that could cost someone data. Please
+  not in a public issue.
+
 ## Origin
 
 This project started as a fork of [rcdu](https://github.com/mayankasthana/rcdu) by Mayank Asthana

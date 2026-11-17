@@ -37,6 +37,7 @@ CI runs all of these on both `ubuntu-latest` and `macos-latest`. A change that o
 - Add unit tests for every change. Bug fixes get a test that reproduces the bug (red) before the fix (green); new features get tests covering the new behavior and its edge cases.
 - Tests live in `#[cfg(test)]` modules at the bottom of each source file, matching the existing layout in `src/`.
 - If a change is hard to unit test (e.g. terminal rendering), say so explicitly in the PR description and verify it manually instead.
+- Add a line to `CHANGELOG.md` under "Unreleased" for every change a user can notice.
 
 ## Code
 

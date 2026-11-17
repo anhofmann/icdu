@@ -1,0 +1,90 @@
+# Contributing
+
+Bug reports, ideas and pull requests are welcome. This page says how the project is worked
+on, so that a change can go in without detours.
+
+## Building and testing
+
+icdu builds with stable Rust on Linux and macOS (the minimum version is `rust-version` in
+`Cargo.toml`). There is nothing else to install.
+
+```sh
+cargo run -- <PATH>            # the browser; needs a real terminal
+cargo run -- <PATH> -o -       # scan without the browser, dump to stdout
+cargo test                     # all tests
+cargo test <part-of-a-name>    # some tests
+```
+
+Before a pull request, these four have to pass. CI runs exactly them, on Linux and on macOS:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release
+```
+
+## What a change needs
+
+- **One thing per pull request.** A fix and an unrelated clean-up are two pull requests.
+- **A test.** A bug fix comes with a test that fails without the fix. A feature comes with
+  tests for what it does and for its edge cases. Tests live at the bottom of the source file
+  they test.
+- **What cannot be unit-tested is said and checked by hand.** That is mostly what the terminal
+  shows. Say in the pull request what you looked at. The browser can be driven in a detached
+  `tmux` session (`tmux send-keys`, `tmux capture-pane -p`), which is how most of it is checked.
+- **Measurements for anything about speed or memory**: what was measured, on what, before and
+  after.
+- **A line in `CHANGELOG.md`** under "Unreleased", if a user can notice the change.
+- **No new dependency** without a good reason, stated in the pull request. There are four,
+  on purpose.
+
+Small commits are preferred, each of which builds and passes the tests, with a subject in the
+imperative ("Add …", "Fix …") of at most 72 characters and a body that says why.
+
+Branches are named `feature/<topic>` or `fix/<topic>`.
+
+## Things to know before changing something
+
+`CLAUDE.md` describes how the program is built: the scanner threads, the tree that the
+interface thread owns, the rules that keep deleting safe, and what must not be done per frame
+or per key press. It is written as notes for a coding agent, and it is the most complete
+description there is. `AGENTS.md` has the workflow rules in short form.
+
+Three rules cause most surprises:
+
+- **Deleting is guarded on purpose.** Read "Safety gates" in `CLAUDE.md` before touching
+  `delete.rs`, a rescan, or anything that acts on a path.
+- **Nothing may walk the whole tree for a key press or a frame.** A tree can have many
+  millions of entries, and a directory millions of rows.
+- **Flags are one table** (`args::FLAGS`). The parser, `--help`, the config files and the
+  option list in the README all come from it, and tests compare them. After adding or changing
+  a flag, bring the README's list up to date with
+
+  ```sh
+  cargo build --release && tools/sync-readme-options.py
+  ```
+
+Where ncdu has an equivalent (a key, a flag, a field of the dump), icdu does what ncdu does.
+If you change such behaviour, say in the pull request how ncdu behaves and how you found out.
+
+## The recording in the README
+
+`.github/assets/demo.svg` is made by the scripts in `tools/demo` (they need `tmux`, `strace`
+and `python3`). If your change alters what the screen looks like, make it again:
+
+```sh
+python3 tools/demo/tree.py /tmp/icdu-demo
+tools/demo/record.sh target/release/icdu /tmp/icdu-demo/home .github/assets/demo.svg
+rm -r /tmp/icdu-demo
+```
+
+## How pull requests go in
+
+When CI is green on both platforms, the maintainer moves `main` forward to the commits of the
+pull request as they are. There are no merge or squash commits, so the history of `main` is
+the history you wrote. Keep it tidy.
+
+## Security problems
+
+Not in a public issue, please: see `SECURITY.md`.
