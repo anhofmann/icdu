@@ -197,6 +197,7 @@ KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
     h/</Backspace   go up         PgUp/PgDn,C-d/u page
     /               search names (Tab: whole tree / this directory)
+    ] / [           next / previous match of the last search
     s               toggle sort   T               largest files
     r               rescan this directory          a   apparent/disk
     d               delete (confirm; full scan)
@@ -666,6 +667,9 @@ fn decode_key(
         KeyCode::Char('x') | KeyCode::Char('!') => KeyAction::NextError,
         KeyCode::Char('b') => KeyAction::Shell,
         KeyCode::Char('/') => KeyAction::Find,
+        // Free in ncdu, whose `n` is "sort by name" and not vim's "next match".
+        KeyCode::Char(']') => KeyAction::NextMatch,
+        KeyCode::Char('[') => KeyAction::PrevMatch,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
@@ -836,6 +840,8 @@ mod tests {
             (ch('!'), none, Some(NextError)),
             (ch('b'), none, Some(Shell)),
             (ch('/'), none, Some(Find)),
+            (ch(']'), none, Some(NextMatch)),
+            (ch('['), none, Some(PrevMatch)),
             (ch('y'), none, Some(Confirm)),
             (ch('Y'), none, Some(Confirm)),
             (ch('n'), none, Some(Cancel)),

@@ -168,6 +168,9 @@ pub struct Find {
     pub selected: Option<NodeIdx>,
     /// First hit on screen; see [`scroll_offset`].
     pub offset: Cell<usize>,
+    /// The match the view last went to, by Enter or by stepping: where `]` and `[` go on
+    /// from. Unlike `selected` it is not moved to another hit when its entry disappears.
+    stepped: Option<NodeIdx>,
     sort_dirty: bool,
     last_sort: Option<Instant>,
 }
@@ -191,6 +194,7 @@ impl Find {
             total: 0,
             selected: None,
             offset: Cell::new(0),
+            stepped: None,
             sort_dirty: false,
             last_sort: None,
         }
@@ -565,6 +569,8 @@ pub struct App {
     waiting_for: Option<NodeIdx>,
     /// A dump that is being written a slice at a time.
     exporting: Option<ExportJob>,
+    /// The search as it was when its popup was closed: its query, hits and highlighted row.
+    last_find: Option<Box<Find>>,
     /// The last `poll_scans` ran out of budget: more batches may be waiting.
     scan_backlog: bool,
     /// When the frame being prepared started. The event loop sets it; without it (in tests)
@@ -610,6 +616,7 @@ impl App {
             row_order: RefCell::new(None),
             waiting_for: None,
             exporting: None,
+            last_find: None,
             scan_backlog: false,
             frame_time: None,
             tick: 0,
@@ -1415,13 +1422,20 @@ impl App {
         }
     }
 
-    /// Advance the search, if its popup is open: debounce the query, look at up to `budget`
-    /// nodes, and re-sort the hits now and then. Called once per frame, after the scan batches
-    /// are applied, so live results show up in the same frame.
+    /// Advance the search: debounce the query, look at up to `budget` nodes, and re-sort the
+    /// hits now and then. Called once per frame, after the scan batches are applied, so live
+    /// results show up in the same frame.
+    ///
+    /// A search whose popup has been closed is advanced too, so that stepping through its
+    /// matches (`]`, `[`) covers what the scan has delivered since. That costs nothing when
+    /// nothing has arrived.
     pub fn find_tick(&mut self, now: Instant, budget: usize) {
         if let Modal::Find(f) = &mut self.modal {
             f.set_dir(self.cur);
             f.tick(&self.tree, self.disk_usage, self.scanning, now, budget);
+        } else if let Some(f) = &mut self.last_find {
+            // Not on screen: its sizes need not be kept fresh by searching again.
+            f.tick(&self.tree, self.disk_usage, false, now, budget);
         }
     }
 
@@ -1439,11 +1453,67 @@ impl App {
         }
     }
 
-    /// Drop search hits that a delete or rescan just detached from the tree.
+    /// Drop search hits that a delete or rescan just detached from the tree, from the
+    /// search on screen or the one that was closed last.
     fn prune_find(&mut self) {
         if let Modal::Find(f) = &mut self.modal {
             f.prune(&self.tree);
         }
+        if let Some(f) = &mut self.last_find {
+            f.prune(&self.tree);
+        }
+    }
+
+    /// Go to the next (`forward`) or previous match of the last search, without opening it.
+    /// The matches are in the order of the popup's list, largest first, and the walk wraps
+    /// around at both ends.
+    fn step_match(&mut self, forward: bool) {
+        let Some(mut find) = self.last_find.take() else {
+            self.status = Some("no search yet: press / to search".into());
+            return;
+        };
+        // Make sure the list is the one for the query, and complete as far as the tree goes.
+        find.rush = true;
+        find.tick(
+            &self.tree,
+            self.disk_usage,
+            false,
+            Instant::now(),
+            usize::MAX,
+        );
+        let query = find.active.clone().unwrap_or_default();
+        let count = find.hits.len();
+        if count == 0 {
+            self.status = Some(format!("no matches for {}", find.query));
+            self.last_find = Some(find);
+            return;
+        }
+        // One step on from the match the view last went to. If that one is gone, or there
+        // was none, to the first or the last.
+        let at = find
+            .stepped
+            .and_then(|last| find.hits.iter().position(|&hit| hit == last));
+        let next = match (at, forward) {
+            (Some(pos), true) => (pos + 1) % count,
+            (Some(pos), false) => (pos + count - 1) % count,
+            (None, true) => 0,
+            (None, false) => count - 1,
+        };
+        let target = find.hits[next];
+        find.selected = Some(target);
+        find.stepped = Some(target);
+        if self.jump_to(target) {
+            self.status = Some(if find.capped() {
+                format!(
+                    "match {} of the largest {count} ({} in all): {query}",
+                    next + 1,
+                    find.total
+                )
+            } else {
+                format!("match {} of {count}: {query}", next + 1)
+            });
+        }
+        self.last_find = Some(find);
     }
 
     /// Move the view to `idx`: its parent directory, with `idx` selected (the root is shown
@@ -1653,6 +1723,7 @@ impl App {
                     KeyAction::Enter => match f.selected {
                         Some(idx) => {
                             self.jump_to(idx);
+                            f.stepped = Some(idx);
                             false
                         }
                         // Nothing to jump to yet.
@@ -1665,6 +1736,10 @@ impl App {
                 };
                 if keep_open {
                     self.modal = Modal::Find(f);
+                } else {
+                    // Closed, not forgotten: it can be opened again as it is, and its
+                    // matches stepped through from the browser.
+                    self.last_find = Some(f);
                 }
                 if !matches!(action, KeyAction::Quit) {
                     return;
@@ -1728,7 +1803,13 @@ impl App {
             KeyAction::Export => self.request_export(),
             KeyAction::NextError => self.jump_to_next_error(),
             KeyAction::Shell => self.request_shell(),
-            KeyAction::Find => self.modal = Modal::Find(Box::new(Find::new(self.cur))),
+            KeyAction::Find => {
+                // The last search comes back as it was left; the first one starts empty.
+                let find = self.last_find.take();
+                self.modal = Modal::Find(find.unwrap_or_else(|| Box::new(Find::new(self.cur))));
+            }
+            KeyAction::NextMatch => self.step_match(true),
+            KeyAction::PrevMatch => self.step_match(false),
             KeyAction::Moved(to) => self.status = Some(to.into()),
             // Esc and `n` answer dialogs; in the browser they do nothing (as in ncdu).
             KeyAction::Confirm | KeyAction::Cancel => {}
@@ -2089,6 +2170,9 @@ pub enum KeyAction {
     /// A character typed into the search popup's query.
     FindChar(char),
     FindBackspace,
+    /// Go to the next / previous match of the last search, from the browser.
+    NextMatch,
+    PrevMatch,
     /// Empty the search query (Ctrl-U).
     FindClear,
     /// Remove the last word of the search query (Ctrl-W).
@@ -5153,6 +5237,131 @@ mod tests {
         app.on_key(KeyAction::Enter);
         let sel = app.selected.expect("the hit is selected");
         assert!(app.sorted_children().contains(&sel));
+    }
+
+    /// After a jump the search is not gone: opening it again shows the query, the hits and
+    /// the highlighted row as they were left.
+    #[test]
+    fn find_reopens_as_it_was_left() {
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        app.on_key(KeyAction::Down); // readme.md
+        let selected = find_state(&app).selected;
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::None));
+
+        app.on_key(KeyAction::Find);
+        let f = find_state(&app);
+        assert_eq!(f.query, "readme");
+        assert_eq!(f.total, 3);
+        assert_eq!(f.selected, selected);
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+
+        // Closing with Esc keeps it as well, and typing goes on from the old query.
+        app.on_key(KeyAction::Cancel);
+        app.on_key(KeyAction::Find);
+        assert_eq!(find_state(&app).query, "readme");
+        type_query(&mut app, ".md");
+        assert_eq!(find_state(&app).query, "readme.md");
+        // Ctrl-U gives a clean line.
+        app.on_key(KeyAction::FindClear);
+        assert_eq!(find_state(&app).query, "");
+    }
+
+    /// `]` and `[` go to the next and the previous match of the last search without opening
+    /// it, wrapping around at the ends, and the footer says where in the list that is.
+    #[test]
+    fn matches_can_be_stepped_through_from_the_browser() {
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        app.on_key(KeyAction::Enter); // jump to the first, README.txt
+        let at = |app: &App| app.tree.nodes[app.selected.unwrap()].name.to_string();
+        assert_eq!(at(&app), "README.txt");
+
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(at(&app), "readme.md");
+        assert_eq!(app.cur, idx_named(&app, "docs"));
+        assert_eq!(app.status.as_deref(), Some("match 2 of 3: readme"));
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(at(&app), "readme");
+        assert_eq!(app.cur, app.tree.root);
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(at(&app), "README.txt", "wraps to the first");
+        assert_eq!(app.status.as_deref(), Some("match 1 of 3: readme"));
+        app.on_key(KeyAction::PrevMatch);
+        assert_eq!(at(&app), "readme", "and back to the last");
+        app.on_key(KeyAction::PrevMatch);
+        assert_eq!(at(&app), "readme.md");
+        assert!(matches!(app.modal, Modal::None), "the popup stays closed");
+
+        // The popup, opened again, has followed.
+        app.on_key(KeyAction::Find);
+        assert_eq!(
+            find_state(&app).selected,
+            Some(idx_named(&app, "readme.md"))
+        );
+    }
+
+    /// Stepping passes over matches that a delete or rescan has taken away.
+    #[test]
+    fn stepping_skips_matches_that_are_gone() {
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        app.on_key(KeyAction::Enter); // README.txt, in docs/sub
+        let sub = idx_named(&app, "sub");
+        app.cur = app.tree.root;
+        app.tree.delete_subtree(sub);
+        app.prune_find();
+
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(app.selected, Some(idx_named(&app, "readme.md")));
+        assert_eq!(app.status.as_deref(), Some("match 1 of 2: readme"));
+        app.on_key(KeyAction::NextMatch);
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(app.selected, Some(idx_named(&app, "readme.md")), "two left");
+    }
+
+    /// Without a search, or without matches, the keys say so and change nothing.
+    #[test]
+    fn stepping_without_matches_says_so() {
+        let mut app = app_for_find();
+        app.on_key(KeyAction::Down);
+        let before = (app.cur, app.selected);
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("no search yet: press / to search")
+        );
+        assert_eq!((app.cur, app.selected), before);
+
+        search(&mut app, "zzz");
+        app.on_key(KeyAction::Cancel);
+        app.on_key(KeyAction::PrevMatch);
+        assert_eq!(app.status.as_deref(), Some("no matches for zzz"));
+        assert_eq!((app.cur, app.selected), before);
+    }
+
+    /// The search that was closed keeps up with the scan: entries that arrive later are
+    /// matches to step to as well.
+    #[test]
+    fn a_closed_search_still_picks_up_new_entries() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        app.tree.apply(file_batch("one.log", 10));
+        let now = search(&mut app, ".log");
+        app.on_key(KeyAction::Enter);
+        // The scan goes on while the popup is closed.
+        let mut later = file_batch("two.log", 500);
+        later.more = false;
+        app.tree.apply(later);
+        app.find_tick(now + Duration::from_secs(1), usize::MAX);
+
+        app.on_key(KeyAction::NextMatch);
+        assert_eq!(app.status.as_deref(), Some("match 1 of 2: .log"));
+        assert_eq!(
+            app.selected,
+            Some(idx_named(&app, "two.log")),
+            "the larger one leads"
+        );
     }
 
     /// For a moment after a key the list still shows the hits of the query before. Enter in

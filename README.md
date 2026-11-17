@@ -101,6 +101,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `PgUp` / `PgDn`, `Ctrl-d` / `Ctrl-u` | page up / down |
 | `s` | toggle sort (size ↔ name) |
 | `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
+| `]` / `[` | go to the next / previous match of the last search |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `c` | toggle the item count column (entries below each directory) |
 | `d` | delete selected entry (asks to confirm) |
@@ -171,6 +172,11 @@ listed with their path and size, largest first, with the matched part highlighte
 containing the selected match with it highlighted, and `Esc` closes the popup without moving.
 To edit the query, `Backspace` deletes a character, `Ctrl-w` the last word and `Ctrl-u` the
 whole line. Pasted text goes into the query as it is, without its line breaks.
+
+The search is kept when the popup closes. `/` opens it again with its query, its matches and
+the highlighted row as you left them, and `]` and `[` step to the next and the previous match
+straight from the browser, wrapping around at the ends. The footer says where you are:
+`match 3 of 57: readme`. Matches that have been deleted or rescanned away are passed over.
 
 `Tab` switches what is searched: the whole tree (the default), or only what lies below the
 directory you are viewing. Limited to a directory, paths are shown relative to it. The title

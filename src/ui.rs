@@ -838,6 +838,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("/", "search by name; Enter goes there"),
     ("    Tab", "search this directory only"),
     ("    C-u / C-w", "clear the query / delete a word"),
+    ("] / [", "next / previous match of that search"),
     ("a", "toggle apparent ↔ disk usage"),
     ("c", "toggle the item count column"),
     ("d", "delete the selected entry (asks first)"),
@@ -1345,6 +1346,10 @@ mod tests {
     #[test]
     fn help_layout_adapts_to_the_terminal() {
         let keys = 23;
+        assert!(
+            HELP_KEYS.len() >= keys,
+            "the cases below are for a list of 23"
+        );
         let one = |rows, max_scroll| HelpLayout {
             columns: 1,
             rows,
@@ -1391,7 +1396,8 @@ mod tests {
         let width = HELP_COLUMN_WIDTH as usize;
         assert!(2 + HELP_FLAGS.chars().count() <= width);
         assert!(help_scroll_hint(100, 100, 999).chars().count() <= width);
-        assert_eq!(help_layout(80, 30, HELP_KEYS.len()).max_scroll, 0);
+        let tall = HELP_KEYS.len() as u16 + 7;
+        assert_eq!(help_layout(80, tall, HELP_KEYS.len()).max_scroll, 0);
     }
 
     /// The delete dialog warns that deleting a hard link may free nothing.
