@@ -95,6 +95,45 @@ jobs:
             "$RUNNER_TEMP/latest/rcdu" --version
           fi
 
+  # The Homebrew formula as the tap will carry it: written for the archives this run built,
+  # put into a tap on the runner, installed from there, tested, and removed again.
+  homebrew:
+    name: Homebrew formula (${{ matrix.os }})
+    needs: dist
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+          path: release
+      - name: Install from a tap, test, remove
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          (cd release && shasum -a 256 icdu-*.tar.gz > sha256sums.txt)
+          brew tap-new --no-git local/icdu
+          tools/dist/homebrew-formula.sh "$version" release/sha256sums.txt "file://$PWD/release" \
+            > "$(brew --repository local/icdu)/Formula/icdu.rb"
+          cat "$(brew --repository local/icdu)/Formula/icdu.rb"
+          brew install local/icdu/icdu
+          brew test local/icdu/icdu
+          test "$(icdu --version)" = "icdu $version"
+          test -f "$(brew --prefix)/share/man/man1/icdu.1"
+          brew uninstall icdu
+          test ! -e "$(brew --prefix)/bin/icdu"
+
   # The oldest Rust that icdu promises to build with: `rust-version` in Cargo.toml.
   msrv:
     name: minimum Rust (${{ matrix.os }})

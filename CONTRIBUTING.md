@@ -118,6 +118,23 @@ workflow for a crate that exists:
 From then on the release workflow publishes the crate after the GitHub release, with a token
 crates.io issues for that one run. The token from step 1 can be revoked.
 
+### The Homebrew tap
+
+`tools/dist/homebrew-formula.sh VERSION sha256sums.txt` prints the formula for a release: it
+installs the prebuilt archive for the machine (macOS and Linux, Intel and ARM) with the
+manual page. CI tries it on every change, with the archives that run built.
+
+To offer `brew install anhofmann/tap/icdu`:
+
+1. Create the repository `anhofmann/homebrew-tap` (the name has to start with `homebrew-`).
+2. Create a fine-grained token that may write the contents of that one repository, and store
+   it in this repository as the secret `HOMEBREW_TAP_TOKEN`.
+3. Set the repository variable `HOMEBREW_TAP` to `anhofmann/homebrew-tap`.
+
+From then on the release workflow writes `Formula/icdu.rb` into the tap after each release.
+Until then, or by hand: download `sha256sums.txt` of the release, run the script, and commit
+its output as `Formula/icdu.rb` in the tap.
+
 ## Security problems
 
 Not in a public issue, please: see `SECURITY.md`.

@@ -60,6 +60,8 @@ mkdir -p "$stage/usr/share/lintian/overrides"
 cat > "$stage/usr/share/lintian/overrides/icdu" <<OVERRIDES
 # A fully static binary is the point of this package: it has no dependencies.
 icdu: statically-linked-binary [usr/bin/icdu]
+# It is position independent as well, which makes it look like a library without any.
+icdu: shared-library-lacks-prerequisites [usr/bin/icdu]
 OVERRIDES
 
 chmod 0644 "$stage/usr/share/man/man1/icdu.1.gz" "$doc/copyright" "$doc/changelog.gz" \
