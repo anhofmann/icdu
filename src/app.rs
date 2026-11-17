@@ -961,26 +961,61 @@ impl App {
         kids
     }
 
+    /// Every entry with a read error, in the order the lists show them (depth-first, the
+    /// entries of each directory sorted as on screen), with `anchor` among them so that its
+    /// place in that order is known.
+    ///
+    /// Only directories that have an error somewhere below them are entered
+    /// (`Tree::errors_below`), and those that lead to `anchor`. In such a directory only the
+    /// entries that matter are sorted, not all of them. Building the display order of the
+    /// whole tree for this took seconds on a tree of millions.
+    fn errors_in_display_order(&self, anchor: NodeIdx) -> Vec<NodeIdx> {
+        let tree = &self.tree;
+        // `anchor` and the directories above it, innermost first.
+        let mut to_anchor = vec![anchor];
+        while let Some(parent) = tree.nodes[*to_anchor.last().unwrap_or(&anchor)].parent {
+            to_anchor.push(parent);
+        }
+        let leads_to_anchor = |idx: NodeIdx| to_anchor.contains(&idx);
+
+        let mut found = Vec::new();
+        let mut stack = vec![tree.root];
+        while let Some(idx) = stack.pop() {
+            let n = &tree.nodes[idx];
+            if n.read_error || idx == anchor {
+                found.push(idx);
+            }
+            if tree.errors_below(idx) == 0 && !(idx != anchor && leads_to_anchor(idx)) {
+                continue;
+            }
+            let relevant: Vec<NodeIdx> = n
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    tree.nodes[c].read_error || leads_to_anchor(c) || tree.errors_below(c) > 0
+                })
+                .collect();
+            // Pushed reversed so the pop order is display order.
+            stack.extend(self.order_children(relevant).iter().rev());
+        }
+        found
+    }
+
     /// Jump to the next entry flagged with a read error (`!`), searching forward from the
     /// current selection in display order and wrapping around. The view moves to the entry's
     /// parent directory with it selected.
     fn jump_to_next_error(&mut self) {
-        let mut order = Vec::new();
-        let mut stack = vec![self.tree.root];
-        while let Some(idx) = stack.pop() {
-            order.push(idx);
-            // Pushed reversed so the pop order is display order.
-            stack.extend(
-                self.order_children(self.tree.nodes[idx].children.clone())
-                    .iter()
-                    .rev(),
-            );
-        }
         let anchor = self.selected.unwrap_or(self.cur);
-        let pos = order.iter().position(|&i| i == anchor).unwrap_or(0);
+        let order = self.errors_in_display_order(anchor);
+        // Start behind the anchor; it comes last, when everything else has been passed over.
+        let start = order
+            .iter()
+            .position(|&i| i == anchor)
+            .map_or(0, |pos| pos + 1);
         let mut locked = false;
-        for step in 1..=order.len() {
-            let idx = order[(pos + step) % order.len()];
+        for step in 0..order.len() {
+            let idx = order[(start + step) % order.len()];
             if !self.tree.nodes[idx].read_error {
                 continue;
             }
@@ -2564,7 +2599,7 @@ mod tests {
             app.on_key(KeyAction::NextError);
             assert_eq!(app.selected, Some(last_dir));
         });
-        app.tree.nodes[last_dir].read_error = false;
+        app.tree.set_read_error(last_dir, false);
         time("... when there is none", &mut || {
             app.on_key(KeyAction::NextError);
         });
@@ -3435,7 +3470,7 @@ mod tests {
             more: false,
         });
         let (locked, flagged) = (idx_named(&app, "locked"), idx_named(&app, "flagged"));
-        app.tree.nodes[flagged].read_error = true; // as an import would
+        app.tree.set_read_error(flagged, true); // as an import would
 
         let row = |app: &App, idx| {
             app.info_pairs(idx)
@@ -4060,8 +4095,8 @@ mod tests {
             idx_named(&app, "README.txt"),
             idx_named(&app, "readme"),
         );
-        app.tree.nodes[inside].read_error = true;
-        app.tree.nodes[outside].read_error = true;
+        app.tree.set_read_error(inside, true);
+        app.tree.set_read_error(outside, true);
         let _worker = start_fake_delete(&mut app, docs);
 
         for _ in 0..3 {
@@ -4071,7 +4106,7 @@ mod tests {
         }
 
         // With nothing but locked errors left, the view stays put and the footer says why.
-        app.tree.nodes[outside].read_error = false;
+        app.tree.set_read_error(outside, false);
         app.on_key(KeyAction::NextError);
         assert_eq!(app.cur, app.tree.root);
         assert!(app

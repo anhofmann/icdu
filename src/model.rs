@@ -112,6 +112,11 @@ pub struct Tree {
     /// Why an entry is flagged with a read error, in the words of the OS. Only entries a scan
     /// could not read have one; an imported dump carries the flag without a reason.
     errors: HashMap<NodeIdx, Box<str>>,
+    /// How many entries with a read error lie below a directory, for the directories that
+    /// have any. It lets a search for errors skip every subtree without one instead of
+    /// walking the whole tree, and it stays small: errors are rare. Kept in step by
+    /// `set_read_error` and by everything that adds or detaches entries.
+    errors_below: HashMap<NodeIdx, u32>,
     /// Hard-linked files by `(dev, ino)`, so that each inode is counted exactly once: across
     /// directories, across scan generations, and after its counted link is deleted. It costs
     /// memory only for files with more than one link. Imported trees do not use it (their
@@ -158,6 +163,7 @@ impl Tree {
             orphans: HashMap::new(),
             raw_names: HashMap::new(),
             errors: HashMap::new(),
+            errors_below: HashMap::new(),
             links: HashMap::new(),
             generation: 0,
             total_dirs: 1,
@@ -193,9 +199,12 @@ impl Tree {
             self.bump_unscanned(parent_idx, -1);
         }
         if let Some(error) = batch.error {
-            self.nodes[parent_idx].read_error = true;
+            self.set_read_error(parent_idx, true);
             self.errors.insert(parent_idx, error.into());
         }
+        // Entries of this batch that could not be examined.
+        let new_errors = batch.nodes.iter().filter(|nn| nn.error.is_some()).count();
+        self.bump_errors(Some(parent_idx), new_errors as i64);
 
         let mut sum_apparent = 0u64;
         let mut sum_disk = 0u64;
@@ -373,6 +382,7 @@ impl Tree {
     /// Returns the number of (dirs, files) removed.
     pub fn delete_subtree(&mut self, idx: NodeIdx) -> (u64, u64) {
         self.generation += 1;
+        self.forget_errors(idx, true);
         // Detach from parent and subtract its counted size and its items (the node itself plus
         // everything below it) from all ancestors.
         if let Some(parent) = self.nodes[idx].parent {
@@ -402,6 +412,10 @@ impl Tree {
             }
             if self.is_counted_link(n) {
                 lost_links.push(n);
+            }
+            // The counts of what was detached are of no use any more.
+            if !self.errors_below.is_empty() {
+                self.errors_below.remove(&n);
             }
             stack.extend_from_slice(&self.nodes[n].children);
         }
@@ -507,6 +521,7 @@ impl Tree {
         // which is what the reset aggregate becomes.
         let (own_apparent, own_disk) = (self.own_apparent(idx), self.own_disk(idx));
 
+        self.forget_errors(idx, false);
         let mut stack = std::mem::take(&mut self.nodes[idx].children);
         // Cut the children's upward links, so `is_attached` can tell the tombstones apart.
         for &c in &stack {
@@ -524,6 +539,9 @@ impl Tree {
             }
             if self.is_counted_link(n) {
                 lost_links.push(n);
+            }
+            if !self.errors_below.is_empty() {
+                self.errors_below.remove(&n);
             }
             // Detach the grandchildren too: the nodes stay as tombstones (like delete), but
             // they no longer hold on to their subtree.
@@ -544,7 +562,7 @@ impl Tree {
         self.sub_totals(idx, removed_apparent, removed_disk, removed_items);
         let n = &mut self.nodes[idx];
         n.scanned = false;
-        n.read_error = false;
+        self.set_read_error(idx, false);
         self.errors.remove(&idx);
         // This directory is unread again, and every ancestor has to count it: the batch that
         // reads it takes one off the whole chain (see `graft`), and until then nothing above
@@ -609,6 +627,54 @@ impl Tree {
         }
         parts.reverse();
         parts.join("/")
+    }
+
+    /// Flag or unflag `idx` as unreadable, and keep the error counts of its ancestors in step.
+    /// Never write `Node::read_error` directly: the counts would no longer match.
+    pub fn set_read_error(&mut self, idx: NodeIdx, on: bool) {
+        if self.nodes[idx].read_error != on {
+            self.nodes[idx].read_error = on;
+            self.bump_errors(self.nodes[idx].parent, if on { 1 } else { -1 });
+        }
+    }
+
+    /// The number of entries with a read error below `idx`, not counting `idx` itself.
+    pub fn errors_below(&self, idx: NodeIdx) -> u32 {
+        if self.errors_below.is_empty() {
+            return 0;
+        }
+        self.errors_below.get(&idx).copied().unwrap_or(0)
+    }
+
+    /// Add `delta` to the error count of `start` and of every ancestor.
+    fn bump_errors(&mut self, start: Option<NodeIdx>, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut cur = start;
+        while let Some(i) = cur {
+            let count = i64::from(self.errors_below(i)) + delta;
+            if count > 0 {
+                self.errors_below
+                    .insert(i, u32::try_from(count).unwrap_or(u32::MAX));
+            } else {
+                self.errors_below.remove(&i);
+            }
+            cur = self.nodes[i].parent;
+        }
+    }
+
+    /// The entries of the subtree `idx` are leaving the tree: take their errors off the counts
+    /// of what stays. `with_self` says whether `idx` itself leaves (a deletion) or only what
+    /// is below it (a rescan). Called before the links are cut.
+    fn forget_errors(&mut self, idx: NodeIdx, with_self: bool) {
+        let below = i64::from(self.errors_below(idx));
+        if with_self {
+            let own = i64::from(self.nodes[idx].read_error);
+            self.bump_errors(self.nodes[idx].parent, -(below + own));
+        } else {
+            self.bump_errors(Some(idx), -below);
+        }
     }
 
     /// Why `idx` has a read error, if the scan recorded a reason.
@@ -740,6 +806,7 @@ impl Tree {
             (0, 0)
         };
         self.add_totals(parent, apparent, disk, 1);
+        self.bump_errors(Some(parent), i64::from(read_error));
         idx
     }
 
@@ -920,6 +987,99 @@ mod tests {
         let big = idx_of(&t, "big");
         assert_eq!(t.nodes[big].items, 2);
         assert!(t.subtree_complete(t.root));
+    }
+
+    /// The count of read errors below each directory follows every way an error can come
+    /// and go: with a batch, by flag, with a deletion, with a rescan.
+    #[test]
+    fn error_counts_follow_the_tree() {
+        let mut t = small_tree(); // /r: a/ (x, sub/ (y)), b
+        let (a, sub, x) = (idx_of(&t, "a"), idx_of(&t, "sub"), idx_of(&t, "x"));
+        let counts = |t: &Tree| {
+            (
+                t.errors_below(t.root),
+                t.errors_below(a),
+                t.errors_below(sub),
+            )
+        };
+        assert_eq!(counts(&t), (0, 0, 0));
+
+        // A flag on a file counts for every directory above it, once.
+        t.set_read_error(x, true);
+        t.set_read_error(x, true);
+        assert_eq!(counts(&t), (1, 1, 0));
+        // A directory with an error counts for its ancestors, not for itself.
+        t.set_read_error(sub, true);
+        assert_eq!(counts(&t), (2, 2, 0));
+        t.set_read_error(x, false);
+        assert_eq!(counts(&t), (1, 1, 0));
+
+        // A batch brings both kinds: a failed listing and entries that could not be examined.
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                dir("d", 1),
+                NewNode {
+                    error: Some("Input/output error".into()),
+                    ..file("broken", 10)
+                },
+            ],
+            error: None,
+            more: false,
+        });
+        let d = idx_of(&t, "d");
+        assert_eq!(t.errors_below(t.root), 1);
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![NewNode {
+                error: Some("Permission denied".into()),
+                ..file("inner", 11)
+            }],
+            error: Some("Stale file handle".into()),
+            more: false,
+        });
+        assert_eq!((t.errors_below(t.root), t.errors_below(d)), (3, 1));
+
+        // A rescan of `d` takes away what was below it and its own flag...
+        t.begin_refresh(d, crate::scan::SCAN_ID_STRIDE);
+        assert_eq!((t.errors_below(t.root), t.errors_below(d)), (1, 0));
+        // ...and a deletion takes the entry with everything below it.
+        let broken = idx_of(&t, "broken");
+        t.delete_subtree(broken);
+        assert_eq!(t.errors_below(t.root), 0);
+
+        // Imported entries count the same way.
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let d = t.import_child(
+            t.root,
+            "d".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            2,
+            false,
+            false,
+            Excluded::No,
+            true,
+        );
+        t.import_child(
+            d,
+            "f".into(),
+            NodeKind::File,
+            0,
+            0,
+            1,
+            3,
+            false,
+            false,
+            Excluded::No,
+            true,
+        );
+        assert_eq!((t.errors_below(t.root), t.errors_below(d)), (2, 1));
+        t.delete_subtree(d);
+        assert_eq!(t.errors_below(t.root), 0);
     }
 
     /// A directory is not deletable until its entire subtree has been scanned.
