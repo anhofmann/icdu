@@ -1,6 +1,7 @@
 //! icdu — an ncdu-like disk usage explorer that is interactive while it scans.
 
 mod app;
+mod args;
 mod delete;
 mod dump;
 mod glob;
@@ -23,144 +24,10 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 
 use app::{App, InputMode, KeyAction};
+use args::{Args, Parsed};
 use model::Tree;
 use scan::Opts;
 use signals::Signals;
-
-struct Args {
-    path: PathBuf,
-    threads: usize,
-    disk_usage: bool,
-    one_file_system: bool,
-    read_only: bool,
-    /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
-    show_item_count: bool,
-    excludes: Vec<String>,
-    /// `--older-than DUR`: exclude entries not modified for this long (seconds).
-    older_than: Option<u64>,
-    /// `--newer-than DUR`: exclude entries modified within this window (seconds).
-    newer_than: Option<u64>,
-    /// `-o FILE`: scan headless and write ncdu JSON, then exit. `-` means stdout.
-    export: Option<String>,
-    /// `-f FILE`: load a tree from ncdu JSON instead of scanning. `-` means stdin.
-    import: Option<String>,
-}
-
-/// Parse the command line (without the program name).
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
-    let mut path: Option<PathBuf> = None;
-    let mut threads = scan::default_threads();
-    let mut disk_usage = true;
-    let mut one_file_system = false;
-    let mut read_only = false;
-    let mut show_item_count = false;
-    let mut excludes = Vec::new();
-    let mut older_than = None;
-    let mut newer_than = None;
-    let mut export = None;
-    let mut import = None;
-
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "-h" | "--help" => {
-                print_help();
-                std::process::exit(0);
-            }
-            "-V" | "-v" | "--version" => {
-                println!("{}", version_line());
-                std::process::exit(0);
-            }
-            "-t" | "--threads" => {
-                let v = it.next().ok_or("--threads needs a value")?;
-                threads = v
-                    .parse::<usize>()
-                    .map_err(|_| "--threads must be a number")?
-                    .max(1);
-            }
-            "-a" | "--apparent-size" | "--apparent" => disk_usage = false,
-            "-x" | "--one-file-system" => one_file_system = true,
-            "-r" | "--read-only" => read_only = true,
-            "--show-itemcount" => show_item_count = true,
-            "--hide-itemcount" => show_item_count = false,
-            "--exclude" => {
-                excludes.push(it.next().ok_or("--exclude needs a pattern")?);
-            }
-            "--older-than" => {
-                let d = it
-                    .next()
-                    .ok_or("--older-than needs a duration (e.g. 30d)")?;
-                older_than = Some(parse_duration(&d)?);
-            }
-            "--newer-than" => {
-                let d = it.next().ok_or("--newer-than needs a duration (e.g. 1y)")?;
-                newer_than = Some(parse_duration(&d)?);
-            }
-            "-X" | "--exclude-from" => {
-                let file = it.next().ok_or("--exclude-from needs a file")?;
-                let content = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
-                for line in content.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with('#') {
-                        excludes.push(line.to_string());
-                    }
-                }
-            }
-            "-o" | "--output" => export = Some(it.next().ok_or("-o needs a file (or -)")?),
-            "-f" | "--file" => import = Some(it.next().ok_or("-f needs a file (or -)")?),
-            // Bundled boolean short flags, e.g. `-rx`.
-            other if other.starts_with('-') && !other.starts_with("--") && other.len() > 2 => {
-                for ch in other[1..].chars() {
-                    match ch {
-                        'a' => disk_usage = false,
-                        'x' => one_file_system = true,
-                        'r' => read_only = true,
-                        _ => return Err(format!("unknown flag -{ch} in {other}")),
-                    }
-                }
-            }
-            other if other.starts_with('-') && other != "-" => {
-                return Err(format!("unknown option: {other}"));
-            }
-            other => path = Some(PathBuf::from(other)),
-        }
-    }
-
-    Ok(Args {
-        path: path.unwrap_or_else(|| PathBuf::from(".")),
-        threads,
-        disk_usage,
-        one_file_system,
-        read_only,
-        show_item_count,
-        excludes,
-        older_than,
-        newer_than,
-        export,
-        import,
-    })
-}
-
-/// Parse a human duration like `45s`, `30m`, `12h`, `30d`, `2w`, `1y`. A bare number is days.
-fn parse_duration(s: &str) -> Result<u64, String> {
-    let (num, unit_secs) = match s.chars().last() {
-        Some(c) if c.is_ascii_digit() => (s, 86_400u64),
-        Some('s') => (&s[..s.len() - 1], 1),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('h') => (&s[..s.len() - 1], 3_600),
-        Some('d') => (&s[..s.len() - 1], 86_400),
-        Some('w') => (&s[..s.len() - 1], 604_800),
-        Some('y') => (&s[..s.len() - 1], 31_536_000),
-        _ => {
-            return Err(format!(
-                "invalid duration '{s}' (expected e.g. 45s, 30m, 12h, 30d, 2w, 1y)"
-            ))
-        }
-    };
-    let n: u64 = num.parse().map_err(|_| format!("invalid duration '{s}'"))?;
-    n.checked_mul(unit_secs)
-        .ok_or_else(|| format!("duration '{s}' overflows"))
-}
 
 /// What `--version` prints: the program name and its version, as ncdu does.
 fn version_line() -> String {
@@ -172,26 +39,13 @@ fn print_help() {
         "icdu {} — interactive, SSD-optimized disk usage explorer (ncdu-compatible)
 
 USAGE:
-    icdu [PATH] [OPTIONS]
+    icdu [OPTIONS] [PATH]
 
 ARGS:
     PATH                     directory to scan (default: current directory)
 
 OPTIONS:
-    -t, --threads N          scanner threads (default: cores*4, tuned for SSDs)
-    -a, --apparent-size      show apparent size instead of on-disk usage
-    -x, --one-file-system    do not cross filesystem boundaries
-        --exclude PATTERN    exclude entries matching a glob (repeatable)
-        --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
-        --newer-than DUR     exclude entries newer than DUR (surfaces stale data)
-    -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
-    -r, --read-only          disable the delete feature
-        --show-itemcount     show the item count column at start (toggle with c)
-        --hide-itemcount     hide the item count column at start (default)
-    -o, --output FILE        scan without UI and write ncdu-compatible JSON ('-' = stdout)
-    -f, --file FILE          load a tree from ncdu JSON instead of scanning ('-' = stdin)
-    -h, --help               show this help
-    -V, --version            show version
+{}
 
 KEYS:
     j/k, down/up    move          l/Enter/right   enter directory
@@ -207,16 +61,26 @@ KEYS:
     Home/End, G     top/bottom    c               item counts
     C-l             redraw        C-z             suspend (fg resumes)
     in the search:  C-u clear the line, C-w delete a word",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        args::options_help().trim_end()
     );
 }
 
 fn main() {
-    let args = match parse_args(std::env::args().skip(1)) {
-        Ok(a) => a,
+    // Usage errors exit with status 1, as in ncdu.
+    let args = match args::parse(std::env::args().skip(1)) {
+        Ok(Parsed::Run(args)) => *args,
+        Ok(Parsed::Help) => {
+            print_help();
+            return;
+        }
+        Ok(Parsed::Version) => {
+            println!("{}", version_line());
+            return;
+        }
         Err(e) => {
             eprintln!("icdu: {e}\nTry 'icdu --help'.");
-            std::process::exit(2);
+            std::process::exit(1);
         }
     };
 
@@ -240,7 +104,7 @@ fn main() {
     // --- Import mode: load a dump, browse it, no scanning. ---
     if let Some(src) = &args.import {
         let tree = unwrap_or_die(load_import(src), src);
-        let mut app = App::new(tree, args.disk_usage, args.read_only, false);
+        let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
         app.show_item_count = args.show_item_count;
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
@@ -250,7 +114,7 @@ fn main() {
     // --- Interactive scan mode. ---
     let (tree, root, opts) = prepare_scan(&args);
     let scan = scan::start(root, opts.clone());
-    let mut app = App::new(tree, args.disk_usage, args.read_only, true);
+    let mut app = App::new(tree, args.disk_usage, args.read_only > 0, true);
     app.show_item_count = args.show_item_count;
     app.attach_scan(scan, opts);
 
@@ -690,9 +554,7 @@ mod tests {
 
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    use super::{
-        decode_key, page_rows, parse_args, parse_duration, plain_path, version_line, Args,
-    };
+    use super::{decode_key, page_rows, plain_path, version_line};
     use crate::app::{InputMode, KeyAction};
 
     #[test]
@@ -724,13 +586,14 @@ mod tests {
     /// `update` used to be a subcommand that downloaded a release. It is a path like any other.
     #[test]
     fn update_is_an_ordinary_path() {
-        let args = parse_args(vec!["update".to_string()]).unwrap();
+        let parsed = crate::args::parse(vec!["update".to_string()]);
+        let Ok(crate::args::Parsed::Run(args)) = parsed else {
+            panic!("{parsed:?}");
+        };
         assert_eq!(args.path, PathBuf::from("update"));
         // What followed the old subcommand is not swallowed either.
-        let Err(err) = parse_args(vec!["update".to_string(), "--check".to_string()]) else {
-            panic!("--check is not an option");
-        };
-        assert!(err.contains("--check"), "{err}");
+        let err = crate::args::parse(vec!["update".to_string(), "--check".to_string()]);
+        assert_eq!(err, Err("unknown option: --check".to_string()));
     }
 
     /// The repository this build's releases are published from.
@@ -1021,24 +884,6 @@ mod tests {
         ));
     }
 
-    fn parse(args: &[&str]) -> Args {
-        parse_args(args.iter().map(|a| a.to_string())).unwrap()
-    }
-
-    /// `--show-itemcount` / `--hide-itemcount` set the column's initial state (hidden by
-    /// default); the last one given wins.
-    #[test]
-    fn itemcount_flags_set_the_initial_state() {
-        assert!(!parse(&[]).show_item_count, "hidden by default");
-        assert!(parse(&["--show-itemcount"]).show_item_count);
-        assert!(!parse(&["--hide-itemcount"]).show_item_count);
-        assert!(!parse(&["--show-itemcount", "--hide-itemcount"]).show_item_count);
-        assert!(parse(&["--hide-itemcount", "--show-itemcount"]).show_item_count);
-        let a = parse(&["/tmp", "--show-itemcount", "-rx"]);
-        assert!(a.show_item_count && a.read_only && a.one_file_system);
-        assert_eq!(a.path, PathBuf::from("/tmp"));
-    }
-
     /// Plain `c` toggles the item count column; Ctrl-C still quits, and while a search is
     /// typed `c` goes to the query.
     #[test]
@@ -1061,23 +906,5 @@ mod tests {
             decode_key(KeyCode::Char('c'), none, InputMode::Find, 10),
             Some(KeyAction::FindChar('c'))
         ));
-    }
-
-    #[test]
-    fn parse_duration_understands_units() {
-        assert_eq!(parse_duration("45s").unwrap(), 45);
-        assert_eq!(parse_duration("30m").unwrap(), 1_800);
-        assert_eq!(parse_duration("12h").unwrap(), 43_200);
-        assert_eq!(parse_duration("30d").unwrap(), 2_592_000);
-        assert_eq!(parse_duration("2w").unwrap(), 1_209_600);
-        assert_eq!(parse_duration("1y").unwrap(), 31_536_000);
-        assert_eq!(
-            parse_duration("10").unwrap(),
-            864_000,
-            "bare numbers are days"
-        );
-        assert!(parse_duration("abc").is_err());
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("1x").is_err());
     }
 }

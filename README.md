@@ -57,27 +57,31 @@ Up to version 0.4.1 this program was called rcdu. Coming from it:
 ## Usage
 
 ```
-icdu [PATH] [OPTIONS]
+icdu [OPTIONS] [PATH]
 
 ARGS:
     PATH                     directory to scan (default: current directory)
 
 OPTIONS:
-    -t, --threads N          scanner threads (default: cores*4, tuned for SSDs)
-    -a, --apparent-size      show apparent size (st_size) instead of on-disk usage
+    -t, --threads N          scanner threads (default: cores*4)
+    -a, --apparent-size      show apparent size instead of on-disk usage
     -x, --one-file-system    do not cross filesystem boundaries
         --exclude PATTERN    exclude entries matching a glob (repeatable)
-        --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
-        --newer-than DUR     exclude entries newer than DUR (surfaces stale data)
     -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
+        --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
+        --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
-        --show-itemcount     show the item count column at start (toggle with c)
-        --hide-itemcount     hide the item count column at start (default)
-    -o, --output FILE        scan without UI and write ncdu-compatible JSON ('-' = stdout)
-    -f, --file FILE          load a tree from ncdu JSON instead of scanning ('-' = stdin)
-    -h, --help               show help
+        --show-itemcount, --hide-itemcount
+                             show or hide the item count column (default: hide)
+    -o, --output FILE        scan without UI, write ncdu JSON (- is stdout)
+    -f, --file FILE          browse a tree from ncdu JSON (- is stdin)
+    -h, --help               show this help
     -V, --version            show version
 ```
+
+Options are written as in ncdu: short flags can be bundled, and a value can be attached to its
+flag or follow it (`-xo-`, `-o file`, `--exclude=tmp`, `--exclude tmp`). `--` ends the options.
+Of two options that contradict each other the later one wins. A usage error exits with status 1.
 
 Examples:
 

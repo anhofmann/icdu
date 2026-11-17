@@ -1,0 +1,951 @@
+//! The command line.
+//!
+//! Written by hand (no clap), but driven by one table, [`FLAGS`]: the parser, `--help` and
+//! the tests all read it, so a flag cannot be accepted without being documented or the other
+//! way round. The accepted forms are those of ncdu, so that command lines written for ncdu
+//! work unchanged:
+//!
+//! * short flags can be bundled, and the last one may take a value, attached or as the next
+//!   argument: `-xo-`, `-xo file`, `-ofile`, `-1xo-`
+//! * long flags take their value as `--long=value` or `--long value`
+//! * `--` ends the options; everything after it is a path
+//! * a flag given twice is counted (`-rr`), and of two flags that contradict each other the
+//!   later one wins, which is what lets a command line override a config file
+
+use std::path::PathBuf;
+
+use crate::scan;
+
+/// The settings a command line asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Args {
+    pub path: PathBuf,
+    pub threads: usize,
+    pub disk_usage: bool,
+    pub one_file_system: bool,
+    /// How many times `-r` was given. Once disables deleting.
+    pub read_only: u8,
+    /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
+    pub show_item_count: bool,
+    pub excludes: Vec<String>,
+    /// `--older-than DUR`: exclude entries not modified for this long (seconds).
+    pub older_than: Option<u64>,
+    /// `--newer-than DUR`: exclude entries modified within this window (seconds).
+    pub newer_than: Option<u64>,
+    /// `-o FILE`: scan headless and write ncdu JSON, then exit. `-` means stdout.
+    pub export: Option<String>,
+    /// `-f FILE`: load a tree from ncdu JSON instead of scanning. `-` means stdin.
+    pub import: Option<String>,
+    /// `-0`, `-1`, `-2`: how much to show while scanning without the browser. Accepted for
+    /// compatibility; the modes themselves are not implemented yet.
+    pub feedback: Option<u8>,
+    /// `-e`: extended information. Accepted for compatibility; not implemented yet.
+    pub extended: bool,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Args {
+            path: PathBuf::from("."),
+            threads: scan::default_threads(),
+            disk_usage: true,
+            one_file_system: false,
+            read_only: 0,
+            show_item_count: false,
+            excludes: Vec::new(),
+            older_than: None,
+            newer_than: None,
+            export: None,
+            import: None,
+            feedback: None,
+            extended: false,
+        }
+    }
+}
+
+/// What a command line amounts to.
+#[derive(Debug, PartialEq)]
+pub enum Parsed {
+    Run(Box<Args>),
+    Help,
+    Version,
+}
+
+/// What a flag does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Action {
+    Help,
+    Version,
+    Threads,
+    Apparent,
+    OneFileSystem,
+    Exclude,
+    ExcludeFrom,
+    OlderThan,
+    NewerThan,
+    ReadOnly,
+    ItemCount(bool),
+    Output,
+    Input,
+    Feedback(u8),
+    Extended,
+}
+
+/// One flag: how it is spelled, whether it takes a value, and what `--help` says about it.
+pub struct Flag {
+    /// Short spellings, without the dash.
+    pub short: &'static [char],
+    /// Long spellings, without the dashes. The first is the one `--help` shows.
+    pub long: &'static [&'static str],
+    /// The name of its value in `--help`, if it takes one.
+    pub value: Option<&'static str>,
+    /// The long name of the flag that undoes this one, if there is one.
+    pub negation: Option<&'static str>,
+    /// The text for `--help`. Empty for a flag that is accepted but not advertised, and for
+    /// the second flag of a pair, which is shown with the first.
+    pub help: &'static str,
+    action: Action,
+}
+
+const fn flag(
+    short: &'static [char],
+    long: &'static [&'static str],
+    value: Option<&'static str>,
+    help: &'static str,
+    action: Action,
+) -> Flag {
+    Flag {
+        short,
+        long,
+        value,
+        negation: None,
+        help,
+        action,
+    }
+}
+
+/// Every flag there is.
+pub const FLAGS: &[Flag] = &[
+    flag(
+        &['t'],
+        &["threads"],
+        Some("N"),
+        "scanner threads (default: cores*4)",
+        Action::Threads,
+    ),
+    flag(
+        &['a'],
+        &["apparent-size", "apparent"],
+        None,
+        "show apparent size instead of on-disk usage",
+        Action::Apparent,
+    ),
+    flag(
+        &['x'],
+        &["one-file-system"],
+        None,
+        "do not cross filesystem boundaries",
+        Action::OneFileSystem,
+    ),
+    flag(
+        &[],
+        &["exclude"],
+        Some("PATTERN"),
+        "exclude entries matching a glob (repeatable)",
+        Action::Exclude,
+    ),
+    flag(
+        &['X'],
+        &["exclude-from"],
+        Some("FILE"),
+        "read exclude patterns from FILE (one per line)",
+        Action::ExcludeFrom,
+    ),
+    flag(
+        &[],
+        &["older-than"],
+        Some("DUR"),
+        "exclude entries older than DUR (e.g. 30d, 2w, 1y)",
+        Action::OlderThan,
+    ),
+    flag(
+        &[],
+        &["newer-than"],
+        Some("DUR"),
+        "exclude entries newer than DUR",
+        Action::NewerThan,
+    ),
+    flag(
+        &['r'],
+        &["read-only"],
+        None,
+        "disable the delete feature",
+        Action::ReadOnly,
+    ),
+    Flag {
+        negation: Some("hide-itemcount"),
+        ..flag(
+            &[],
+            &["show-itemcount"],
+            None,
+            "show or hide the item count column (default: hide)",
+            Action::ItemCount(true),
+        )
+    },
+    Flag {
+        negation: Some("show-itemcount"),
+        ..flag(&[], &["hide-itemcount"], None, "", Action::ItemCount(false))
+    },
+    flag(
+        &['o'],
+        &["output"],
+        Some("FILE"),
+        "scan without UI, write ncdu JSON (- is stdout)",
+        Action::Output,
+    ),
+    flag(
+        &['f'],
+        &["file"],
+        Some("FILE"),
+        "browse a tree from ncdu JSON (- is stdin)",
+        Action::Input,
+    ),
+    // ncdu's feedback modes and extended information: accepted, so that command lines written
+    // for ncdu run, but without effect yet. Not advertised until they have one.
+    flag(&['0'], &[], None, "", Action::Feedback(0)),
+    flag(&['1'], &[], None, "", Action::Feedback(1)),
+    flag(&['2'], &[], None, "", Action::Feedback(2)),
+    flag(&['e'], &["extended"], None, "", Action::Extended),
+    flag(&['h'], &["help"], None, "show this help", Action::Help),
+    flag(
+        &['V', 'v'],
+        &["version"],
+        None,
+        "show version",
+        Action::Version,
+    ),
+];
+
+/// Parse the command line (without the program name).
+pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
+    let mut parsed = Args::default();
+    let mut path: Option<String> = None;
+    let mut only_paths = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        // A lone `-` is not an option; neither is anything after `--`.
+        if only_paths || arg == "-" || !arg.starts_with('-') {
+            if let Some(first) = &path {
+                return Err(format!("more than one directory given: {first} and {arg}"));
+            }
+            path = Some(arg);
+        } else if arg == "--" {
+            only_paths = true;
+        } else if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (long, None),
+            };
+            let flag = FLAGS
+                .iter()
+                .find(|f| f.long.contains(&name))
+                .ok_or_else(|| format!("unknown option: --{name}"))?;
+            let shown = format!("--{name}");
+            let value = match (flag.value, attached) {
+                (Some(_), Some(value)) => Some(value),
+                (Some(_), None) => Some(args.next().ok_or_else(|| needs_value(flag, &shown))?),
+                (None, Some(_)) => return Err(format!("{shown} does not take a value")),
+                (None, None) => None,
+            };
+            match apply(flag.action, value, &shown, &mut parsed)? {
+                Some(stop) => return Ok(stop),
+                None => continue,
+            }
+        } else {
+            // A bundle of short flags. The first one that takes a value takes the rest of
+            // the bundle as that value, or the next argument if nothing is left.
+            let bundle = &arg[1..];
+            for (at, c) in bundle.char_indices() {
+                let flag =
+                    FLAGS.iter().find(|f| f.short.contains(&c)).ok_or_else(|| {
+                        match bundle.chars().count() {
+                            1 => format!("unknown option: -{c}"),
+                            _ => format!("unknown option -{c} in {arg}"),
+                        }
+                    })?;
+                let shown = format!("-{c}");
+                let rest = &bundle[at + c.len_utf8()..];
+                let value = match flag.value {
+                    Some(_) if !rest.is_empty() => Some(rest.to_string()),
+                    Some(_) => Some(args.next().ok_or_else(|| needs_value(flag, &shown))?),
+                    None => None,
+                };
+                let took_the_rest = value.is_some();
+                if let Some(stop) = apply(flag.action, value, &shown, &mut parsed)? {
+                    return Ok(stop);
+                }
+                if took_the_rest {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(path) = path {
+        parsed.path = PathBuf::from(path);
+    }
+    Ok(Parsed::Run(Box::new(parsed)))
+}
+
+fn needs_value(flag: &Flag, shown: &str) -> String {
+    let what = match flag.value {
+        Some("N") => "a number",
+        Some("FILE") => "a file (or -)",
+        Some("PATTERN") => "a pattern",
+        Some("DUR") => "a duration (e.g. 30d)",
+        _ => "a value",
+    };
+    format!("{shown} needs {what}")
+}
+
+/// Carry out one flag. Returns `Some` for the flags that end parsing (`--help`, `--version`).
+fn apply(
+    action: Action,
+    value: Option<String>,
+    shown: &str,
+    args: &mut Args,
+) -> Result<Option<Parsed>, String> {
+    let value = value.unwrap_or_default();
+    match action {
+        Action::Help => return Ok(Some(Parsed::Help)),
+        Action::Version => return Ok(Some(Parsed::Version)),
+        Action::Threads => {
+            args.threads = value
+                .parse::<usize>()
+                .map_err(|_| format!("{shown} must be a number, not '{value}'"))?
+                .max(1);
+        }
+        Action::Apparent => args.disk_usage = false,
+        Action::OneFileSystem => args.one_file_system = true,
+        Action::Exclude => args.excludes.push(value),
+        Action::ExcludeFrom => {
+            let content = std::fs::read_to_string(&value).map_err(|e| format!("{value}: {e}"))?;
+            args.excludes.extend(
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_string),
+            );
+        }
+        Action::OlderThan => args.older_than = Some(parse_duration(&value)?),
+        Action::NewerThan => args.newer_than = Some(parse_duration(&value)?),
+        Action::ReadOnly => args.read_only = args.read_only.saturating_add(1),
+        Action::ItemCount(show) => args.show_item_count = show,
+        Action::Output => args.export = Some(value),
+        Action::Input => args.import = Some(value),
+        Action::Feedback(level) => args.feedback = Some(level),
+        Action::Extended => args.extended = true,
+    }
+    Ok(None)
+}
+
+/// Parse a human duration like `45s`, `30m`, `12h`, `30d`, `2w`, `1y`. A bare number is days.
+pub fn parse_duration(s: &str) -> Result<u64, String> {
+    let (num, unit_secs) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, 86_400u64),
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3_600),
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some('w') => (&s[..s.len() - 1], 604_800),
+        Some('y') => (&s[..s.len() - 1], 31_536_000),
+        _ => {
+            return Err(format!(
+                "invalid duration '{s}' (expected e.g. 45s, 30m, 12h, 30d, 2w, 1y)"
+            ))
+        }
+    };
+    let n: u64 = num.parse().map_err(|_| format!("invalid duration '{s}'"))?;
+    n.checked_mul(unit_secs)
+        .ok_or_else(|| format!("duration '{s}' overflows"))
+}
+
+/// The OPTIONS block of `--help`, straight from [`FLAGS`]: one entry per advertised flag. A
+/// flag and its negation share an entry, which stands at the place of the one with the text.
+pub fn options_help() -> String {
+    const SPEC_WIDTH: usize = 24;
+    let mut out = String::new();
+    for flag in FLAGS.iter().filter(|f| !f.help.is_empty()) {
+        let short = match flag.short.first() {
+            Some(c) => format!("-{c}, "),
+            None => "    ".to_string(),
+        };
+        let mut spec = format!(
+            "{short}--{}",
+            flag.long.first().copied().unwrap_or_default()
+        );
+        if let Some(value) = flag.value {
+            spec.push(' ');
+            spec.push_str(value);
+        }
+        if let Some(negation) = flag.negation {
+            spec.push_str(&format!(", --{negation}"));
+        }
+        if spec.len() > SPEC_WIDTH {
+            // Too long to share a line with its text.
+            out.push_str(&format!(
+                "    {spec}\n    {:SPEC_WIDTH$} {}\n",
+                "", flag.help
+            ));
+        } else {
+            out.push_str(&format!("    {spec:<SPEC_WIDTH$} {}\n", flag.help));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(args: &[&str]) -> Result<Parsed, String> {
+        parse(args.iter().map(|a| a.to_string()))
+    }
+
+    /// The settings a command line gives, which must be one that runs.
+    fn args(line: &[&str]) -> Args {
+        match run(line) {
+            Ok(Parsed::Run(args)) => *args,
+            other => panic!("{line:?} gave {other:?}"),
+        }
+    }
+
+    fn error(line: &[&str]) -> String {
+        match run(line) {
+            Err(e) => e,
+            other => panic!("{line:?} gave {other:?}"),
+        }
+    }
+
+    /// Argument lists and what they amount to, as differences from the defaults.
+    #[test]
+    fn command_lines_and_their_meaning() {
+        let d = Args::default;
+        let path = |p: &str| PathBuf::from(p);
+        let table: Vec<(&[&str], Args)> = vec![
+            (&[], d()),
+            (
+                &["/var"],
+                Args {
+                    path: path("/var"),
+                    ..d()
+                },
+            ),
+            (
+                &["-x"],
+                Args {
+                    one_file_system: true,
+                    ..d()
+                },
+            ),
+            (
+                &["--one-file-system"],
+                Args {
+                    one_file_system: true,
+                    ..d()
+                },
+            ),
+            (
+                &["-a"],
+                Args {
+                    disk_usage: false,
+                    ..d()
+                },
+            ),
+            (
+                &["--apparent"],
+                Args {
+                    disk_usage: false,
+                    ..d()
+                },
+            ),
+            (
+                &["--apparent-size"],
+                Args {
+                    disk_usage: false,
+                    ..d()
+                },
+            ),
+            // A value: as the next argument, attached, or after `=`.
+            (&["-t", "8"], Args { threads: 8, ..d() }),
+            (&["-t8"], Args { threads: 8, ..d() }),
+            (&["--threads", "8"], Args { threads: 8, ..d() }),
+            (&["--threads=8"], Args { threads: 8, ..d() }),
+            (&["-t", "0"], Args { threads: 1, ..d() }),
+            (
+                &["-o", "out.json"],
+                Args {
+                    export: Some("out.json".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["-oout.json"],
+                Args {
+                    export: Some("out.json".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["-o-"],
+                Args {
+                    export: Some("-".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["-o", "-"],
+                Args {
+                    export: Some("-".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["--output=-"],
+                Args {
+                    export: Some("-".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["-f-"],
+                Args {
+                    import: Some("-".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["--file", "dump"],
+                Args {
+                    import: Some("dump".into()),
+                    ..d()
+                },
+            ),
+            (
+                &["--exclude=sub"],
+                Args {
+                    excludes: vec!["sub".into()],
+                    ..d()
+                },
+            ),
+            (
+                &["--exclude", "a", "--exclude=b=c"],
+                Args {
+                    excludes: vec!["a".into(), "b=c".into()],
+                    ..d()
+                },
+            ),
+            // An empty value is a value.
+            (
+                &["--exclude="],
+                Args {
+                    excludes: vec!["".into()],
+                    ..d()
+                },
+            ),
+            // Bundles: flags in any number, the last one may take a value.
+            (
+                &["-rx"],
+                Args {
+                    read_only: 1,
+                    one_file_system: true,
+                    ..d()
+                },
+            ),
+            (
+                &["-xo-", "/"],
+                Args {
+                    one_file_system: true,
+                    export: Some("-".into()),
+                    path: path("/"),
+                    ..d()
+                },
+            ),
+            (
+                &["-xo", "file", "/"],
+                Args {
+                    one_file_system: true,
+                    export: Some("file".into()),
+                    path: path("/"),
+                    ..d()
+                },
+            ),
+            (
+                &["-xt4"],
+                Args {
+                    one_file_system: true,
+                    threads: 4,
+                    ..d()
+                },
+            ),
+            // After a flag with a value, the rest of the bundle is the value, not more flags.
+            (
+                &["-oxr"],
+                Args {
+                    export: Some("xr".into()),
+                    ..d()
+                },
+            ),
+            // Counted, and in any spelling.
+            (
+                &["-r"],
+                Args {
+                    read_only: 1,
+                    ..d()
+                },
+            ),
+            (
+                &["-rr"],
+                Args {
+                    read_only: 2,
+                    ..d()
+                },
+            ),
+            (
+                &["-r", "--read-only"],
+                Args {
+                    read_only: 2,
+                    ..d()
+                },
+            ),
+            // The later of two contradicting flags wins.
+            (
+                &["--show-itemcount"],
+                Args {
+                    show_item_count: true,
+                    ..d()
+                },
+            ),
+            (&["--show-itemcount", "--hide-itemcount"], d()),
+            (
+                &["--hide-itemcount", "--show-itemcount"],
+                Args {
+                    show_item_count: true,
+                    ..d()
+                },
+            ),
+            (&["-t2", "-t", "3"], Args { threads: 3, ..d() }),
+            // `--` ends the options; a lone `-` never was one.
+            (
+                &["--", "-x"],
+                Args {
+                    path: path("-x"),
+                    ..d()
+                },
+            ),
+            (
+                &["-x", "--", "--help"],
+                Args {
+                    one_file_system: true,
+                    path: path("--help"),
+                    ..d()
+                },
+            ),
+            (&["--"], d()),
+            (
+                &["-"],
+                Args {
+                    path: path("-"),
+                    ..d()
+                },
+            ),
+            // Options may follow the path.
+            (
+                &["/tmp", "--show-itemcount", "-rx"],
+                Args {
+                    path: path("/tmp"),
+                    show_item_count: true,
+                    read_only: 1,
+                    one_file_system: true,
+                    ..d()
+                },
+            ),
+            (
+                &["--older-than", "30d"],
+                Args {
+                    older_than: Some(2_592_000),
+                    ..d()
+                },
+            ),
+            (
+                &["--newer-than=1y"],
+                Args {
+                    newer_than: Some(31_536_000),
+                    ..d()
+                },
+            ),
+            // ncdu's feedback modes and -e are accepted.
+            (
+                &["-0"],
+                Args {
+                    feedback: Some(0),
+                    ..d()
+                },
+            ),
+            (
+                &["-2", "-1"],
+                Args {
+                    feedback: Some(1),
+                    ..d()
+                },
+            ),
+            (
+                &["-e"],
+                Args {
+                    extended: true,
+                    ..d()
+                },
+            ),
+            (
+                &["--extended"],
+                Args {
+                    extended: true,
+                    ..d()
+                },
+            ),
+        ];
+        for (line, want) in table {
+            assert_eq!(args(line), want, "{line:?}");
+        }
+    }
+
+    /// The command lines from the EXAMPLES sections of the ncdu 1.18 and 2.x man pages.
+    #[test]
+    fn examples_of_the_ncdu_man_page_parse() {
+        let d = Args::default;
+        assert_eq!(args(&[]), d());
+        assert_eq!(
+            args(&["-x", "/"]),
+            Args {
+                one_file_system: true,
+                path: "/".into(),
+                ..d()
+            }
+        );
+        assert_eq!(
+            args(&["-1xo-", "/"]),
+            Args {
+                feedback: Some(1),
+                one_file_system: true,
+                export: Some("-".into()),
+                path: "/".into(),
+                ..d()
+            }
+        );
+        assert_eq!(
+            args(&["-f-"]),
+            Args {
+                import: Some("-".into()),
+                ..d()
+            }
+        );
+        assert_eq!(
+            args(&["-o-"]),
+            Args {
+                export: Some("-".into()),
+                ..d()
+            }
+        );
+        assert_eq!(
+            args(&["-o-", "/"]),
+            Args {
+                export: Some("-".into()),
+                path: "/".into(),
+                ..d()
+            }
+        );
+        assert_eq!(
+            args(&["-e", "-f-"]),
+            Args {
+                extended: true,
+                import: Some("-".into()),
+                ..d()
+            }
+        );
+        assert_eq!(
+            args(&["-0xo-", "/"]).feedback,
+            Some(0),
+            "the cron variant of the export example"
+        );
+    }
+
+    #[test]
+    fn help_and_version_end_parsing() {
+        for line in [
+            &["-h"][..],
+            &["--help"],
+            &["-xh"],
+            &["/tmp", "--help", "--no-such"],
+        ] {
+            assert_eq!(run(line), Ok(Parsed::Help), "{line:?}");
+        }
+        for line in [&["-V"][..], &["-v"], &["--version"], &["-rV"]] {
+            assert_eq!(run(line), Ok(Parsed::Version), "{line:?}");
+        }
+    }
+
+    /// What is wrong with a command line is said in terms of what was typed.
+    #[test]
+    fn errors_name_the_argument() {
+        let table: &[(&[&str], &str)] = &[
+            (&["--no-such"], "unknown option: --no-such"),
+            (&["--no-such=1"], "unknown option: --no-such"),
+            (&["-Z"], "unknown option: -Z"),
+            (&["-xZ"], "unknown option -Z in -xZ"),
+            (&["-t"], "-t needs a number"),
+            (&["--threads"], "--threads needs a number"),
+            (&["-xo"], "-o needs a file (or -)"),
+            (&["--exclude"], "--exclude needs a pattern"),
+            (
+                &["--older-than"],
+                "--older-than needs a duration (e.g. 30d)",
+            ),
+            (&["-t", "many"], "-t must be a number, not 'many'"),
+            (&["--threads=x"], "--threads must be a number, not 'x'"),
+            (&["--read-only=yes"], "--read-only does not take a value"),
+            (&["--help=me"], "--help does not take a value"),
+            (&["a", "b"], "more than one directory given: a and b"),
+            (
+                &["--older-than", "soon"],
+                "invalid duration 'soon' (expected e.g. 45s, 30m, 12h, 30d, 2w, 1y)",
+            ),
+            (
+                &["-X", "/nonexistent/icdu/excludes"],
+                "/nonexistent/icdu/excludes: No such file or directory (os error 2)",
+            ),
+        ];
+        for (line, want) in table {
+            assert_eq!(error(line), *want, "{line:?}");
+        }
+    }
+
+    /// `-X` reads patterns from a file: one per line, without blank lines and comments.
+    #[test]
+    fn exclude_from_reads_patterns() {
+        let file = std::env::temp_dir().join(format!("icdu_args_{}", std::process::id()));
+        std::fs::write(&file, "*.o\n\n  # a comment\n  node_modules  \n").unwrap();
+        let file_arg = file.to_string_lossy().to_string();
+        let parsed = args(&["--exclude", "first", "-X", &file_arg]);
+        assert_eq!(parsed.excludes, vec!["first", "*.o", "node_modules"]);
+        assert_eq!(args(&[&format!("-X{file_arg}")]).excludes.len(), 2);
+        assert_eq!(
+            args(&[&format!("--exclude-from={file_arg}")])
+                .excludes
+                .len(),
+            2
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    /// The table is consistent: no spelling is used twice, every negation exists and points
+    /// back, and a flag that is advertised has a long name to show.
+    #[test]
+    fn flag_table_is_consistent() {
+        let mut shorts: Vec<char> = FLAGS.iter().flat_map(|f| f.short.iter().copied()).collect();
+        let mut longs: Vec<&str> = FLAGS.iter().flat_map(|f| f.long.iter().copied()).collect();
+        let (short_count, long_count) = (shorts.len(), longs.len());
+        shorts.sort_unstable();
+        shorts.dedup();
+        longs.sort_unstable();
+        longs.dedup();
+        assert_eq!(shorts.len(), short_count, "a short flag is listed twice");
+        assert_eq!(longs.len(), long_count, "a long flag is listed twice");
+
+        for flag in FLAGS {
+            assert!(!flag.short.is_empty() || !flag.long.is_empty());
+            if !flag.help.is_empty() {
+                assert!(!flag.long.is_empty(), "advertised without a long name");
+            }
+            if let Some(negation) = flag.negation {
+                let other = FLAGS
+                    .iter()
+                    .find(|f| f.long.contains(&negation))
+                    .unwrap_or_else(|| panic!("--{negation} is not in the table"));
+                assert!(
+                    other.negation.is_some_and(|back| flag.long.contains(&back)),
+                    "--{negation} does not point back"
+                );
+            }
+        }
+    }
+
+    /// `--help` lists every advertised flag with its spellings and its value, a negation
+    /// next to the flag it undoes, and nothing the parser does not accept.
+    #[test]
+    fn help_lists_what_the_parser_accepts() {
+        let help = options_help();
+        let mentions = |long: &str| {
+            help.split(|c: char| c.is_whitespace() || c == ',')
+                .any(|word| word == long)
+        };
+        for flag in FLAGS.iter().filter(|f| !f.help.is_empty()) {
+            let long = format!("--{}", flag.long[0]);
+            assert!(mentions(&long), "{long} is missing from --help");
+            assert!(help.contains(flag.help), "{long}: its text is missing");
+            if let Some(c) = flag.short.first() {
+                assert!(help.contains(&format!("-{c}, {long}")), "{long}");
+            }
+            if let Some(value) = flag.value {
+                assert!(help.contains(&format!("{long} {value}")), "{long}");
+            }
+            if let Some(negation) = flag.negation {
+                assert!(
+                    help.contains(&format!("{long}, --{negation}")),
+                    "{long} without its negation"
+                );
+            }
+        }
+        // Every option the help names is one the parser knows.
+        for word in help.split(|c: char| c.is_whitespace() || c == ',') {
+            if let Some(name) = word.strip_prefix("--") {
+                assert!(
+                    FLAGS.iter().any(|f| f.long.contains(&name)),
+                    "--help names --{name}, which is not a flag"
+                );
+            }
+        }
+        // Flags that are accepted for compatibility only stay out of it.
+        assert!(!mentions("--extended"));
+        // No line runs past the usual 80 columns.
+        for line in help.lines() {
+            assert!(line.chars().count() <= 80, "{line}");
+        }
+    }
+
+    /// The option list in the README is the one `--help` prints.
+    #[test]
+    fn readme_lists_the_same_options() {
+        let readme = include_str!("../README.md");
+        for line in options_help().lines() {
+            assert!(readme.contains(line), "README lacks: {line}");
+        }
+    }
+
+    #[test]
+    fn parse_duration_understands_units() {
+        assert_eq!(parse_duration("45s").unwrap(), 45);
+        assert_eq!(parse_duration("30m").unwrap(), 1_800);
+        assert_eq!(parse_duration("12h").unwrap(), 43_200);
+        assert_eq!(parse_duration("30d").unwrap(), 2_592_000);
+        assert_eq!(parse_duration("2w").unwrap(), 1_209_600);
+        assert_eq!(parse_duration("1y").unwrap(), 31_536_000);
+        assert_eq!(
+            parse_duration("10").unwrap(),
+            864_000,
+            "bare numbers are days"
+        );
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("1x").is_err());
+    }
+}
