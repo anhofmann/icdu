@@ -112,34 +112,55 @@ impl<W: Write> Exporter<W> {
     }
 }
 
+/// Write the info object of one entry: the fields ncdu writes, in ncdu's order, and like
+/// ncdu only those that say something. A size of zero is left out, the inode is there for
+/// hard links only, and the device only where it differs from the parent's.
 fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> {
     let n = &tree.nodes[idx];
     write!(w, "{{\"name\":")?;
     write_json_string(tree.name_bytes(idx), w)?;
-    write!(
-        w,
-        ",\"asize\":{},\"dsize\":{},\"ino\":{},\"dev\":{}",
-        tree.own_apparent(idx),
-        tree.own_disk(idx),
-        n.ino,
-        n.dev
-    )?;
-    if n.hlink {
-        write!(w, ",\"hlnkc\":true")?;
+    // An entry that was left out has no size in a dump, as in ncdu, which does not even
+    // look at it. A reader that added one to its totals would disagree with the scan.
+    let (apparent, disk) = match n.excluded {
+        Excluded::No => (tree.own_apparent(idx), tree.own_disk(idx)),
+        _ => (0, 0),
+    };
+    if apparent > 0 {
+        write!(w, ",\"asize\":{apparent}")?;
     }
-    if matches!(n.kind, NodeKind::Link | NodeKind::Other) {
-        write!(w, ",\"notreg\":true")?;
+    if disk > 0 {
+        write!(w, ",\"dsize\":{disk}")?;
+    }
+    // A reader takes a missing `dev` to be the parent's; the root has no parent.
+    if n.parent
+        .is_none_or(|parent| tree.nodes[parent].dev != n.dev)
+    {
+        write!(w, ",\"dev\":{}", n.dev)?;
+    }
+    if n.hlink {
+        write!(w, ",\"ino\":{},\"hlnkc\":true", n.ino)?;
+        if let Some(nlink) = tree.nlink(idx) {
+            write!(w, ",\"nlink\":{nlink}")?;
+        }
     }
     // A directory whose listing has not arrived yet (a dump taken while the scan is still
     // running) is written as a read error too. The format has no word for "not read yet", and
     // this one makes every reader show the directory as incomplete instead of as empty.
-    if n.read_error || tree.is_unread(idx) {
+    let read_error = n.read_error || tree.is_unread(idx);
+    if read_error {
         write!(w, ",\"read_error\":true")?;
     }
+    // "Not a regular file" is for symlinks and special files. An entry that could not be
+    // examined, or was left out, is of unknown type, and ncdu does not flag those.
+    let special = matches!(n.kind, NodeKind::Link | NodeKind::Other);
+    if special && !read_error && n.excluded == Excluded::No {
+        write!(w, ",\"notreg\":true")?;
+    }
     match n.excluded {
-        Excluded::Pattern => write!(w, ",\"excluded\":\"pattern\"")?,
+        // The mtime filters are icdu's own. The format has no value for them, and a reader
+        // takes an unknown value for a pattern anyway.
+        Excluded::Pattern | Excluded::Age => write!(w, ",\"excluded\":\"pattern\"")?,
         Excluded::OtherFs => write!(w, ",\"excluded\":\"otherfs\"")?,
-        Excluded::Age => write!(w, ",\"excluded\":\"age\"")?,
         Excluded::Kernfs => write!(w, ",\"excluded\":\"kernfs\"")?,
         Excluded::FrmLink => write!(w, ",\"excluded\":\"frmlink\"")?,
         Excluded::No => {}
@@ -1045,6 +1066,56 @@ mod tests {
         assert_eq!(t.path_of(data), "/fixture/docs/deep/data.bin");
     }
 
+    /// A dump without its header (program name, version, timestamp) and without the line
+    /// breaks ncdu puts between entries.
+    fn entries(dump: &str) -> String {
+        let meta_end = dump.find('}').unwrap();
+        dump[meta_end..].replace('\n', "")
+    }
+
+    /// Read ncdu's dump and write it back: every entry comes out with the same fields, the
+    /// same values and in the same order as ncdu wrote it. So what icdu writes is what ncdu
+    /// would have written, and nothing ncdu recorded is lost on the way through.
+    #[test]
+    fn export_writes_what_ncdu_writes() {
+        let t = import(NCDU_1_18.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        export(&t, &mut out).unwrap();
+        let ours = String::from_utf8(out).unwrap();
+        assert_eq!(entries(&ours), entries(NCDU_1_18));
+    }
+
+    /// The fields that are only written when they say something.
+    #[test]
+    fn export_leaves_out_what_goes_without_saying() {
+        let json = r#"[1,2,{},[{"name":"/r","asize":4096,"dsize":4096,"dev":7},
+            {"name":"empty"},
+            {"name":"plain","asize":5,"dsize":512,"ino":100},
+            {"name":"linked","asize":5,"dsize":512,"ino":101,"hlnkc":true,"nlink":2},
+            [{"name":"mnt","dev":8},{"name":"inside","asize":1}],
+            {"name":"aged","asize":9,"excluded":"age"}]]"#;
+        let t = import(json.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        export(&t, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        for written in [
+            // The root always says which device it is on.
+            r#"[{"name":"/r","asize":4096,"dsize":4096,"dev":7}"#,
+            // No sizes of zero, no inode without a hard link, no device like the parent's.
+            r#"{"name":"empty"}"#,
+            r#"{"name":"plain","asize":5,"dsize":512}"#,
+            r#"{"name":"linked","asize":5,"dsize":512,"ino":101,"hlnkc":true,"nlink":2}"#,
+            // A device that differs is written, and holds for what is below.
+            r#"[{"name":"mnt","dev":8},{"name":"inside","asize":1}]"#,
+            // icdu's mtime filter is not a value of the format, and what was left out has no
+            // size.
+            r#"{"name":"aged","excluded":"pattern"}"#,
+        ] {
+            assert!(text.contains(written), "{written}\nnot in\n{text}");
+        }
+        assert!(!text.contains("\"age\""));
+    }
+
     /// An entry without `dev` is on the device of its parent. Hard links are told apart by
     /// device and inode, so two files with the same inode number on different devices are two
     /// files; reading the missing `dev` as 0 merged them.
@@ -1117,10 +1188,10 @@ mod tests {
         export(&t, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         for written in [
-            r#""name":"o","asize":0,"dsize":0,"ino":0,"dev":0,"excluded":"otherfs""#,
-            r#""name":"old","asize":0,"dsize":0,"ino":0,"dev":0,"excluded":"otherfs""#,
-            r#""excluded":"kernfs""#,
-            r#""excluded":"frmlink""#,
+            r#"{"name":"o","excluded":"otherfs"}"#,
+            r#"{"name":"old","excluded":"otherfs"}"#,
+            r#"{"name":"k","excluded":"kernfs"}"#,
+            r#"{"name":"f","excluded":"frmlink"}"#,
         ] {
             assert!(text.contains(written), "{written} not in {text}");
         }

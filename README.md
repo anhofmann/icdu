@@ -320,8 +320,11 @@ leaves the rest on disk. Any other key disarms the prompt.
 
 ### ncdu JSON compatibility
 
-`-o` writes the ncdu export format (`[1, 2, {meta}, <root>]`, per-item `asize`/`dsize`, `hlnkc`,
-`notreg`, `excluded`, `read_error`), readable by ncdu and other tools. `-f` reads the same format
+`-o` writes the ncdu export format (`[1, 2, {meta}, <root>]`), readable by ncdu and other tools,
+with the fields ncdu writes and only where they say something: `asize` and `dsize` unless zero,
+`dev` where it differs from the parent's, `ino`, `hlnkc` and `nlink` for hard links,
+`read_error`, `notreg`, `excluded`. For the same tree the dumps of icdu and ncdu 1.18 agree
+entry for entry. `-f` reads the same format
 (including dumps produced by ncdu itself), re-deriving hard-link dedup so totals match a live scan.
 Names are read and written byte for byte, as ncdu does, so a name that is not valid UTF-8
 survives an import and a re-export unchanged.

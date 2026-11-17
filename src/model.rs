@@ -249,6 +249,9 @@ impl Tree {
             if let Some(raw) = nn.raw_name {
                 self.raw_names.insert(idx, raw);
             }
+            if nn.hlink {
+                self.set_nlink(idx, nn.nlink);
+            }
             let read_error = nn.error.is_some();
             if let Some(error) = nn.error {
                 self.errors.insert(idx, error);
@@ -855,6 +858,7 @@ mod tests {
             dev: 1,
             ino: id,
             hlink: false,
+            nlink: 1,
             excluded: Excluded::No,
             error: None,
             dir_id: Some(id),
@@ -1543,6 +1547,7 @@ mod tests {
     fn link(name: &str, ino: u64) -> NewNode {
         NewNode {
             hlink: true,
+            nlink: 2,
             apparent: 1000,
             disk: 1000,
             ..file(name, ino)
@@ -1748,10 +1753,12 @@ mod tests {
         // Two links to one inode: the second is the duplicate.
         let counted = NewNode {
             hlink: true,
+            nlink: 2,
             ..file("f", 10)
         };
         let shared = NewNode {
             hlink: true,
+            nlink: 2,
             ..file("dup", 10)
         };
         let excluded_dir = NewNode {

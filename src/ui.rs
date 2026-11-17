@@ -1204,6 +1204,7 @@ mod tests {
             dev: 1,
             ino: id,
             hlink: false,
+            nlink: 1,
             excluded,
             error: None,
             dir_id: (excluded == Excluded::No).then_some(id),

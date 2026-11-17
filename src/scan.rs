@@ -49,9 +49,11 @@ pub struct NewNode {
     pub disk: u64,
     pub dev: u64,
     pub ino: u64,
-    /// A file with more than one link. Which of an inode's links is counted is the tree's
-    /// decision (see `Tree::graft`), so it holds across scan generations.
+    /// An entry other than a directory with more than one link. Which of an inode's links is
+    /// counted is the tree's decision (see `Tree::graft`), so it holds across scan generations.
     pub hlink: bool,
+    /// Its link count (`st_nlink`); 1 where it is not known.
+    pub nlink: u32,
     pub excluded: Excluded,
     /// Why the entry could not be examined (its `lstat` failed), if it could not. Such an
     /// entry is shown with the read-error flag and without a size.
@@ -665,6 +667,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                     dev: 0,
                     ino: 0,
                     hlink: false,
+                    nlink: 1,
                     excluded: Excluded::No,
                     error: Some(e.to_string().into()),
                     dir_id: None,
@@ -688,7 +691,10 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         let apparent = meta.len();
         let disk = meta.blocks().saturating_mul(512);
         let mtime = meta.mtime();
-        let hlink = matches!(kind, NodeKind::File) && meta.nlink() > 1;
+        let nlink = u32::try_from(meta.nlink()).unwrap_or(u32::MAX);
+        // Anything but a directory can have several names: files, and symlinks, devices,
+        // sockets and fifos too. (A directory's link count is about its subdirectories.)
+        let hlink = !matches!(kind, NodeKind::Dir) && nlink > 1;
 
         // Determine exclusion / whether to recurse.
         let mut excluded = Excluded::No;
@@ -717,6 +723,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
             dev,
             ino,
             hlink,
+            nlink,
             excluded,
             error: None,
             dir_id,
@@ -1694,6 +1701,58 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "workers are stuck");
             thread::sleep(std::time::Duration::from_millis(5));
         }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The scan records the link count of entries that have more than one name, so that a
+    /// dump can carry it (`nlink`), and writes such a dump the way ncdu does.
+    #[test]
+    fn link_counts_are_recorded_and_exported() {
+        let base = std::env::temp_dir().join(format!("icdu_nlink_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("one"), b"12345").unwrap();
+        fs::hard_link(base.join("one"), base.join("sub/two")).unwrap();
+        fs::hard_link(base.join("one"), base.join("sub/three")).unwrap();
+        fs::write(base.join("plain"), b"x").unwrap();
+        std::os::unix::fs::symlink("plain", base.join("link")).unwrap();
+
+        let tree = scan_tree(&base, 2);
+        let named = |name: &str| tree.nodes.iter().position(|n| n.name == name).unwrap();
+        for name in ["one", "two", "three"] {
+            assert!(tree.nodes[named(name)].hlink, "{name}");
+            assert_eq!(tree.nlink(named(name)), Some(3), "{name}");
+        }
+        assert!(!tree.nodes[named("plain")].hlink);
+        assert_eq!(tree.nlink(named("plain")), None);
+        // A directory has several links too, but they are not hard links to a file.
+        assert!(!tree.nodes[named("sub")].hlink);
+        assert_eq!(tree.nlink(named("sub")), None);
+
+        let mut out = Vec::new();
+        crate::dump::export(&tree, &mut out).unwrap();
+        let dump = String::from_utf8(out).unwrap();
+        let ino = tree.nodes[named("one")].ino;
+        for name in ["one", "two", "three"] {
+            let entry = format!(
+                r#"{{"name":"{name}","asize":5,"dsize":4096,"ino":{ino},"hlnkc":true,"nlink":3}}"#
+            );
+            // The block size is the filesystem's; only compare where it is the usual 4096.
+            if tree.own_disk(named(name)) == 4096 {
+                assert!(dump.contains(&entry), "{entry}\nnot in\n{dump}");
+            }
+        }
+        assert!(dump.contains(r#"{"name":"plain","asize":1,"#), "{dump}");
+        assert!(!dump.contains(&format!(
+            r#""name":"plain","asize":1,"dsize":{},"ino""#,
+            4096
+        )));
+        assert!(dump.contains(r#""name":"link","asize":5,"#) && dump.contains(r#""notreg":true"#));
+        assert_eq!(
+            dump.matches("\"dev\":").count(),
+            1,
+            "only the root says its device"
+        );
         fs::remove_dir_all(&base).unwrap();
     }
 
