@@ -65,6 +65,9 @@ Three rules cause most surprises:
   cargo build --release && tools/sync-readme-options.py
   ```
 
+  and describe the flag in the manual page, `doc/icdu.1`. A test fails if the page lacks an
+  option or names one that does not exist.
+
 Where ncdu has an equivalent (a key, a flag, a field of the dump), icdu does what ncdu does.
 If you change such behaviour, say in the pull request how ncdu behaves and how you found out.
 

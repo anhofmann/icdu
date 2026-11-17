@@ -7,6 +7,7 @@ Writes OUT_DIR/icdu-VERSION-TARGET.tar.gz (the version is the one in Cargo.toml)
 its path. The archive holds one directory, icdu-VERSION-TARGET, with:
 
     icdu          the binary
+    icdu.1        the manual page
     LICENSE       the licence asks for its text to go with every copy
     README.md
     CHANGELOG.md
@@ -37,7 +38,7 @@ def main():
     ).stdout.strip()
 
     name = f"icdu-{version}-{target}"
-    files = [(binary, "icdu", 0o755)]
+    files = [(binary, "icdu", 0o755), (os.path.join(top, "doc", "icdu.1"), "icdu.1", 0o644)]
     files += [(os.path.join(top, doc), doc, 0o644) for doc in ("LICENSE", "README.md", "CHANGELOG.md")]
 
     os.makedirs(out_dir, exist_ok=True)

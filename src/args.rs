@@ -2364,6 +2364,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The manual page documents every option the parser knows, under the name `--help`
+    /// uses, and no option the parser does not know. A flag added to the table and not to
+    /// the page fails here.
+    #[test]
+    fn man_page_lists_the_same_options() {
+        // The page writes a dash as `\-`.
+        let page = include_str!("../doc/icdu.1").replace("\\-", "-");
+        // The words of the page that are options: after a blank, a quote or a bracket.
+        let words: Vec<&str> = page
+            .split(|c: char| c.is_whitespace() || "\"',()[]\\".contains(c))
+            .map(|word| word.trim_end_matches(['.', ',', ':', ';']))
+            .collect();
+        for flag in FLAGS {
+            let long = flag.long.first().map(|name| format!("--{name}"));
+            let short = flag.short.first().map(|c| format!("-{c}"));
+            for spelling in long.iter().chain(short.iter()) {
+                // `--sort=name-desc` and `-o-` count as a mention of `--sort` and `-o`.
+                let named = words.iter().any(|word| {
+                    word == spelling
+                        || word
+                            .strip_prefix(spelling.as_str())
+                            .is_some_and(|rest| rest.starts_with('=') || rest == "-")
+                });
+                assert!(named, "doc/icdu.1 does not mention {spelling}");
+            }
+        }
+        for word in &words {
+            let Some(name) = word.strip_prefix("--") else {
+                continue;
+            };
+            let name = name.split('=').next().unwrap_or(name);
+            if name.is_empty() {
+                continue; // `--` on its own ends the options
+            }
+            assert!(
+                FLAGS.iter().any(|f| f.long.contains(&name)),
+                "doc/icdu.1 names --{name}, which is not an option"
+            );
+        }
+    }
+
     /// The table is consistent: no spelling is used twice, every negation exists and points
     /// back, and a flag that is advertised has a long name to show.
     #[test]

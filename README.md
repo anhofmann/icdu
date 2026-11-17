@@ -145,6 +145,8 @@ something has a counterpart that switches it back (`--apparent-size` / `--disk-u
 64); ncdu 2 uses one unless told otherwise.
 
 Options you always want can go into a config file; see [Configuration](#configuration).
+Everything is also in the manual page, [`doc/icdu.1`](doc/icdu.1) (`man ./doc/icdu.1`; the
+release archives carry it as `icdu.1`).
 
 Examples:
 
@@ -613,7 +615,8 @@ shell. The binaries are self-contained:
 Every [release](https://github.com/anhofmann/icdu/releases) has four archives named
 `icdu-<version>-<target>.tar.gz`, for `x86_64-unknown-linux-musl`,
 `aarch64-unknown-linux-musl`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. Each unpacks to
-one directory with the `icdu` binary, the licence, this README and the changelog. (Releases up
+one directory with the `icdu` binary, its manual page (`icdu.1`), the licence, this README and
+the changelog. (Releases up
 to 0.4.1 consist of bare binaries named `rcdu-portable-<os>-<arch>`.)
 
 - **`sha256sums.txt`** tells you that a download arrived intact. It lies next to the archives,

@@ -50,7 +50,7 @@ jobs:
         if: matrix.native
         run: |
           mkdir unpacked && tar -xzf "$ARCHIVE" -C unpacked --strip-components 1
-          ls unpacked/LICENSE unpacked/README.md unpacked/CHANGELOG.md
+          ls unpacked/icdu.1 unpacked/LICENSE unpacked/README.md unpacked/CHANGELOG.md
           unpacked/icdu --version
           mkdir -p tryout/sub && echo hello > tryout/sub/file
           unpacked/icdu --ignore-config -o - tryout | grep -q '"name":"file"'

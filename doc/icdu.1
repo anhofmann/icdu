@@ -1,0 +1,584 @@
+.\" icdu.1 - the manual page of icdu. Written by hand, in the layout of ncdu's page.
+.\" A test (args::tests::man_page_lists_the_same_options) compares its options with the
+.\" program's.
+.TH ICDU 1 "2026-11-17" "icdu" "User Commands"
+.SH NAME
+icdu \- disk usage explorer that can be browsed and searched while it scans
+.SH SYNOPSIS
+.B icdu
+.RI [ options ]
+.RI [ directory ]
+.SH DESCRIPTION
+.B icdu
+shows where the space on a disk has gone: a list of the entries of a directory, largest
+first, that can be walked through, sorted, searched and cleaned up.
+.PP
+It does not wait for the scan to finish.
+The list is on screen at once, sizes fill in and add up while the scan runs, and the
+directory that is being looked at is scanned next.
+.B /
+searches the whole tree by name, including what the scan has only just reached.
+.PP
+icdu is compatible with
+.BR ncdu (1):
+it has ncdu's keys and options, reads ncdu's configuration files, and reads and writes
+ncdu's JSON export format.
+Where it differs is listed under
+.BR "DIFFERENCES FROM NCDU" .
+.PP
+Without a
+.IR directory ,
+the current one is scanned.
+.SH OPTIONS
+Short options can be bundled
+.RB ( \-xe ),
+and a value can be attached to its option or follow it
+.RB ( \-o\- ,
+.BR "\-o file" ,
+.BR \-\-exclude=tmp ,
+.BR "\-\-exclude tmp" ).
+.B \-\-
+ends the options.
+Of two options that contradict each other the later one wins; every option that switches
+something has a counterpart that switches it back.
+.SS Mode selection
+.TP
+.BR \-h ", " \-\-help
+Print a summary of the options and keys, and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version, and exit.
+.TP
+.BR \-f ", " \-\-file " \fIFILE\fR"
+Browse a tree from an export file instead of scanning.
+.B \-
+reads standard input.
+The file is not the local filesystem: delete, shell, open and rescan are off.
+.TP
+.BR \-o ", " \-\-output " \fIFILE\fR"
+Scan, write the tree to
+.I FILE
+in ncdu's JSON format, and exit without opening the browser.
+.B \-
+writes to standard output.
+With
+.B \-f
+this converts a dump.
+.TP
+.BR \-e ", " \-\-extended ", " \-\-no\-extended
+Also record owner, group, mode and modification time of every entry.
+They are shown by
+.B m
+and
+.BR i ,
+can be sorted by with
+.BR M ,
+and are written to and read from export files.
+As in ncdu the option has to be given when reading such a file as well.
+It costs 32 bytes of memory per entry.
+.TP
+.B \-\-ignore\-config
+Do not read the configuration files.
+.SS Scan options
+These have no effect with
+.BR \-f .
+.TP
+.BR \-x ", " \-\-one\-file\-system ", " \-\-cross\-file\-system
+Do not enter directories on other filesystems than the one the scan started on.
+They are listed, flagged
+.BR > ,
+and not counted.
+.TP
+.BR \-\-exclude " \fIPATTERN\fR"
+Leave out entries that match the shell pattern.
+The pattern is tried against the whole path of an entry and against every tail of the path
+that starts after a slash, so
+.B node_modules
+excludes every entry of that name,
+.B src/build
+only a
+.B build
+inside a
+.BR src ,
+and
+.B /var/cache
+that directory.
+.B *
+and
+.B ?
+also match a slash.
+Can be given several times.
+Excluded entries are listed, flagged
+.BR < ,
+neither entered nor counted.
+.TP
+.BR \-X ", " \-\-exclude\-from " \fIFILE\fR"
+Read patterns from
+.IR FILE ,
+one per line, each taken as it stands.
+.TP
+.BR \-\-exclude\-caches ", " \-\-include\-caches
+Leave out directories that hold a
+.B CACHEDIR.TAG
+file with the signature of the Cache Directory Tagging Specification.
+.TP
+.BR \-\-exclude\-kernfs ", " \-\-include\-kernfs
+Leave out the Linux kernel's pseudo filesystems (proc, sysfs, cgroup, debugfs, devpts and
+the like), wherever they are mounted.
+They are flagged
+.BR ^ .
+No effect on other systems.
+.TP
+.BR \-L ", " \-\-follow\-symlinks ", " \-\-no\-follow\-symlinks
+Count a symlink to a file as that file.
+Each such link counts on its own.
+Symlinks to directories are never followed.
+Deleting such an entry removes the link and not the file.
+.TP
+.BR \-\-older\-than " \fIDUR\fR, " \-\-newer\-than " \fIDUR\fR"
+Leave out entries that were last modified more than, or less than,
+.I DUR
+ago.
+.I DUR
+is a number with a unit:
+.BR s ,
+.BR m ,
+.BR h ,
+.BR d ,
+.BR w
+or
+.BR y ;
+without a unit, days.
+Not in ncdu.
+.TP
+.BR \-t ", " \-\-threads " \fIN\fR"
+The number of threads that read directories.
+The default is four per processor core, at least 4 and at most 64.
+Fewer are better on a single spinning disk.
+.SS Export options
+.TP
+.BR \-0 ", " \-1 ", " \-2
+What to show while scanning:
+nothing
+.RB ( \-0 ,
+the default with
+.BR "\-o \-" ),
+one line of progress
+.RB ( \-1 ,
+the default with
+.BR "\-o \fIFILE\fR" ),
+or the browser
+.RB ( \-2 ,
+the default otherwise).
+.B \-0
+and
+.B \-1
+without
+.B \-o
+scan first and open the browser afterwards.
+.SS Interface options
+.TP
+.BR \-q ", " \-\-slow\-ui\-updates ", " \-\-fast\-ui\-updates
+Redraw the screen every two seconds while scanning instead of ten times a second.
+Useful over a slow remote connection.
+.TP
+.BR \-r ", " \-\-read\-only
+Turn the delete key off.
+Given twice
+.RB ( \-rr ),
+also the shell, the opener and the export key: nothing is left that changes the filesystem
+or runs a program.
+.TP
+.BR \-\-disable\-delete ", " \-\-enable\-delete
+Turn the delete key
+.RB ( d )
+off, or on.
+.TP
+.BR \-\-disable\-shell ", " \-\-enable\-shell
+Turn the shell
+.RB ( b )
+and the opener
+.RB ( o )
+off, or on.
+.TP
+.BR \-\-disable\-refresh ", " \-\-enable\-refresh
+Turn rescanning
+.RB ( r )
+off, or on.
+.TP
+.BR \-\-delete\-command " \fICMD\fR"
+Delete by running
+.I CMD
+instead of removing the entry.
+The command is run by
+.B /bin/sh
+with the path of the entry as its last argument and in the variable
+.BR NCDU_DELETE_PATH ,
+with the terminal, in the directory icdu was started in.
+Afterwards icdu looks at what is left.
+For example
+.B "\-\-delete\-command 'gio trash \-\-'"
+or
+.BR "\-\-delete\-command 'rm \-ri \-\-'" .
+.TP
+.BR \-\-confirm\-quit ", " \-\-no\-confirm\-quit
+Ask before quitting.
+.TP
+.BR \-\-confirm\-delete ", " \-\-no\-confirm\-delete
+Ask before deleting (the default), or do not.
+.TP
+.BR \-a ", " \-\-apparent\-size ", " \-\-disk\-usage
+Show the apparent sizes of files instead of the space they take on disk.
+.TP
+.BR \-\-si ", " \-\-no\-si
+Show sizes in powers of 1000 (kB, MB, GB) instead of 1024 (KiB, MiB, GiB).
+.TP
+.BR \-\-color " \fISCHEME\fR"
+.BR off ,
+.B dark
+or
+.BR dark\-bg .
+Colours are on unless the environment variable
+.B NO_COLOR
+is set.
+icdu has one colour scheme, for which both of ncdu's names stand.
+.TP
+.BR \-\-show\-hidden ", " \-\-hide\-hidden
+List entries whose name starts with a dot and excluded entries, or do not.
+Hidden entries are still counted.
+.TP
+.BR \-\-show\-graph ", " \-\-hide\-graph
+Show the bar that compares each entry with the largest one, or do not.
+.TP
+.BR \-\-show\-percent ", " \-\-hide\-percent
+Show each entry's share of its directory, or do not.
+.TP
+.BR \-\-graph\-style " \fISTYLE\fR"
+Draw the bar with
+.B hash
+characters, or with block characters to half a cell
+.RB ( half\-block )
+or to an eighth
+.RB ( eighth\-block ).
+.TP
+.BR \-\-show\-itemcount ", " \-\-hide\-itemcount
+Show the number of entries below each directory, or do not.
+.TP
+.BR \-\-show\-mtime ", " \-\-hide\-mtime
+Show the modification time, for a directory the latest one below it, or do not.
+Needs
+.BR \-e .
+.TP
+.BR \-\-sort " \fICOLUMN\fR"
+Sort by
+.B disk\-usage
+(the default),
+.BR apparent\-size ,
+.BR name ,
+.B itemcount
+or
+.BR mtime .
+.B \-asc
+or
+.B \-desc
+after the name sets the direction, as in
+.BR \-\-sort=name\-desc .
+.TP
+.BR \-\-group\-directories\-first ", " \-\-no\-group\-directories\-first
+List directories before everything else.
+.TP
+.BR \-\-disable\-natsort ", " \-\-enable\-natsort
+Order names byte by byte.
+By default a run of digits counts as the number it spells, so that
+.B file2
+comes before
+.BR file10 .
+.SH CONFIGURATION
+Default options are read from configuration files, one option per line, written as on the
+command line, with the value of an option after it on the same line and taken as it stands.
+Lines that start with
+.B #
+and empty lines are ignored.
+A line that starts with
+.B @
+may fail without that being an error.
+In the file name of
+.BR \-X ,
+.B ~/
+is the home directory.
+.PP
+Four files are read, each overriding the ones before it, and the command line overrides
+them all:
+.PP
+.RS
+.nf
+/etc/ncdu.conf
+$XDG_CONFIG_HOME/ncdu/config    (~/.config/ncdu/config)
+/etc/icdu.conf
+$XDG_CONFIG_HOME/icdu/config    (~/.config/icdu/config)
+.fi
+.RE
+.PP
+The first two are ncdu's own, so that a setup made for ncdu applies.
+What icdu cannot use in them is reported and passed over.
+A mistake in one of icdu's own files is an error.
+.PP
+Example:
+.PP
+.RS
+.nf
+# Always record owner, mode and time
+\-e
+# Leave out .git directories
+\-\-exclude .git
+# This file need not exist
+@\-\-exclude\-from ~/.ncduexcludes
+.fi
+.RE
+.SH KEYS
+.TP
+.B ?
+Help.
+.TP
+.BR j ", " k ", " down ", " up
+Move the selection.
+.TP
+.BR PgUp ", " PgDn ", " Ctrl\-U ", " Ctrl\-D
+Move by a page.
+.TP
+.BR Home ", " End ", " G
+Jump to the first or the last entry.
+.TP
+.BR l ", " Enter ", " right
+Enter the selected directory.
+.TP
+.BR h ", " < ", " Backspace ", " left
+Go to the parent directory.
+.TP
+.B /
+Search by name in the whole tree.
+Matches are listed as the query is typed, largest first.
+.B Enter
+goes to the selected one,
+.B Tab
+limits the search to the directory on screen,
+.B Esc
+closes it.
+.TP
+.BR ] ", " [
+Go to the next or the previous match of the last search.
+.TP
+.BR s ", " n ", " C ", " M
+Sort by size, name, item count or modification time.
+The key of the active column reverses the order.
+.B M
+needs
+.BR \-e .
+.TP
+.B t
+Directories before files, or not.
+.TP
+.B a
+Switch between disk usage and apparent size.
+.TP
+.B e
+Show or hide hidden and excluded entries.
+.TP
+.B g
+Bar and percentage: both, neither, the bar, the percentage.
+.TP
+.B c
+Show or hide the item counts.
+.TP
+.B m
+Show or hide the modification times.
+Needs
+.BR \-e .
+.TP
+.B i
+Details of the selected entry.
+.TP
+.B T
+The largest files below the directory on screen.
+Not in ncdu.
+.TP
+.BR x ", " !
+Jump to the next entry that could not be read.
+Not in ncdu.
+.TP
+.B d
+Delete the selected entry, after a question.
+A directory can only be deleted when all of it has been scanned.
+.TP
+.B r
+Scan the directory on screen again.
+.TP
+.B b
+Start a shell in the directory on screen.
+.TP
+.B o
+Open the selected entry with the system's default application.
+Not in ncdu.
+.TP
+.B E
+Write the tree to
+.B icdu\-dump.json
+in the current directory, in the export format.
+Not in ncdu.
+.TP
+.BR Ctrl\-L ", " Ctrl\-Z
+Redraw the screen; suspend icdu.
+.TP
+.BR q ", " Ctrl\-C
+Quit.
+.SH FILE FLAGS
+Each row starts with a flag:
+.TP
+.B !
+The directory or entry could not be read.
+.TP
+.B .
+Something further down could not be read, so the size may be too small.
+.TP
+.B <
+Excluded: by a pattern, as a cache directory, or by the time filters.
+.TP
+.B >
+A directory on another filesystem
+.RB ( \-x ).
+.TP
+.B ^
+A kernel filesystem
+.RB ( \-\-exclude\-kernfs ).
+.TP
+.B H
+A hard link whose file is counted at another of its names.
+.TP
+.B @
+Neither a file nor a directory: a symlink, device, socket or fifo.
+.TP
+.B e
+An empty directory.
+.TP
+.B F
+A firmlink (only in export files written by ncdu on macOS).
+.SH EXAMPLES
+Scan and browse the current directory:
+.PP
+.RS
+.B icdu
+.RE
+.PP
+A whole filesystem, without what is mounted below it:
+.PP
+.RS
+.B "icdu \-x /"
+.RE
+.PP
+Scan now, look later:
+.PP
+.RS
+.nf
+.B "icdu \-1xo\- / | gzip > export.gz"
+.B "zcat export.gz | icdu \-f\-"
+.fi
+.RE
+.PP
+From a cron job, use
+.B \-0
+in place of
+.B \-1
+to keep it silent.
+.PP
+Scan a remote machine and browse the result here.
+ncdu on the remote side works as well as icdu:
+.PP
+.RS
+.B "ssh \-C user@host icdu \-o\- / | icdu \-f\-"
+.RE
+.PP
+Move to the trash instead of deleting:
+.PP
+.RS
+.B "icdu \-\-delete\-command 'gio trash \-\-'"
+.RE
+.SH ENVIRONMENT
+.TP
+.B NCDU_SHELL
+The command the shell key runs, in place of
+.BR SHELL .
+Without either,
+.BR /bin/sh .
+.TP
+.B NCDU_LEVEL
+Set to 1 in the shell that icdu starts, or to one more than icdu itself was started with.
+.TP
+.B NO_COLOR
+If set, icdu starts without colours.
+.TP
+.BR HOME ", " XDG_CONFIG_HOME
+Where the configuration files are looked for.
+.SH EXIT STATUS
+0 on success, 1 if the command line or a configuration file is wrong, or a scan, an export
+or an import fails.
+.SH HARD LINKS
+A file with several names is counted once: at the first of its names that the scan comes
+across.
+The other names are listed with their size, flagged
+.BR H ,
+and add nothing to any total.
+When the counted name is deleted and another one is still in the tree, the size moves to
+that one.
+.SH DIFFERENCES FROM NCDU
+.SS What icdu adds
+The browser while the scan runs, the search
+.RB ( / ,
+.BR ] ,
+.BR [ ),
+the largest files
+.RB ( T ),
+the jump to the next read error
+.RB ( x ),
+opening an entry
+.RB ( o ),
+the export from the browser
+.RB ( E ),
+and the time filters
+.RB ( \-\-older\-than ,
+.BR \-\-newer\-than ).
+.SS What icdu does not have
+The binary export format of ncdu 2 and its compression:
+.BR \-O ,
+.BR \-c ,
+.BR \-\-compress ,
+.BR \-\-no\-compress ,
+.B \-\-compress\-level
+and
+.B \-\-export\-block\-size
+are refused, and such files cannot be read.
+A zstd or gzip compressed JSON export can be piped in:
+.BR "zstd \-dc FILE | icdu \-f\-" .
+.PP
+The column for sizes shared through hard links
+.RB ( u ,
+.BR \-\-shared\-column ).
+The option is accepted and ignored.
+.SS What is different
+Times are shown in UTC.
+.PP
+Bar and percentage are both shown by default; ncdu shows the bar only.
+.PP
+The scan uses many threads by default
+.RB ( \-t );
+ncdu 2 uses one.
+.PP
+Deleting, shell, opening and rescanning are always off for an imported file, also with
+.BR \-\-enable\-delete .
+.PP
+Deleting removes only what the scan listed, entry by entry.
+Something that appeared in a directory after the scan stays, and the directory with it.
+.SH SEE ALSO
+.BR ncdu (1),
+.BR du (1)
+.PP
+https://github.com/anhofmann/icdu
