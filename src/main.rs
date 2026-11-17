@@ -434,6 +434,11 @@ fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::i
     terminal.clear()
 }
 
+/// How long a frame may spend taking scan results into the tree. With drawing on top, this
+/// keeps a frame well under the 80 ms poll interval while leaving most of the time, when
+/// there is a backlog, to working it off.
+const SCAN_TIME_PER_FRAME: Duration = Duration::from_millis(12);
+
 /// The most input events handled between two frames.
 const MAX_EVENTS_PER_FRAME: usize = 256;
 
@@ -464,10 +469,11 @@ fn run(
             terminal.clear()?;
         }
 
-        // Drain whatever the scanners produced since the last frame. `poll_scans` caps the
-        // batch so a huge filesystem can't starve input handling between redraws, and folds
-        // stream completion (initial scan, subtree rescans) into the app state.
-        app.poll_scans(20_000);
+        // Take in what the scanners produced since the last frame, for a few milliseconds
+        // at most: a scan that delivers faster than the tree can absorb must not starve input
+        // handling and drawing. Stream completion (initial scan, subtree rescans) is folded
+        // into the app state here too.
+        app.poll_scans_until(usize::MAX, Some(Instant::now() + SCAN_TIME_PER_FRAME));
 
         // Advance the whole-tree search (if its popup is open) by one slice, right after the
         // new batches landed so live matches show up this frame.
@@ -500,7 +506,8 @@ fn run(
         // and wake up in time for a debounced search query.
         let busy = app.scanning || app.is_deleting();
         let mut timeout = Duration::from_millis(if busy { 80 } else { 250 });
-        if app.find_busy() {
+        if app.find_busy() || app.scan_backlog() {
+            // More to do right away: check for input, then carry on.
             timeout = Duration::ZERO;
         } else if let Some(due) = app.find_due() {
             timeout = timeout.min(due.saturating_duration_since(Instant::now()));

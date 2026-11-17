@@ -28,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use compact_str::CompactString;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 
 use crate::glob;
 use crate::model::{Excluded, NodeKind};
@@ -60,13 +60,120 @@ pub struct NewNode {
     pub dir_id: Option<u64>,
 }
 
-/// One message per directory we finished reading.
+/// Entries of one directory, on their way to the tree. A directory usually arrives as one
+/// batch. One with very many entries arrives in several, so that its first entries are on
+/// screen while the rest is still being read, and no single message holds millions of entries.
 pub struct Batch {
     pub parent_id: u64,
     pub nodes: Vec<NewNode>,
     /// Set if the directory could not be read, or not to the end (e.g. permission denied, an
     /// I/O error halfway through). `nodes` then holds what was listed before the error.
     pub error: Option<String>,
+    /// More batches for this directory follow. The directory counts as read with the batch
+    /// that says `false`.
+    pub more: bool,
+}
+
+/// The most entries of one directory sent in one batch.
+pub const BATCH_ENTRIES: usize = 4096;
+
+/// The most entries a scan may have on their way to the UI. Beyond this the workers wait.
+/// The UI takes batches off every frame, so in normal operation the limit is never reached;
+/// it holds memory down when the UI is busy elsewhere for a while (in the shell, say).
+/// About 100 bytes per entry: a few hundred megabytes at most.
+const QUEUED_ENTRIES: usize = 2_000_000;
+
+/// Counts the entries that have been sent and not yet received, and makes senders wait while
+/// there are too many. The channel itself is unbounded: its capacity would count batches,
+/// and a batch can hold one entry or thousands.
+struct Gate {
+    limit: usize,
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+struct GateState {
+    queued: usize,
+    /// False once the receiving side is gone: nobody will make room, so nobody waits.
+    open: bool,
+}
+
+impl Gate {
+    fn new(limit: usize) -> Self {
+        Gate {
+            limit,
+            state: Mutex::new(GateState {
+                queued: 0,
+                open: true,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Account for `entries` about to be sent, waiting first while the limit is reached. A
+    /// batch always gets through when nothing is queued, however large it is.
+    fn enter(&self, entries: usize) {
+        let mut state = self.state.lock().unwrap();
+        while state.open && state.queued > 0 && state.queued + entries > self.limit {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.queued += entries;
+    }
+
+    /// `entries` have been received.
+    fn leave(&self, entries: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.queued = state.queued.saturating_sub(entries);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().open = false;
+        self.changed.notify_all();
+    }
+}
+
+/// The receiving end of a scan: its batches, in the order they were sent. Taking a batch
+/// makes room for the workers to send more.
+pub struct Events {
+    rx: Receiver<Batch>,
+    gate: Option<Arc<Gate>>,
+}
+
+impl Events {
+    /// A stream fed by hand, without a limit. For tests of the code that consumes one.
+    #[cfg(test)]
+    pub fn from_channel(rx: Receiver<Batch>) -> Self {
+        Events { rx, gate: None }
+    }
+
+    fn received(&self, batch: &Batch) {
+        if let Some(gate) = &self.gate {
+            gate.leave(batch.nodes.len());
+        }
+    }
+
+    /// The next batch if one is waiting. `Disconnected` means the scan is over.
+    pub fn try_recv(&self) -> Result<Batch, TryRecvError> {
+        let batch = self.rx.try_recv()?;
+        self.received(&batch);
+        Ok(batch)
+    }
+
+    /// Every batch until the scan is over, waiting for each.
+    pub fn iter(&self) -> impl Iterator<Item = Batch> + '_ {
+        self.rx.iter().inspect(|batch| self.received(batch))
+    }
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        // Nobody will receive any more: let waiting workers through, so they can finish.
+        if let Some(gate) = &self.gate {
+            gate.close();
+        }
+    }
 }
 
 /// A unit of work: read directory `path`, whose tree id is `id`.
@@ -292,7 +399,7 @@ impl ScanControl {
 
 /// What [`start`] returns: the batch stream plus the steering handle.
 pub struct Scan {
-    pub events: Receiver<Batch>,
+    pub events: Events,
     pub control: ScanControl,
 }
 
@@ -315,6 +422,8 @@ pub struct Opts {
 /// State shared by workers only (NOT the UI), so it holds the event `Sender`.
 struct Shared {
     ev_tx: Sender<Batch>,
+    /// Bounds what is on its way to the UI.
+    gate: Arc<Gate>,
     next_id: AtomicU64,
     one_file_system: bool,
     root_dev: u64,
@@ -407,7 +516,19 @@ pub fn start(root: PathBuf, opts: Opts) -> Scan {
 /// A rescan also passes the `identity` the tree has for `root`. If the path names something
 /// else by the time it is read, nothing is listed and the directory gets a read error.
 pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identity>) -> Scan {
+    start_limited(root, opts, id_base, identity, QUEUED_ENTRIES)
+}
+
+/// [`start_at`] with a given limit on the entries in transit.
+fn start_limited(
+    root: PathBuf,
+    opts: Opts,
+    id_base: u64,
+    identity: Option<Identity>,
+    queued_entries: usize,
+) -> Scan {
     let (ev_tx, ev_rx) = unbounded::<Batch>();
+    let gate = Arc::new(Gate::new(queued_entries));
 
     let frontier: FrontierArc = Arc::new((
         Mutex::new(Frontier::new(DirJob {
@@ -419,6 +540,7 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identi
 
     let shared = Arc::new(Shared {
         ev_tx,
+        gate: Arc::clone(&gate),
         next_id: AtomicU64::new(id_base + 1),
         one_file_system: opts.one_file_system,
         root_dev: opts.root_dev,
@@ -440,7 +562,10 @@ pub fn start_at(root: PathBuf, opts: Opts, id_base: u64, identity: Option<Identi
     drop(shared);
 
     Scan {
-        events: ev_rx,
+        events: Events {
+            rx: ev_rx,
+            gate: Some(gate),
+        },
         control: ScanControl { frontier },
     }
 }
@@ -476,24 +601,23 @@ fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
 }
 
 fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
-    let failed = |error: String| {
+    // Send entries of this directory to the UI, waiting if too much is on its way already.
+    let send = |nodes: Vec<NewNode>, error: Option<String>, more: bool| {
+        shared.gate.enter(nodes.len());
         let _ = shared.ev_tx.send(Batch {
             parent_id: job.id,
-            nodes: Vec::new(),
-            error: Some(error),
+            nodes,
+            error,
+            more,
         });
     };
+    let failed = |error: String| send(Vec::new(), Some(error), false);
     let read = match std::fs::read_dir(&job.path) {
         Ok(r) => r,
         // Removed since its parent was listed: an empty directory, not an error. The
         // directory the scan was asked to start at is different: that one has to exist.
         Err(e) if vanished(&e) && job.id != shared.start_id => {
-            let _ = shared.ev_tx.send(Batch {
-                parent_id: job.id,
-                nodes: Vec::new(),
-                error: None,
-            });
-            return;
+            return send(Vec::new(), None, false);
         }
         Err(e) => return failed(e.to_string()),
     };
@@ -600,28 +724,34 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         if let Some(id) = dir_id {
             child_jobs.push(DirJob { id, path });
         }
-    }
-
-    // Publish this directory's children BEFORE queueing the subdirectories. This guarantees a
-    // node's creation batch reaches the UI before any of its descendants' batches, so the tree
-    // is always grafted parent-first.
-    let _ = shared.ev_tx.send(Batch {
-        parent_id: job.id,
-        nodes,
-        error: listing.error,
-    });
-
-    // Enqueue the subdirectories, prioritizing those under the focused path, and wake idle
-    // workers. The readdir/stat work above runs outside the lock; only queueing takes it.
-    if !child_jobs.is_empty() {
-        let (lock, cv) = &**frontier;
-        let mut f = lock.lock().unwrap();
-        f.pending += child_jobs.len();
-        for cj in child_jobs {
-            f.push(cj);
+        // A directory with very many entries goes out in parts: what has been read so far is
+        // on screen, and its subdirectories are being read, while the listing continues.
+        if nodes.len() >= BATCH_ENTRIES {
+            send(std::mem::take(&mut nodes), None, true);
+            enqueue(frontier, std::mem::take(&mut child_jobs));
         }
-        cv.notify_all();
     }
+
+    // The last (usually the only) batch says that the directory has been read.
+    send(nodes, listing.error, false);
+    enqueue(frontier, child_jobs);
+}
+
+/// Queue the subdirectories found, and wake idle workers. Always called AFTER the batch that
+/// holds those subdirectories was sent: a node's creation then reaches the UI before any
+/// batch of its descendants, so the tree is grafted parent-first. The readdir/stat work runs
+/// outside the lock; only queueing takes it.
+fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>) {
+    if child_jobs.is_empty() {
+        return;
+    }
+    let (lock, cv) = &**frontier;
+    let mut f = lock.lock().unwrap();
+    f.pending += child_jobs.len();
+    for cj in child_jobs {
+        f.push(cj);
+    }
+    cv.notify_all();
 }
 
 fn name_excluded(name: &str, patterns: &[String]) -> bool {
@@ -1380,6 +1510,190 @@ mod tests {
         assert_eq!(tree.nodes[tree.root].items, entries_on_disk(&base) - 2);
         assert_eq!(tree.nodes[tree.root].items, 10);
 
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A directory with more entries than fit in a batch arrives in parts: every part but
+    /// the last says that more follows, none exceeds the limit, and together they hold every
+    /// entry once. Subdirectories found in an early part are read without waiting for the
+    /// rest of the listing.
+    #[test]
+    fn huge_directory_arrives_in_parts() {
+        let base = std::env::temp_dir().join(format!("icdu_parts_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let big = base.join("big");
+        fs::create_dir_all(&big).unwrap();
+        let files = BATCH_ENTRIES * 2 + 500;
+        for i in 0..files {
+            fs::write(big.join(format!("f{i:05}")), b"x").unwrap();
+        }
+        for d in 0..3 {
+            fs::create_dir(big.join(format!("sub{d}"))).unwrap();
+            fs::write(big.join(format!("sub{d}/inside")), b"x").unwrap();
+        }
+        let entries = files + 3;
+
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let batches: Vec<Batch> = start(base.clone(), opts(2, meta.dev()))
+            .events
+            .iter()
+            .collect();
+        // The id of `big` comes with the root's batch.
+        let big_id = batches
+            .iter()
+            .find(|b| b.parent_id == 0)
+            .and_then(|b| b.nodes[0].dir_id)
+            .unwrap();
+        let parts: Vec<&Batch> = batches.iter().filter(|b| b.parent_id == big_id).collect();
+        assert_eq!(parts.len(), 3, "two full parts and the remainder");
+        assert!(parts.iter().all(|b| b.nodes.len() <= BATCH_ENTRIES));
+        let more: Vec<bool> = parts.iter().map(|b| b.more).collect();
+        assert_eq!(more, vec![true, true, false]);
+        assert_eq!(parts.iter().map(|b| b.nodes.len()).sum::<usize>(), entries);
+        let mut names: Vec<&str> = parts
+            .iter()
+            .flat_map(|b| b.nodes.iter().map(|n| n.name.as_str()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), entries, "every entry exactly once");
+        // Every other directory still arrives in one batch.
+        assert!(batches
+            .iter()
+            .filter(|b| b.parent_id != big_id)
+            .all(|b| !b.more));
+
+        // In the tree: complete, with the right counts.
+        let tree = scan_tree(&base, 4);
+        assert!(tree.subtree_complete(tree.root));
+        assert_eq!(tree.nodes[tree.root].items as usize, 1 + entries + 3);
+        assert_eq!(tree.total_files as usize, files + 3);
+        assert_eq!(tree.total_dirs, 1 + 1 + 3);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The gate lets entries through up to its limit and makes the sender wait beyond it,
+    /// until the receiver has taken some.
+    #[test]
+    fn gate_holds_senders_back_until_there_is_room() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let gate = Arc::new(Gate::new(10));
+        gate.enter(6);
+        gate.enter(4); // exactly full: still no wait
+        let through = Arc::new(AtomicBool::new(false));
+        let sender = {
+            let (gate, through) = (Arc::clone(&gate), Arc::clone(&through));
+            thread::spawn(move || {
+                gate.enter(3);
+                through.store(true, Ordering::SeqCst);
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(!through.load(Ordering::SeqCst), "over the limit: it waits");
+        gate.leave(2);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!through.load(Ordering::SeqCst), "8 + 3 is still too many");
+        gate.leave(4);
+        sender.join().unwrap();
+        assert!(through.load(Ordering::SeqCst));
+        assert_eq!(gate.state.lock().unwrap().queued, 7);
+    }
+
+    /// A batch larger than the limit goes through when nothing else is queued (otherwise it
+    /// could never be sent), and a closed gate holds nobody.
+    #[test]
+    fn gate_never_blocks_forever() {
+        let gate = Gate::new(10);
+        gate.enter(1_000); // nothing queued: goes through
+        gate.leave(1_000);
+
+        let gate = Arc::new(Gate::new(10));
+        gate.enter(10);
+        let sender = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || gate.enter(5))
+        };
+        thread::sleep(std::time::Duration::from_millis(30));
+        gate.close(); // the receiver is gone
+        sender.join().unwrap();
+    }
+
+    /// While nobody takes batches, a scan stops producing once the limit is reached: memory
+    /// stays bounded however long the UI is busy elsewhere. Taking them lets it finish.
+    #[test]
+    fn scan_waits_when_its_batches_are_not_taken() {
+        let base = std::env::temp_dir().join(format!("icdu_gate_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for d in 0..200 {
+            let dir = base.join(format!("d{d:03}"));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..20 {
+                fs::write(dir.join(format!("f{f}")), b"x").unwrap();
+            }
+        }
+        let total = 200 + 200 * 20;
+        let limit = 300;
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let scan = start_limited(base.clone(), opts(4, meta.dev()), 0, None, limit);
+
+        // Leave it alone until it has sent something, and then a while longer. It cannot
+        // have got far.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while scan.events.rx.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scan sent nothing"
+            );
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        thread::sleep(std::time::Duration::from_millis(300));
+        let waiting = scan.events.rx.len();
+        let queued = scan
+            .events
+            .gate
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .queued;
+        // The root's batch (200 entries) may go through alone; after it, at most the limit.
+        assert!(queued <= limit + 200, "{queued} entries queued");
+        assert!(queued < total, "the scan is waiting, not finished");
+        assert!(waiting > 0);
+
+        // Now take everything: the scan runs to its end and nothing is lost.
+        let received: usize = scan.events.iter().map(|b| b.nodes.len()).sum();
+        assert_eq!(received, total);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A consumer that goes away does not leave the workers waiting at the gate.
+    #[test]
+    fn dropping_the_events_releases_the_workers() {
+        let base = std::env::temp_dir().join(format!("icdu_drop_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for d in 0..50 {
+            let dir = base.join(format!("d{d:02}"));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..10 {
+                fs::write(dir.join(format!("f{f}")), b"x").unwrap();
+            }
+        }
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let scan = start_limited(base.clone(), opts(4, meta.dev()), 0, None, 20);
+        let control = scan.control;
+        drop(scan.events);
+        // With nobody receiving, the workers must still drain the frontier and stop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if control.frontier.0.lock().unwrap().done {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "workers are stuck");
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 

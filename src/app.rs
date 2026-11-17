@@ -16,7 +16,7 @@ use crossbeam_channel::{unbounded, Receiver};
 use crate::delete::{Plan, Report};
 use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
 use crate::scan::{
-    check_identity, start_at, Batch, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
+    check_identity, start_at, Events, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -356,7 +356,7 @@ struct PendingOpen {
 /// One live batch stream: the original scan (`refresh: false`) or a subtree rescan
 /// (`refresh: true`). `alive` flips false once the stream's channel disconnects.
 struct ScanHandle {
-    rx: Receiver<Batch>,
+    rx: Events,
     refresh: bool,
     alive: bool,
     /// When this stream started, and the counted bytes it has delivered, in both metrics:
@@ -367,7 +367,7 @@ struct ScanHandle {
 }
 
 impl ScanHandle {
-    fn new(rx: Receiver<Batch>, refresh: bool, started: Instant) -> Self {
+    fn new(rx: Events, refresh: bool, started: Instant) -> Self {
         ScanHandle {
             rx,
             refresh,
@@ -442,6 +442,8 @@ pub struct App {
     /// A directory on which a delete or rescan was refused because it is not read completely
     /// yet. The scans read it first, and the footer says when it is ready.
     waiting_for: Option<NodeIdx>,
+    /// The last `poll_scans` ran out of budget: more batches may be waiting.
+    scan_backlog: bool,
     /// When the frame being prepared started. The event loop sets it; without it (in tests)
     /// the rows are sorted again after every change, with it only when `resort_due` says so.
     frame_time: Option<Instant>,
@@ -484,6 +486,7 @@ impl App {
             list_offset: Cell::new(0),
             row_order: RefCell::new(None),
             waiting_for: None,
+            scan_backlog: false,
             frame_time: None,
             tick: 0,
             tree,
@@ -552,19 +555,41 @@ impl App {
         self.refocus();
     }
 
-    /// Drain every live scan's batch stream into the tree (up to `cap` batches per frame, so a
-    /// huge filesystem can't starve input handling). Marks streams dead when their channel
-    /// disconnects; when a rescan's stream ends the spinner clears, and when the last stream
-    /// ends the scan is over and the scan-only bookkeeping is released.
-    pub fn poll_scans(&mut self, cap: usize) {
-        let mut applied = 0usize;
-        for i in 0..self.scans.len() {
+    /// [`App::poll_scans_until`] without a time limit, for tests.
+    #[cfg(test)]
+    pub fn poll_scans(&mut self, max_entries: usize) {
+        self.poll_scans_until(max_entries, None);
+    }
+
+    /// Drain every live scan's batch stream into the tree, until `max_entries` entries are
+    /// in or `deadline` has passed. Marks streams dead when their channel disconnects; when a
+    /// rescan's stream ends the spinner clears, and when the last stream ends the scan is
+    /// over and the scan-only bookkeeping is released.
+    ///
+    /// The event loop gives each frame a few milliseconds for this, so a scan that delivers
+    /// faster than the tree can take it in never starves input handling and drawing. What
+    /// does not fit stays queued (see [`App::scan_backlog`]); the scanner waits when too
+    /// much is (`scan::Events`).
+    ///
+    /// The budget is counted in entries, not batches: a batch holds anything from nothing to
+    /// thousands of entries. At least one batch is applied per call.
+    pub fn poll_scans_until(&mut self, max_entries: usize, deadline: Option<Instant>) {
+        let mut entries = 0usize;
+        self.scan_backlog = false;
+        'streams: for i in 0..self.scans.len() {
             if !self.scans[i].alive {
                 continue;
             }
             loop {
+                let spent = entries >= max_entries || deadline.is_some_and(|d| Instant::now() >= d);
+                if entries > 0 && spent {
+                    self.scan_backlog = true;
+                    break 'streams;
+                }
                 match self.scans[i].rx.try_recv() {
                     Ok(batch) => {
+                        // An empty directory is work too.
+                        entries += batch.nodes.len().max(1);
                         // Count the batch's bytes before `apply` moves it, for the footer's
                         // throughput display.
                         let stream = &mut self.scans[i];
@@ -573,10 +598,6 @@ impl App {
                             stream.disk = stream.disk.saturating_add(n.disk);
                         }
                         self.tree.apply(batch);
-                        applied += 1;
-                        if applied >= cap {
-                            break;
-                        }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -602,6 +623,12 @@ impl App {
             self.scanning = false;
             self.tree.finish_scan();
         }
+    }
+
+    /// True if the last poll stopped at its budget, so batches may be waiting to be applied.
+    /// The event loop then comes back at once instead of sleeping until the next frame is due.
+    pub fn scan_backlog(&self) -> bool {
+        self.scan_backlog
     }
 
     pub fn is_deleting(&self) -> bool {
@@ -1892,6 +1919,7 @@ pub fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::model::{Excluded, NodeKind};
+    use crate::scan::Batch;
     use crossbeam_channel::Sender;
 
     fn app() -> App {
@@ -2031,6 +2059,7 @@ mod tests {
                 dir_id: None,
             }],
             error: None,
+            more: false,
         }
     }
 
@@ -2114,6 +2143,7 @@ mod tests {
                 file_batch("large", 500).nodes.remove(0),
             ],
             error: None,
+            more: false,
         });
         let mut app = App::new(t, true, false, true);
         let t0 = Instant::now();
@@ -2322,6 +2352,7 @@ mod tests {
                 node("big", NodeKind::Dir, 500, Some(1)),
             ],
             error: None,
+            more: false,
         });
         app.settle_selection();
         let big = idx_named(&app, "big");
@@ -2583,11 +2614,13 @@ mod tests {
             parent_id: 10,
             nodes: vec![dir("more", 11), dir("other", 12)],
             error: None,
+            more: false,
         });
         app.tree.apply(Batch {
             parent_id: 20,
             nodes: Vec::new(),
             error: None,
+            more: false,
         });
         app
     }
@@ -2598,6 +2631,7 @@ mod tests {
             parent_id: id,
             nodes: Vec::new(),
             error: None,
+            more: false,
         }
     }
 
@@ -2685,7 +2719,8 @@ mod tests {
     /// Attach a scan stream that started at `started`; the sender feeds it.
     fn add_stream(app: &mut App, refresh: bool, started: Instant) -> Sender<Batch> {
         let (tx, rx) = unbounded();
-        app.scans.push(ScanHandle::new(rx, refresh, started));
+        app.scans
+            .push(ScanHandle::new(Events::from_channel(rx), refresh, started));
         app.scanning = true;
         tx
     }
@@ -2696,6 +2731,49 @@ mod tests {
         batch.parent_id = parent_id;
         batch.nodes[0].disk = disk;
         batch
+    }
+
+    /// The budget of a poll counts entries, across all streams. What does not fit stays
+    /// queued for the next poll, and the app says that it does.
+    #[test]
+    fn poll_scans_stops_at_its_budget_and_resumes() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        let t0 = Instant::now();
+        let first = add_stream(&mut app, false, t0);
+        let second = add_stream(&mut app, true, t0);
+        // Stream one: the root with five files, in batches of one. Stream two: two more.
+        for i in 0..5u64 {
+            let mut batch = sized_batch(0, &format!("a{i}"), 10 + i, 10 + i);
+            batch.more = i < 4;
+            first.send(batch).unwrap();
+        }
+        for i in 0..2u64 {
+            let mut batch = sized_batch(0, &format!("b{i}"), 20 + i, 20 + i);
+            batch.more = true;
+            second.send(batch).unwrap();
+        }
+        let files = |app: &App| app.tree.nodes[app.tree.root].children.len();
+
+        app.poll_scans(3);
+        assert_eq!(files(&app), 3, "the budget, not one batch more per stream");
+        assert!(app.scan_backlog());
+        app.poll_scans(3);
+        assert_eq!(
+            files(&app),
+            6,
+            "the rest of stream one, then into stream two"
+        );
+        assert!(app.scan_backlog());
+        app.poll_scans(3);
+        assert_eq!(files(&app), 7);
+        assert!(!app.scan_backlog(), "everything that was waiting is in");
+
+        // A time limit that has already passed still lets one batch through per poll.
+        first.send(sized_batch(0, "late1", 1, 1)).unwrap();
+        first.send(sized_batch(0, "late2", 2, 2)).unwrap();
+        app.poll_scans_until(usize::MAX, Some(t0));
+        assert_eq!(files(&app), 8);
+        assert!(app.scan_backlog());
     }
 
     /// The footer's throughput figure: bytes per second of the streams that are running, in
@@ -2990,11 +3068,13 @@ mod tests {
                 node("pending", NodeKind::Dir, Some(2)),
             ],
             error: None,
+            more: false,
         });
         app.tree.apply(Batch {
             parent_id: 1,
             nodes: vec![node("f", NodeKind::File, None)],
             error: None,
+            more: false,
         });
         app
     }
@@ -3064,6 +3144,7 @@ mod tests {
             parent_id: 2,
             nodes: vec![],
             error: None,
+            more: false,
         });
 
         app.on_key(KeyAction::Export);
@@ -3149,16 +3230,19 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("locked", 1), dir("flagged", 2)],
             error: None,
+            more: false,
         });
         app.tree.apply(Batch {
             parent_id: 1,
             nodes: Vec::new(),
             error: Some("Permission denied (os error 13)".into()),
+            more: false,
         });
         app.tree.apply(Batch {
             parent_id: 2,
             nodes: Vec::new(),
             error: None,
+            more: false,
         });
         let (locked, flagged) = (idx_named(&app, "locked"), idx_named(&app, "flagged"));
         app.tree.nodes[flagged].read_error = true; // as an import would
@@ -3519,11 +3603,13 @@ mod tests {
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), false, false, true);
         let (tx, rx) = crossbeam_channel::unbounded();
         let started = Instant::now();
-        app.scans.push(ScanHandle::new(rx, false, started));
+        app.scans
+            .push(ScanHandle::new(Events::from_channel(rx), false, started));
         tx.send(Batch {
             parent_id: 0,
             nodes: vec![huge("x", 2), huge("y", 3)],
             error: None,
+            more: false,
         })
         .unwrap();
         app.poll_scans(100);
@@ -3558,6 +3644,7 @@ mod tests {
                 node("a.log", NodeKind::File, None),
             ],
             error: None,
+            more: false,
         });
         let now = search(&mut app, ".log");
         assert_eq!(hit_names(&app), vec!["a.log"]);
@@ -3569,6 +3656,7 @@ mod tests {
                 node("x", NodeKind::File, None),
             ],
             error: None,
+            more: false,
         });
         assert!(app.find_busy(), "new nodes to look at");
         app.find_tick(now + Duration::from_secs(1), usize::MAX);
@@ -4358,6 +4446,7 @@ mod tests {
                 node("out", NodeKind::Dir, Some(2)),
             ],
             error: None,
+            more: false,
         });
         app.cur = idx_named(&app, "in");
         let now = search(&mut app, ".log");
@@ -4370,6 +4459,7 @@ mod tests {
                 parent_id,
                 nodes: vec![node(name, NodeKind::File, None)],
                 error: None,
+                more: false,
             });
         }
         app.find_tick(now + Duration::from_secs(1), usize::MAX);

@@ -1088,16 +1088,19 @@ mod tests {
                 dir("mount", 5, Excluded::OtherFs),
             ],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: Vec::new(),
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 3,
             nodes: Vec::new(),
             error: Some("Permission denied".into()),
+            more: false,
         });
         let state =
             |name: &str| listing_state(&t, t.nodes.iter().position(|n| n.name == name).unwrap());

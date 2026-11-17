@@ -139,6 +139,8 @@ Sizes are live, so the screen says which of them are final:
   (`2,281 directories left to read`). The number shrinks to nothing as the scan gets there.
 - The title of the list describes the directory itself: `reading…` until its entries have
   arrived, then the number of items, `(empty)`, `(unreadable)` or `(excluded, not scanned)`.
+  A directory with a great many entries arrives in parts; while more are coming the title
+  reads `8,192 items · reading…`.
 
 The same `…` marks unfinished directories in the search results.
 
@@ -149,8 +151,9 @@ the whole tree. A status message shares the line with this progress and does not
 ### Shelling out
 
 Press `b` to suspend the TUI and run `$SHELL` interactively in the directory you are viewing
-(as ncdu does) — find it here, fix it there, `exit` to come straight back into icdu. The scan keeps running in the background while you're away and catches up when you
-return.
+(as ncdu does) — find it here, fix it there, `exit` to come straight back into icdu. The scan keeps running in the
+background while you're away, up to a limit on what it queues for the display, and carries on
+when you return.
 
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
 Symlinks are never followed (counted as the link itself), matching ncdu's default.
@@ -360,7 +363,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 
 | Module | Responsibility |
 |--------|----------------|
-| `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). One `Batch` per directory; excludes, one-filesystem. |
+| `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). Entries arrive in batches, a huge directory in several; excludes, one-filesystem. |
 | `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, counts each hard-linked inode once, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
 | `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
 | `glob.rs` | `fnmatch`-style globbing for `--exclude`. |

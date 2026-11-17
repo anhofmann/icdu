@@ -185,7 +185,9 @@ impl Tree {
 
     fn graft(&mut self, parent_idx: NodeIdx, batch: Batch) {
         self.generation += 1;
-        if !self.nodes[parent_idx].scanned {
+        // A directory counts as read with its last batch. Until then it stays unscanned:
+        // nothing above it passes the delete or rescan gate, and it is listed as incomplete.
+        if !batch.more && !self.nodes[parent_idx].scanned {
             self.nodes[parent_idx].scanned = true;
             // This directory is now read: one fewer unscanned dir in every ancestor's subtree.
             self.bump_unscanned(parent_idx, -1);
@@ -202,8 +204,8 @@ impl Tree {
         let mut new_dir_ids = Vec::new();
         let mut new_subdirs = Vec::new();
 
-        // Each dir receives exactly one batch (one readdir), so reserve children exactly to
-        // avoid the Vec's growth slack.
+        // Nearly every directory arrives as one batch, so reserve its children exactly and
+        // avoid the Vec's growth slack. (A very large one arrives in several.)
         self.nodes[parent_idx]
             .children
             .reserve_exact(batch.nodes.len());
@@ -777,11 +779,13 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![dir("b", 2)],
             error: None,
+            more: false,
         });
         let a = t.nodes[t.root].children[0];
         let b = t.nodes[a].children[0];
@@ -808,12 +812,14 @@ mod tests {
                 },
             ],
             error: None,
+            more: false,
         });
         // The listing of `a` broke off after one entry.
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("seen", 11)],
             error: Some("Stale file handle (os error 116)".into()),
+            more: false,
         });
         let (a, broken) = (idx_of(&t, "a"), idx_of(&t, "broken"));
         assert!(t.nodes[a].read_error && t.nodes[broken].read_error);
@@ -828,6 +834,94 @@ mod tests {
         assert_eq!(t.error_of(a), None);
     }
 
+    /// A large directory arrives in several batches. It counts as read only with the last
+    /// one: until then it and everything above it stays incomplete, while its entries and
+    /// sizes are already there.
+    #[test]
+    fn directory_is_scanned_only_after_its_last_batch() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("big", 1)],
+            error: None,
+            more: false,
+        });
+        let big = idx_of(&t, "big");
+        assert!(!t.subtree_complete(t.root) && t.nodes[big].unscanned == 1);
+
+        // First part: two entries, one of them a directory that is read right away.
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("f1", 10), dir("sub", 2)],
+            error: None,
+            more: true,
+        });
+        t.apply(Batch {
+            parent_id: 2,
+            nodes: Vec::new(),
+            error: None,
+            more: false,
+        });
+        assert_eq!(t.nodes[big].children.len(), 2, "the entries are there");
+        assert_eq!(t.nodes[big].items, 2);
+        assert_eq!(
+            t.nodes[big].apparent,
+            100 + 100 + 100,
+            "and so are the sizes"
+        );
+        assert!(!t.nodes[big].scanned, "but the listing is not finished");
+        assert!(t.is_unread(big));
+        assert!(!t.subtree_complete(big) && !t.subtree_complete(t.root));
+        assert_eq!(t.nodes[t.root].unscanned, 1);
+
+        // A second part, still not the last.
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("f2", 11)],
+            error: None,
+            more: true,
+        });
+        assert!(!t.subtree_complete(big));
+
+        // The last part may be empty.
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: Vec::new(),
+            error: None,
+            more: false,
+        });
+        assert!(t.nodes[big].scanned);
+        assert!(t.subtree_complete(big) && t.subtree_complete(t.root));
+        assert_eq!(t.nodes[big].items, 3);
+        assert_eq!(t.nodes[t.root].items, 4);
+        assert_eq!(t.nodes[t.root].unscanned, 0, "counted down exactly once");
+    }
+
+    /// Parts that arrive before their directory is known are held back together, in order.
+    #[test]
+    fn parts_of_a_directory_wait_for_their_parent() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        for (name, more) in [("f1", true), ("f2", false)] {
+            t.apply(Batch {
+                parent_id: 1,
+                nodes: vec![file(name, 10)],
+                error: None,
+                more,
+            });
+        }
+        assert!(!t.orphans_is_empty());
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("big", 1)],
+            error: None,
+            more: false,
+        });
+        assert!(t.orphans_is_empty());
+        let big = idx_of(&t, "big");
+        assert_eq!(t.nodes[big].items, 2);
+        assert!(t.subtree_complete(t.root));
+    }
+
     /// A directory is not deletable until its entire subtree has been scanned.
     #[test]
     fn delete_gate_tracks_unscanned_subtree() {
@@ -840,6 +934,7 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1)],
             error: None,
+            more: false,
         });
         let a = t.nodes[t.root].children[0];
         assert!(
@@ -853,6 +948,7 @@ mod tests {
             parent_id: 1,
             nodes: vec![dir("b", 2)],
             error: None,
+            more: false,
         });
         assert!(!t.subtree_complete(a), "a has an unscanned child b");
 
@@ -861,6 +957,7 @@ mod tests {
             parent_id: 2,
             nodes: vec![],
             error: None,
+            more: false,
         });
         assert!(t.subtree_complete(t.nodes[a].children[0]), "b complete");
         assert!(t.subtree_complete(a), "a complete");
@@ -882,16 +979,19 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1), file("b", 10)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("x", 11), dir("sub", 2)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: vec![file("y", 12)],
             error: None,
+            more: false,
         });
         t
     }
@@ -950,11 +1050,13 @@ mod tests {
             parent_id: 0,
             nodes: vec![raw_dir],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("plain", 10)],
             error: None,
+            more: false,
         });
         let (d, plain) = (idx_of(&t, "d\u{FFFD}"), idx_of(&t, "plain"));
 
@@ -1014,11 +1116,13 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1), dir("b", 2), dir("c", 3)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("x", 11)],
             error: None,
+            more: false,
         });
         let a = idx_of(&t, "a");
         assert!(t.subtree_complete(a));
@@ -1035,12 +1139,14 @@ mod tests {
             parent_id: base,
             nodes: vec![file("x", 11), dir("sub", base + 1)],
             error: None,
+            more: false,
         });
         assert_counts_in_step(&t, "rescan read a");
         t.apply(Batch {
             parent_id: base + 1,
             nodes: vec![],
             error: None,
+            more: false,
         });
         assert!(t.subtree_complete(a));
         assert_counts_in_step(&t, "rescan done");
@@ -1050,6 +1156,7 @@ mod tests {
             parent_id: 2,
             nodes: vec![],
             error: None,
+            more: false,
         });
         assert!(!t.subtree_complete(t.root), "c has not been read yet");
         assert_counts_in_step(&t, "b read");
@@ -1057,6 +1164,7 @@ mod tests {
             parent_id: 3,
             nodes: vec![],
             error: None,
+            more: false,
         });
         assert!(t.subtree_complete(t.root));
         assert_counts_in_step(&t, "c read");
@@ -1143,6 +1251,7 @@ mod tests {
             parent_id: 0,
             nodes: vec![excluded, file("f", 10)],
             error: None,
+            more: false,
         });
         let ex = idx_of(&t, "ex");
         let before = sizes(&t, t.root);
@@ -1159,6 +1268,7 @@ mod tests {
             parent_id: base,
             nodes: vec![file("inside", 11)],
             error: None,
+            more: false,
         });
         assert_eq!(sizes(&t, t.root), before, "its content adds nothing");
     }
@@ -1192,6 +1302,7 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1), file("b", 10)],
             error: None,
+            more: false,
         });
         assert_eq!(t.nodes[t.root].items, 2);
         assert_eq!(items(&t, "a"), 0, "not read yet");
@@ -1199,6 +1310,7 @@ mod tests {
             parent_id: 1,
             nodes: vec![file("x", 11), dir("sub", 2)],
             error: None,
+            more: false,
         });
         assert_eq!(items(&t, "a"), 2);
         assert_eq!(t.nodes[t.root].items, 4);
@@ -1206,6 +1318,7 @@ mod tests {
             parent_id: 2,
             nodes: vec![file("y", 12)],
             error: None,
+            more: false,
         });
         assert_eq!(items(&t, "sub"), 1);
         assert_eq!(items(&t, "a"), 3);
@@ -1229,12 +1342,14 @@ mod tests {
             parent_id: 1,
             nodes: vec![file("x", 11), file("y", 12)],
             error: None,
+            more: false,
         });
         assert_eq!(t.nodes[t.root].items, 0, "orphan not grafted yet");
         t.apply(Batch {
             parent_id: 0,
             nodes: vec![dir("a", 1)],
             error: None,
+            more: false,
         });
         assert!(t.orphans_is_empty());
         assert_eq!(items(&t, "a"), 2);
@@ -1259,16 +1374,19 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1), dir("b", 2)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![link("one", 50), file("x", 11)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: vec![link("two", 50)],
             error: None,
+            more: false,
         });
         t
     }
@@ -1293,6 +1411,7 @@ mod tests {
                 ..link("elsewhere", 50)
             }],
             error: None,
+            more: false,
         });
         assert!(!t.nodes[idx_of(&t, "elsewhere")].shared);
     }
@@ -1379,6 +1498,7 @@ mod tests {
             parent_id: base,
             nodes: vec![link("one", 50), file("x", 11)],
             error: None,
+            more: false,
         });
         let again = t.nodes[a].children[0];
         assert!(
@@ -1402,6 +1522,7 @@ mod tests {
             parent_id: base,
             nodes: vec![link("two", 50)],
             error: None,
+            more: false,
         });
         assert!(!t.nodes[one].shared);
         assert!(t.nodes[t.nodes[b].children[0]].shared);
@@ -1423,6 +1544,7 @@ mod tests {
                 link("kept", 50),
             ],
             error: None,
+            more: false,
         });
         let (skipped, kept) = (idx_of(&t, "skipped"), idx_of(&t, "kept"));
         assert!(
@@ -1462,6 +1584,7 @@ mod tests {
             parent_id: 0,
             nodes: vec![counted, shared, excluded_dir, excluded_file],
             error: None,
+            more: false,
         });
         assert_eq!(t.nodes[t.root].items, 4);
         assert_eq!(items(&t, "node_modules"), 0);
@@ -1541,6 +1664,7 @@ mod tests {
             parent_id: base,
             nodes: vec![file("x", 11), dir("sub", base + 1), file("new", 13)],
             error: None,
+            more: false,
         });
         assert_eq!(t.nodes[a].items, 3);
         assert_eq!(t.nodes[t.root].items, 5);
@@ -1548,6 +1672,7 @@ mod tests {
             parent_id: base + 1,
             nodes: vec![file("y", 12)],
             error: None,
+            more: false,
         });
         assert_eq!(t.nodes[a].items, 4);
         assert_eq!(t.nodes[t.root].items, 6);
@@ -1570,11 +1695,13 @@ mod tests {
             parent_id: 0,
             nodes: vec![dir("a", 1)],
             error: None,
+            more: false,
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![big("x", 10), big("y", 11)],
             error: None,
+            more: false,
         });
         let a = idx_of(&t, "a");
         for idx in [a, t.root] {
@@ -1617,6 +1744,7 @@ mod tests {
             parent_id: 2,
             nodes: vec![file("p", 20), file("q", 21)],
             error: None,
+            more: false,
         });
         assert_eq!(t.nodes[a].items, u32::MAX);
         assert_eq!(t.nodes[t.root].items, u32::MAX);
