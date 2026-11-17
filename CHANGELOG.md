@@ -12,7 +12,9 @@ history was separated; they do not match the pull requests of this repository.
 
 ## [Unreleased]
 
-Everything since 0.4.1. It will be released as icdu 0.5.0.
+## [0.5.0] - 2026-11-17
+
+The first release under the name icdu, with everything since rcdu 0.4.1.
 
 ### Changed, and needing attention when upgrading
 
@@ -153,7 +155,8 @@ The first release of rcdu: a disk usage explorer that can be browsed while it sc
 parallel scanner, delete with a safety gate, hard-link handling, `--exclude`, `-x`, and import
 and export of ncdu's JSON format.
 
-[Unreleased]: https://github.com/anhofmann/icdu/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/anhofmann/icdu/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/anhofmann/icdu/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/anhofmann/icdu/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/anhofmann/icdu/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/anhofmann/icdu/compare/v0.2.0...v0.3.0

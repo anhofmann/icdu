@@ -1,6 +1,6 @@
 [package]
 name = "icdu"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 # What the newest dependency needs (ratatui 0.30). CI builds and tests with exactly this
 # version, taken from this line.
