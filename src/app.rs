@@ -18,7 +18,7 @@ use crossbeam_channel::{unbounded, Receiver};
 use crate::delete::{Plan, Report};
 use crate::dump::Exporter;
 use crate::matcher::Matcher;
-use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
+use crate::model::{Excluded, Ext, NodeIdx, NodeKind, Tree};
 use crate::scan::{
     check_identity, start_at, Events, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
 };
@@ -515,6 +515,9 @@ pub struct App {
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
     pub show_item_count: bool,
+    /// Show the modification time column (`m`, `--show-mtime`). It has something to show
+    /// only in extended mode (`-e`).
+    pub show_mtime: bool,
     pub scanning: bool,
     /// Read-only: deletion disabled (ncdu `-r`).
     pub read_only: bool,
@@ -593,6 +596,7 @@ impl App {
             sort: SortKey::Size,
             disk_usage,
             show_item_count: false,
+            show_mtime: false,
             scanning,
             read_only,
             imported: false,
@@ -1400,6 +1404,19 @@ impl App {
             let why = self.tree.error_of(idx).unwrap_or("yes");
             rows.push(("read error".to_string(), why.to_string()));
         }
+        // In extended mode (`-e`) the tree has owner, mode and time itself: what the scan
+        // saw, or what the dump says. They are shown as they are, without asking the disk.
+        let stored = self.tree.ext(idx);
+        if let Some(ext) = stored {
+            push_ext_rows(&mut rows, ext);
+            // For a directory, what the `m` column shows: the latest change below it.
+            match self.tree.latest_mtime(idx) {
+                Some(latest) if n.is_dir() && Some(latest) != ext.mtime() => {
+                    rows.push(("newest below".to_string(), fmt_mtime(latest)));
+                }
+                _ => {}
+            }
+        }
         if self.imported {
             // The path may belong to another machine; a local file of the same name would
             // show up here as if it were the entry.
@@ -1409,14 +1426,13 @@ impl App {
             ));
             return rows;
         }
+        if stored.is_some() {
+            rows.push(("inode".to_string(), n.ino.to_string()));
+            return rows;
+        }
         match self.tree.fs_path_of(idx).map(std::fs::symlink_metadata) {
             Some(Ok(m)) => {
-                rows.push((
-                    "permissions".to_string(),
-                    format!("{:o}", m.mode() & 0o7777),
-                ));
-                rows.push(("owner".to_string(), format!("{}:{}", m.uid(), m.gid())));
-                rows.push(("modified".to_string(), fmt_time(m.mtime())));
+                push_ext_rows(&mut rows, crate::scan::ext_of(&m));
                 rows.push(("inode".to_string(), m.ino().to_string()));
                 rows.push(("links".to_string(), m.nlink().to_string()));
             }
@@ -1814,6 +1830,15 @@ impl App {
             }
             KeyAction::ToggleUsage => self.disk_usage = !self.disk_usage,
             KeyAction::ToggleItemCount => self.show_item_count = !self.show_item_count,
+            KeyAction::ToggleMtime => {
+                if self.tree.is_extended() {
+                    self.show_mtime = !self.show_mtime;
+                } else {
+                    // ncdu ignores the key here. Saying why is more use.
+                    self.status =
+                        Some("modification times are recorded only with -e (extended mode)".into());
+                }
+            }
             KeyAction::Help => self.modal = Modal::Help(HelpView::default()),
             KeyAction::Delete => self.request_delete(),
             KeyAction::Open => self.open_selected(),
@@ -2171,6 +2196,7 @@ pub enum KeyAction {
     ToggleUsage,
     /// Show or hide the item count column.
     ToggleItemCount,
+    ToggleMtime,
     Help,
     Delete,
     Open,
@@ -2253,10 +2279,32 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     (y, m as u32, d as u32, h, mi, s)
 }
 
+/// The rows of the info popup for owner, mode and modification time, as far as known.
+fn push_ext_rows(rows: &mut Vec<(String, String)>, ext: Ext) {
+    if let Some(mode) = ext.mode() {
+        rows.push(("permissions".to_string(), format!("{:o}", mode & 0o7777)));
+    }
+    let id = |id: Option<u32>| id.map_or("?".to_string(), |id| id.to_string());
+    if ext.uid().is_some() || ext.gid().is_some() {
+        rows.push((
+            "owner".to_string(),
+            format!("{}:{}", id(ext.uid()), id(ext.gid())),
+        ));
+    }
+    if let Some(mtime) = ext.mtime() {
+        rows.push(("modified".to_string(), fmt_mtime(mtime)));
+    }
+}
+
 /// Human-readable UTC timestamp for the info panel (mtime), dependency-free.
 pub fn fmt_time(secs: i64) -> String {
     let (y, mo, d, h, mi, s) = civil(secs);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+/// The same for a modification time as the tree keeps it.
+pub fn fmt_mtime(mtime: u64) -> String {
+    fmt_time(i64::try_from(mtime).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
@@ -2497,6 +2545,7 @@ mod tests {
             }],
             error: None,
             more: false,
+            ext: Vec::new(),
         }
     }
 
@@ -2581,6 +2630,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let mut app = App::new(t, true, false, true);
         let t0 = Instant::now();
@@ -2791,6 +2841,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app.settle_selection();
         let big = idx_named(&app, "big");
@@ -3130,12 +3181,14 @@ mod tests {
             nodes: vec![dir("more", 11), dir("other", 12)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app.tree.apply(Batch {
             parent_id: 20,
             nodes: Vec::new(),
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app
     }
@@ -3147,6 +3200,7 @@ mod tests {
             nodes: Vec::new(),
             error: None,
             more: false,
+            ext: Vec::new(),
         }
     }
 
@@ -3711,12 +3765,14 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app.tree.apply(Batch {
             parent_id: 1,
             nodes: vec![node("f", NodeKind::File, None)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app
     }
@@ -3787,6 +3843,7 @@ mod tests {
             nodes: vec![],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
 
         app.on_key(KeyAction::Export);
@@ -3874,18 +3931,21 @@ mod tests {
             nodes: vec![dir("locked", 1), dir("flagged", 2)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app.tree.apply(Batch {
             parent_id: 1,
             nodes: Vec::new(),
             error: Some("Permission denied (os error 13)".into()),
             more: false,
+            ext: Vec::new(),
         });
         app.tree.apply(Batch {
             parent_id: 2,
             nodes: Vec::new(),
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let (locked, flagged) = (idx_named(&app, "locked"), idx_named(&app, "flagged"));
         app.tree.set_read_error(flagged, true); // as an import would
@@ -4076,6 +4136,123 @@ mod tests {
             Excluded::No,
             false,
         )
+    }
+
+    /// `m` shows the modification times, where the tree has any.
+    #[test]
+    fn mtime_column_needs_extended_mode() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::ToggleMtime);
+        assert!(!app.show_mtime);
+        assert!(app.status.as_deref().unwrap().contains("-e"));
+        app.tree.set_extended();
+        app.on_key(KeyAction::ToggleMtime);
+        assert!(app.show_mtime);
+        app.on_key(KeyAction::ToggleMtime);
+        assert!(!app.show_mtime);
+    }
+
+    fn info(app: &App, idx: NodeIdx, key: &str) -> Option<String> {
+        let rows = app.info_pairs(idx);
+        rows.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// In extended mode the popup shows what the dump says about an entry. That is the only
+    /// way to see owner, mode and time of an imported tree, whose paths are never looked up.
+    #[test]
+    fn info_rows_show_what_an_extended_dump_recorded() {
+        let json = r#"[1,2,{},
+            [{"name":"/elsewhere","uid":0,"gid":0,"mode":16877,"mtime":1000000000},
+             {"name":"f","asize":5,"uid":1000,"gid":100,"mode":33184,"mtime":1700000000},
+             {"name":"bare","asize":5},
+             {"name":"timed","mtime":86400}]]"#;
+        let tree = crate::dump::import_with(json.as_bytes(), true).unwrap();
+        let mut app = App::new(tree, true, false, false);
+        app.imported = true;
+        let named = |name: &str| app.tree.nodes.iter().position(|n| n.name == name).unwrap();
+        let f = named("f");
+        assert_eq!(info(&app, f, "permissions").as_deref(), Some("640"));
+        assert_eq!(info(&app, f, "owner").as_deref(), Some("1000:100"));
+        assert_eq!(
+            info(&app, f, "modified").as_deref(),
+            Some("2023-11-14 22:13:20 UTC")
+        );
+        assert!(info(&app, f, "on disk").unwrap().contains("imported"));
+        // A directory: its own time, and the latest below it where that is another.
+        let root = app.tree.root;
+        assert_eq!(
+            info(&app, root, "modified").as_deref(),
+            Some("2001-09-09 01:46:40 UTC")
+        );
+        assert_eq!(
+            info(&app, root, "newest below").as_deref(),
+            Some("2023-11-14 22:13:20 UTC")
+        );
+        assert_eq!(info(&app, f, "newest below"), None);
+        // An entry the dump says nothing about, and one it says only the time of.
+        let bare = named("bare");
+        assert_eq!(info(&app, bare, "permissions"), None);
+        assert_eq!(info(&app, bare, "owner"), None);
+        assert_eq!(info(&app, bare, "modified"), None);
+        let timed = named("timed");
+        assert_eq!(
+            info(&app, timed, "modified").as_deref(),
+            Some("1970-01-02 00:00:00 UTC")
+        );
+        assert_eq!(info(&app, timed, "owner"), None);
+    }
+
+    /// After a scan with `-e` the popup shows what the scan saw, and does not ask the disk
+    /// again: the file here is given an owner it does not have.
+    #[test]
+    fn info_rows_use_the_scanned_values_in_extended_mode() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("icdu_info_ext_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("f"), b"0123456789").unwrap();
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let mut t = Tree::new(
+            base.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        t.set_extended();
+        let f = t.import_child(
+            t.root,
+            "f".into(),
+            NodeKind::File,
+            10,
+            4096,
+            meta.dev(),
+            77,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        t.set_ext(
+            f,
+            Ext {
+                mtime: 86_400,
+                uid: 4242,
+                gid: 4343,
+                mode: 0o100600,
+                has: Ext::ALL,
+            },
+        );
+        let app = App::new(t, true, false, false);
+        assert_eq!(info(&app, f, "owner").as_deref(), Some("4242:4343"));
+        assert_eq!(info(&app, f, "permissions").as_deref(), Some("600"));
+        assert_eq!(
+            info(&app, f, "modified").as_deref(),
+            Some("1970-01-02 00:00:00 UTC")
+        );
+        assert_eq!(info(&app, f, "inode").as_deref(), Some("77"));
+        assert_eq!(info(&app, f, "on disk"), None);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// The info popup shows a directory's direct entries and its recursive item count; an
@@ -4384,6 +4561,7 @@ mod tests {
             nodes: vec![huge("x", 2), huge("y", 3)],
             error: None,
             more: false,
+            ext: Vec::new(),
         })
         .unwrap();
         app.poll_scans(100);
@@ -4420,6 +4598,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let now = search(&mut app, ".log");
         assert_eq!(hit_names(&app), vec!["a.log"]);
@@ -4432,6 +4611,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(app.find_busy(), "new nodes to look at");
         app.find_tick(now + Duration::from_secs(1), usize::MAX);
@@ -4505,6 +4685,7 @@ mod tests {
             root_dev: 1,
             older_than: None,
             newer_than: None,
+            extended: false,
         }
     }
 
@@ -5231,6 +5412,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         app.cur = idx_named(&app, "in");
         let now = search(&mut app, ".log");
@@ -5244,6 +5426,7 @@ mod tests {
                 nodes: vec![node(name, NodeKind::File, None)],
                 error: None,
                 more: false,
+                ext: Vec::new(),
             });
         }
         app.find_tick(now + Duration::from_secs(1), usize::MAX);

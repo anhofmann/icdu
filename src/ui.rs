@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles, FIND_CAP,
+    fmt_mtime, indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles, FIND_CAP,
 };
 use crate::matcher::Matcher;
 use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
@@ -55,6 +55,18 @@ fn item_cell(n: &Node) -> String {
         fmt_items(n.items)
     } else {
         String::new()
+    }
+}
+
+/// Width of the modification time column: `2023-05-06 07:08:09 UTC`.
+const MTIME_WIDTH: usize = 23;
+
+/// The modification time column's cell (`m`, extended mode): for a file its own time, for a
+/// directory the latest one in it, as in ncdu. An entry without a time says so.
+fn mtime_cell(tree: &Tree, idx: NodeIdx) -> String {
+    match tree.latest_mtime(idx) {
+        Some(mtime) => fmt_mtime(mtime),
+        None => "no mtime".to_string(),
     }
 }
 
@@ -647,6 +659,12 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         if app.show_item_count {
             spans.push(Span::raw(format!("{:>ITEMS_WIDTH$} ", item_cell(n))));
         }
+        if app.show_mtime && app.tree.is_extended() {
+            spans.push(Span::raw(format!(
+                "{:>MTIME_WIDTH$} ",
+                mtime_cell(&app.tree, k)
+            )));
+        }
         spans.push(Span::styled(format!("{ind}{}{suffix}", n.name), name_style));
         items.push(ListItem::new(Line::from(spans)));
     }
@@ -843,6 +861,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("] / [", "next / previous match of that search"),
     ("a", "toggle apparent ↔ disk usage"),
     ("c", "toggle the item count column"),
+    ("m", "toggle the modification times (with -e)"),
     ("d", "delete the selected entry (asks first)"),
     ("o", "open it in the default application"),
     ("T", "largest files under this directory"),
@@ -1107,9 +1126,9 @@ mod tests {
     use super::{
         bar_scale, confirm_export_text, dir_label, display_width, find_empty_message, find_rows,
         find_title, fmt_count, fmt_items, footer_split, hard_link_note, help_layout,
-        help_scroll_hint, item_cell, left_to_read, list_title, listing_state, scan_progress,
-        size_cell, truncate_left, HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS,
-        HELP_KEY_WIDTH, ITEMS_WIDTH,
+        help_scroll_hint, item_cell, left_to_read, list_title, listing_state, mtime_cell,
+        scan_progress, size_cell, truncate_left, HelpLayout, Listing, HELP_COLUMN_WIDTH,
+        HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
 
@@ -1226,18 +1245,21 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: Vec::new(),
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 3,
             nodes: Vec::new(),
             error: Some("Permission denied".into()),
             more: false,
+            ext: Vec::new(),
         });
         let state =
             |name: &str| listing_state(&t, t.nodes.iter().position(|n| n.name == name).unwrap());
@@ -1483,6 +1505,40 @@ mod tests {
                 assert!(fmt_items(m).len() <= ITEMS_WIDTH, "{m} → {}", fmt_items(m));
             }
         }
+    }
+
+    /// The time column: a file's own time, a directory's latest, or the word that there is
+    /// none. All of one width.
+    #[test]
+    fn mtime_cell_shows_the_latest_time_or_says_there_is_none() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        t.set_extended();
+        let f = t.import_child(
+            t.root,
+            "f".into(),
+            NodeKind::File,
+            1,
+            1,
+            1,
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        assert_eq!(mtime_cell(&t, f), "no mtime");
+        assert_eq!(mtime_cell(&t, t.root), "no mtime");
+        t.set_ext(
+            f,
+            crate::model::Ext {
+                mtime: 1_700_000_000,
+                has: crate::model::Ext::MTIME,
+                ..Default::default()
+            },
+        );
+        assert_eq!(mtime_cell(&t, f), "2023-11-14 22:13:20 UTC");
+        assert_eq!(mtime_cell(&t, t.root), "2023-11-14 22:13:20 UTC");
+        assert_eq!(mtime_cell(&t, f).len(), MTIME_WIDTH);
     }
 
     /// Directories show their count (even 0); files, symlinks, special files and excluded

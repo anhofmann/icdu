@@ -83,6 +83,10 @@ OPTIONS:
     -2                       browse while scanning (default)
     -q, --slow-ui-updates, --fast-ui-updates
                              update the screen every 2 s, or 10 times a second
+    -e, --extended, --no-extended
+                             record owner, group, mode and mtime of entries
+        --show-mtime, --hide-mtime
+                             show or hide the mtime column (needs -e)
     -h, --help               show this help
     -V, --version            show version
 ```
@@ -122,6 +126,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `]` / `[` | go to the next / previous match of the last search |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `c` | toggle the item count column (entries below each directory) |
+| `m` | toggle the modification time column (needs `-e`) |
 | `d` | delete selected entry (asks to confirm) |
 | `T` | show the largest files under the current directory |
 | `r` | rescan the current directory in place |
@@ -230,6 +235,19 @@ blank, like the cells of files, symlinks and special files. Counts below 100,000
 larger ones are compact and rounded down (`123k`, `4.1M`). Imported dumps (`-f`) get the same
 counts, derived on load. The info popup (`i`) shows the count as `total items`.
 
+### Owner, mode and modification time (`-e`)
+
+With `-e` icdu also records the owner, group, mode and modification time of every entry, like
+ncdu's extended mode. That costs 32 bytes per entry, and nothing without the flag.
+
+- `m` (or `--show-mtime`) adds a column with the modification time: a file's own, and for a
+  directory the latest one anywhere below it, so the list shows where something changed
+  recently. An excluded entry keeps its time to itself, like its size. Times are in UTC.
+- `i` shows permissions, owner and time as the scan recorded them.
+- `-o` writes the four fields (`uid`, `gid`, `mode`, `mtime`) to the dump and `-f` reads them.
+  As in ncdu, `-e` has to be given when reading a dump as well: `icdu -e -f dump.json`.
+  Without it the fields are passed over and take no memory.
+
 ### Rescanning in place
 
 Press `r` to rescan the directory you are viewing from disk without restarting (as in ncdu; at
@@ -256,6 +274,10 @@ exclusions, read errors) — plus, statted lazily from disk at open time, its pe
 numeric owner, modification time, inode, and link count. Nothing extra is stored per node, so
 the tree stays lean; if the path is gone (deleted mid-session) the popup says the on-disk
 details are unavailable. For an imported dump (`-f`) nothing is read from disk at all.
+
+With `-e` the popup shows permissions, owner and time as the scan or the dump recorded them,
+without asking the disk, and for a directory also the newest modification time below it. For
+an imported dump that is the only way to see them.
 
 ### Read errors
 
@@ -333,8 +355,9 @@ leaves the rest on disk. Any other key disarms the prompt.
 `-o` writes the ncdu export format (`[1, 2, {meta}, <root>]`), readable by ncdu and other tools,
 with the fields ncdu writes and only where they say something: `asize` and `dsize` unless zero,
 `dev` where it differs from the parent's, `ino`, `hlnkc` and `nlink` for hard links,
-`read_error`, `notreg`, `excluded`. For the same tree the dumps of icdu and ncdu 1.18 agree
-entry for entry. `-f` reads the same format
+`read_error`, `notreg`, `excluded`, and with `-e` also `uid`, `gid`, `mode` and `mtime`. For
+the same tree the dumps of icdu and ncdu 1.18 agree entry for entry, and a dump made by
+`ncdu -e` passes through `icdu -e -f - -o -` unchanged. `-f` reads the same format
 (including dumps produced by ncdu itself), re-deriving hard-link dedup so totals match a live scan.
 Names are read and written byte for byte, as ncdu does, so a name that is not valid UTF-8
 survives an import and a re-export unchanged.

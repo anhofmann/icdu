@@ -93,6 +93,60 @@ impl Node {
 }
 
 /// The links to one inode that a scan has delivered (files with a link count above 1 only).
+/// What `-e` records about an entry besides its sizes: ncdu's "extended information".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ext {
+    /// Modification time, in seconds since the epoch.
+    pub mtime: u64,
+    pub uid: u32,
+    pub gid: u32,
+    /// `st_mode`: the file type and the permission bits.
+    pub mode: u16,
+    /// Which of the four are known (`Ext::UID` and so on). A scan knows all of them or, for
+    /// an entry it could not examine, none. A dump may carry any of them.
+    pub has: u8,
+}
+
+impl Ext {
+    pub const UID: u8 = 1;
+    pub const GID: u8 = 2;
+    pub const MODE: u8 = 4;
+    pub const MTIME: u8 = 8;
+    pub const ALL: u8 = Ext::UID | Ext::GID | Ext::MODE | Ext::MTIME;
+
+    pub fn uid(&self) -> Option<u32> {
+        (self.has & Ext::UID != 0).then_some(self.uid)
+    }
+
+    pub fn gid(&self) -> Option<u32> {
+        (self.has & Ext::GID != 0).then_some(self.gid)
+    }
+
+    pub fn mode(&self) -> Option<u16> {
+        (self.has & Ext::MODE != 0).then_some(self.mode)
+    }
+
+    pub fn mtime(&self) -> Option<u64> {
+        (self.has & Ext::MTIME != 0).then_some(self.mtime)
+    }
+
+    /// The time as it is kept for "latest below": one more than the time, so that 0 can
+    /// stand for "none known".
+    fn stamp(&self) -> u64 {
+        self.mtime().map_or(0, |mtime| mtime.saturating_add(1))
+    }
+}
+
+/// One row of the extended table.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtRow {
+    ext: Ext,
+    /// The latest modification time in the subtree, the entry itself included, as a stamp
+    /// (see [`Ext::stamp`]). Kept like the sizes: raised as entries arrive, and what lies
+    /// below an excluded directory does not reach the directories above it.
+    latest: u64,
+}
+
 struct LinkSet {
     /// The link whose size is in the totals.
     counted: NodeIdx,
@@ -129,6 +183,9 @@ pub struct Tree {
     /// memory only for files with more than one link. Imported trees do not use it (their
     /// duplicates are marked by the import, and nothing in them is deleted or rescanned).
     links: HashMap<(u64, u64), LinkSet>,
+    /// Extended information (`-e`): one row per node, parallel to `nodes`. `None` unless the
+    /// mode is on, so that it costs nothing otherwise and `Node` stays as small as it is.
+    ext: Option<Vec<ExtRow>>,
     pub total_files: u64,
     pub total_dirs: u64,
     /// How many times a subtree has been detached (deleted or torn down for a rescan). While
@@ -173,6 +230,7 @@ impl Tree {
             nlinks: HashMap::new(),
             errors_below: HashMap::new(),
             links: HashMap::new(),
+            ext: None,
             generation: 0,
             total_dirs: 1,
             total_files: 0,
@@ -220,6 +278,9 @@ impl Tree {
         let new_items = u32::try_from(batch.nodes.len()).unwrap_or(u32::MAX);
         let mut new_dir_ids = Vec::new();
         let mut new_subdirs = Vec::new();
+        // Extended information comes as a list parallel to the entries, if at all.
+        let mut exts = batch.ext.into_iter();
+        let mut newest = 0u64;
 
         // Nearly every directory arrives as one batch, so reserve its children exactly and
         // avoid the Vec's growth slack. (A very large one arrives in several.)
@@ -255,6 +316,17 @@ impl Tree {
             let read_error = nn.error.is_some();
             if let Some(error) = nn.error {
                 self.errors.insert(idx, error);
+            }
+            if let Some(rows) = &mut self.ext {
+                let ext = exts.next().unwrap_or_default();
+                // Like its size, the time of an excluded entry is its own affair.
+                if nn.excluded == Excluded::No {
+                    newest = newest.max(ext.stamp());
+                }
+                rows.push(ExtRow {
+                    ext,
+                    latest: ext.stamp(),
+                });
             }
 
             self.nodes.push(Node {
@@ -292,6 +364,7 @@ impl Tree {
         // Push the children's combined counted size and their item count up through every
         // ancestor.
         self.add_totals(parent_idx, sum_apparent, sum_disk, new_items);
+        self.raise_latest(Some(parent_idx), newest);
 
         // Flush any batches that were waiting on directories we just created.
         for id in new_dir_ids {
@@ -335,6 +408,84 @@ impl Tree {
                 (apparent, disk) = (0, 0);
             }
             cur = n.parent;
+        }
+    }
+
+    /// Turn on extended mode (`-e`): from now on the tree keeps owner, group, mode and
+    /// modification time of every entry it is given them for.
+    pub fn set_extended(&mut self) {
+        if self.ext.is_none() {
+            self.ext = Some(vec![ExtRow::default(); self.nodes.len()]);
+        }
+    }
+
+    pub fn is_extended(&self) -> bool {
+        self.ext.is_some()
+    }
+
+    /// The extended information of an entry, if the tree keeps any and has some for it.
+    pub fn ext(&self, idx: NodeIdx) -> Option<Ext> {
+        let ext = self.ext.as_ref()?[idx].ext;
+        (ext.has != 0).then_some(ext)
+    }
+
+    /// Record the extended information of an entry. Without extended mode this does nothing.
+    pub fn set_ext(&mut self, idx: NodeIdx, ext: Ext) {
+        let Some(rows) = &mut self.ext else { return };
+        self.generation += 1;
+        rows[idx].ext = ext;
+        self.raise_latest(Some(idx), ext.stamp());
+    }
+
+    /// The latest modification time in a subtree, the entry itself included: what ncdu shows
+    /// and sorts by for a directory. `None` if no time is known there.
+    pub fn latest_mtime(&self, idx: NodeIdx) -> Option<u64> {
+        self.ext.as_ref()?[idx].latest.checked_sub(1)
+    }
+
+    /// Raise "latest below" to `stamp` at `start` and at every ancestor that is behind it.
+    ///
+    /// An ancestor that is not behind ends the walk: those above it are at least as late.
+    /// So does an excluded directory, as for sizes: what it holds does not reach beyond it.
+    fn raise_latest(&mut self, start: Option<NodeIdx>, stamp: u64) {
+        let Some(rows) = &mut self.ext else { return };
+        let mut cur = start;
+        while let Some(i) = cur {
+            if rows[i].latest >= stamp {
+                break;
+            }
+            rows[i].latest = stamp;
+            if self.nodes[i].excluded != Excluded::No {
+                break;
+            }
+            cur = self.nodes[i].parent;
+        }
+    }
+
+    /// The other direction: something whose latest time was `stamp` has been taken out from
+    /// under `start`. Every directory that had its time from there gets the latest of what
+    /// it still holds. That reads the children of those directories once, and of no others:
+    /// the walk ends at the first ancestor with a later time from elsewhere.
+    fn lower_latest(&mut self, start: Option<NodeIdx>, stamp: u64) {
+        let Some(rows) = &mut self.ext else { return };
+        let mut cur = start;
+        while let Some(i) = cur {
+            if rows[i].latest != stamp {
+                break;
+            }
+            let node = &self.nodes[i];
+            let latest = node
+                .children
+                .iter()
+                .filter(|&&child| self.nodes[child].excluded == Excluded::No)
+                .map(|&child| rows[child].latest)
+                .fold(rows[i].ext.stamp(), u64::max);
+            if latest == stamp || node.excluded != Excluded::No {
+                rows[i].latest = latest;
+                break;
+            }
+            rows[i].latest = latest;
+            cur = node.parent;
         }
     }
 
@@ -406,6 +557,10 @@ impl Tree {
             };
             let items = n.items.saturating_add(1);
             self.sub_totals(parent, ap, dk, items);
+            if let (Some(rows), Excluded::No) = (&self.ext, self.nodes[idx].excluded) {
+                let stamp = rows[idx].latest;
+                self.lower_latest(Some(parent), stamp);
+            }
         }
         // Cut the upward link too, so `is_attached` can tell the tombstones apart.
         self.nodes[idx].parent = None;
@@ -571,6 +726,16 @@ impl Tree {
         let removed_disk = n.disk.saturating_sub(own_disk);
         let removed_items = n.items;
         self.sub_totals(idx, removed_apparent, removed_disk, removed_items);
+        // The directory is left with its own modification time, and whatever above it had
+        // its latest time from below here looks again.
+        if let Some(rows) = &mut self.ext {
+            let own = rows[idx].ext.stamp();
+            let was = std::mem::replace(&mut rows[idx].latest, own);
+            if self.nodes[idx].excluded == Excluded::No {
+                let parent = self.nodes[idx].parent;
+                self.lower_latest(parent, was);
+            }
+        }
         let n = &mut self.nodes[idx];
         n.scanned = false;
         self.set_read_error(idx, false);
@@ -824,6 +989,9 @@ impl Tree {
             unscanned: 0,
             items: 0,
         });
+        if let Some(rows) = &mut self.ext {
+            rows.push(ExtRow::default());
+        }
         self.nodes[parent].children.push(idx);
         // Every entry is an item; only counted entries add to the sizes.
         let (apparent, disk) = if !shared && excluded == Excluded::No {
@@ -874,12 +1042,14 @@ mod tests {
             nodes: vec![dir("a", 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![dir("b", 2)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let a = t.nodes[t.root].children[0];
         let b = t.nodes[a].children[0];
@@ -907,6 +1077,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         // The listing of `a` broke off after one entry.
         t.apply(Batch {
@@ -914,6 +1085,7 @@ mod tests {
             nodes: vec![file("seen", 11)],
             error: Some("Stale file handle (os error 116)".into()),
             more: false,
+            ext: Vec::new(),
         });
         let (a, broken) = (idx_of(&t, "a"), idx_of(&t, "broken"));
         assert!(t.nodes[a].read_error && t.nodes[broken].read_error);
@@ -939,6 +1111,7 @@ mod tests {
             nodes: vec![dir("big", 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let big = idx_of(&t, "big");
         assert!(!t.subtree_complete(t.root) && t.nodes[big].unscanned == 1);
@@ -949,12 +1122,14 @@ mod tests {
             nodes: vec![file("f1", 10), dir("sub", 2)],
             error: None,
             more: true,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: Vec::new(),
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[big].children.len(), 2, "the entries are there");
         assert_eq!(t.nodes[big].items, 2);
@@ -974,6 +1149,7 @@ mod tests {
             nodes: vec![file("f2", 11)],
             error: None,
             more: true,
+            ext: Vec::new(),
         });
         assert!(!t.subtree_complete(big));
 
@@ -983,6 +1159,7 @@ mod tests {
             nodes: Vec::new(),
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(t.nodes[big].scanned);
         assert!(t.subtree_complete(big) && t.subtree_complete(t.root));
@@ -1001,6 +1178,7 @@ mod tests {
                 nodes: vec![file(name, 10)],
                 error: None,
                 more,
+                ext: Vec::new(),
             });
         }
         assert!(!t.orphans_is_empty());
@@ -1009,6 +1187,7 @@ mod tests {
             nodes: vec![dir("big", 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(t.orphans_is_empty());
         let big = idx_of(&t, "big");
@@ -1054,6 +1233,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let d = idx_of(&t, "d");
         assert_eq!(t.errors_below(t.root), 1);
@@ -1065,6 +1245,7 @@ mod tests {
             }],
             error: Some("Stale file handle".into()),
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!((t.errors_below(t.root), t.errors_below(d)), (3, 1));
 
@@ -1122,6 +1303,7 @@ mod tests {
             nodes: vec![dir("a", 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let a = t.nodes[t.root].children[0];
         assert!(
@@ -1136,6 +1318,7 @@ mod tests {
             nodes: vec![dir("b", 2)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(!t.subtree_complete(a), "a has an unscanned child b");
 
@@ -1145,6 +1328,7 @@ mod tests {
             nodes: vec![],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(t.subtree_complete(t.nodes[a].children[0]), "b complete");
         assert!(t.subtree_complete(a), "a complete");
@@ -1167,18 +1351,21 @@ mod tests {
             nodes: vec![dir("a", 1), file("b", 10)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("x", 11), dir("sub", 2)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: vec![file("y", 12)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t
     }
@@ -1238,12 +1425,14 @@ mod tests {
             nodes: vec![raw_dir],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("plain", 10)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let (d, plain) = (idx_of(&t, "d\u{FFFD}"), idx_of(&t, "plain"));
 
@@ -1304,12 +1493,14 @@ mod tests {
             nodes: vec![dir("a", 1), dir("b", 2), dir("c", 3)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![file("x", 11)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let a = idx_of(&t, "a");
         assert!(t.subtree_complete(a));
@@ -1327,6 +1518,7 @@ mod tests {
             nodes: vec![file("x", 11), dir("sub", base + 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_counts_in_step(&t, "rescan read a");
         t.apply(Batch {
@@ -1334,6 +1526,7 @@ mod tests {
             nodes: vec![],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(t.subtree_complete(a));
         assert_counts_in_step(&t, "rescan done");
@@ -1344,6 +1537,7 @@ mod tests {
             nodes: vec![],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(!t.subtree_complete(t.root), "c has not been read yet");
         assert_counts_in_step(&t, "b read");
@@ -1352,6 +1546,7 @@ mod tests {
             nodes: vec![],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(t.subtree_complete(t.root));
         assert_counts_in_step(&t, "c read");
@@ -1439,6 +1634,7 @@ mod tests {
             nodes: vec![excluded, file("f", 10)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let ex = idx_of(&t, "ex");
         let before = sizes(&t, t.root);
@@ -1456,6 +1652,7 @@ mod tests {
             nodes: vec![file("inside", 11)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(sizes(&t, t.root), before, "its content adds nothing");
     }
@@ -1471,6 +1668,222 @@ mod tests {
             .iter()
             .map(|&c| 1 + entries_below(t, c))
             .sum()
+    }
+
+    fn at(mtime: u64) -> Ext {
+        Ext {
+            mtime,
+            uid: 1000,
+            gid: 100,
+            mode: 0o100644,
+            has: Ext::ALL,
+        }
+    }
+
+    /// A tree in extended mode, with the modification times in brackets:
+    ///
+    /// ```text
+    /// /r (10)
+    /// ├── old (20)
+    /// ├── d (30)
+    /// │   ├── new (90)
+    /// │   └── mid (50)
+    /// └── skipped (99, excluded)
+    /// ```
+    fn extended_tree() -> Tree {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        t.set_extended();
+        t.set_ext(t.root, at(10));
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![
+                file("old", 2),
+                dir("d", 1),
+                NewNode {
+                    excluded: Excluded::Pattern,
+                    ..file("skipped", 3)
+                },
+            ],
+            error: None,
+            more: false,
+            ext: vec![at(20), at(30), at(99)],
+        });
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("new", 4), file("mid", 5)],
+            error: None,
+            more: false,
+            ext: vec![at(90), at(50)],
+        });
+        t
+    }
+
+    /// In extended mode every entry keeps what the scan saw of it, and a directory knows the
+    /// latest modification time below it at every moment, like it knows its size.
+    #[test]
+    fn extended_information_follows_the_tree() {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        t.set_extended();
+        t.set_ext(t.root, at(10));
+        assert_eq!(t.ext(t.root), Some(at(10)));
+        assert_eq!(t.latest_mtime(t.root), Some(10));
+
+        let t = extended_tree();
+        assert_eq!(t.ext(idx_of(&t, "old")), Some(at(20)));
+        assert_eq!(t.ext(idx_of(&t, "new")), Some(at(90)));
+        // A file's latest time is its own; a directory's is the latest below it.
+        assert_eq!(t.latest_mtime(idx_of(&t, "old")), Some(20));
+        assert_eq!(t.latest_mtime(idx_of(&t, "d")), Some(90));
+        assert_eq!(t.latest_mtime(t.root), Some(90));
+        // An excluded entry has its time, and keeps it to itself, as it does its size.
+        assert_eq!(t.latest_mtime(idx_of(&t, "skipped")), Some(99));
+    }
+
+    /// A directory that is newer than everything in it shows its own time.
+    #[test]
+    fn a_directory_counts_its_own_time_too() {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        t.set_extended();
+        t.set_ext(t.root, at(500));
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![file("f", 2)],
+            error: None,
+            more: false,
+            ext: vec![at(20)],
+        });
+        assert_eq!(t.latest_mtime(t.root), Some(500));
+    }
+
+    /// An entry the scan could not examine has no extended information, and one whose time
+    /// is the epoch itself still has one.
+    #[test]
+    fn unknown_and_zero_times_are_told_apart() {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        t.set_extended();
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![file("unknown", 2), file("epoch", 3)],
+            error: None,
+            more: false,
+            ext: vec![Ext::default(), at(0)],
+        });
+        assert_eq!(t.ext(idx_of(&t, "unknown")), None);
+        assert_eq!(t.latest_mtime(idx_of(&t, "unknown")), None);
+        assert_eq!(t.ext(idx_of(&t, "epoch")), Some(at(0)));
+        assert_eq!(t.latest_mtime(idx_of(&t, "epoch")), Some(0));
+        // The root itself was given no time; it has the one below it.
+        assert_eq!(t.ext(t.root), None);
+        assert_eq!(t.latest_mtime(t.root), Some(0));
+    }
+
+    /// Deleting what a directory had its latest time from: the time falls back to the
+    /// latest of what is left, all the way up.
+    #[test]
+    fn deleting_the_newest_entry_lowers_the_latest_time() {
+        let mut t = extended_tree();
+        // Not the newest: nothing changes.
+        t.delete_subtree(idx_of(&t, "mid"));
+        assert_eq!(t.latest_mtime(idx_of(&t, "d")), Some(90));
+        t.delete_subtree(idx_of(&t, "new"));
+        assert_eq!(t.latest_mtime(idx_of(&t, "d")), Some(30), "its own time");
+        assert_eq!(t.latest_mtime(t.root), Some(30));
+        t.delete_subtree(idx_of(&t, "d"));
+        assert_eq!(t.latest_mtime(t.root), Some(20), "`old` is what is left");
+        // The excluded entry never counted, so removing it changes nothing either.
+        t.delete_subtree(idx_of(&t, "skipped"));
+        assert_eq!(t.latest_mtime(t.root), Some(20));
+        t.delete_subtree(idx_of(&t, "old"));
+        assert_eq!(t.latest_mtime(t.root), Some(10), "the root's own time");
+    }
+
+    /// A rescan empties the directory: it is left with its own time until the new entries
+    /// arrive, and the directories above it follow both ways.
+    #[test]
+    fn rescan_resets_and_restores_the_latest_time() {
+        let mut t = extended_tree();
+        let d = idx_of(&t, "d");
+        let base = crate::scan::SCAN_ID_STRIDE;
+        t.begin_refresh(d, base);
+        assert_eq!(t.latest_mtime(d), Some(30));
+        assert_eq!(t.latest_mtime(t.root), Some(30));
+        assert_eq!(
+            t.ext(d),
+            Some(at(30)),
+            "what is known of the directory stays"
+        );
+        t.apply(Batch {
+            parent_id: base,
+            nodes: vec![file("newer", 6)],
+            error: None,
+            more: false,
+            ext: vec![at(95)],
+        });
+        assert_eq!(t.latest_mtime(d), Some(95));
+        assert_eq!(t.latest_mtime(t.root), Some(95));
+    }
+
+    /// Without `-e` the tree keeps none of it, whatever a batch carries.
+    #[test]
+    fn nothing_is_kept_without_extended_mode() {
+        let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
+        assert!(!t.is_extended());
+        t.set_ext(t.root, at(10));
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![file("f", 2)],
+            error: None,
+            more: false,
+            ext: vec![at(20)],
+        });
+        assert_eq!(t.ext(t.root), None);
+        assert_eq!(t.ext(idx_of(&t, "f")), None);
+        assert_eq!(t.latest_mtime(t.root), None);
+    }
+
+    /// The table is as long as the tree, however the nodes got there, and takes the fields
+    /// one by one, as a dump may have them.
+    #[test]
+    fn extended_rows_stay_parallel_to_the_nodes() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        t.set_extended();
+        let mut add = |parent, name: &str, kind| {
+            t.import_child(
+                parent,
+                name.into(),
+                kind,
+                1,
+                1,
+                1,
+                2,
+                false,
+                false,
+                Excluded::No,
+                false,
+            )
+        };
+        let d = add(0, "d", NodeKind::Dir);
+        let f = add(d, "f", NodeKind::File);
+        assert_eq!(t.ext(f), None);
+        t.set_ext(f, at(70));
+        assert_eq!(t.ext(f), Some(at(70)));
+        assert_eq!(t.latest_mtime(d), Some(70));
+        assert_eq!(t.latest_mtime(t.root), Some(70));
+        let only_time = Ext {
+            mtime: 80,
+            has: Ext::MTIME,
+            ..Ext::default()
+        };
+        t.set_ext(d, only_time);
+        assert_eq!(t.ext(d).unwrap().uid(), None);
+        assert_eq!(t.ext(d).unwrap().mtime(), Some(80));
+        assert_eq!(t.latest_mtime(t.root), Some(80));
+    }
+
+    /// Extended mode costs a row per entry, and only when it is on.
+    #[test]
+    fn an_extended_row_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<ExtRow>(), 32);
     }
 
     /// The item count must not cost memory: `items` fits in existing padding.
@@ -1490,6 +1903,7 @@ mod tests {
             nodes: vec![dir("a", 1), file("b", 10)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[t.root].items, 2);
         assert_eq!(items(&t, "a"), 0, "not read yet");
@@ -1498,6 +1912,7 @@ mod tests {
             nodes: vec![file("x", 11), dir("sub", 2)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(items(&t, "a"), 2);
         assert_eq!(t.nodes[t.root].items, 4);
@@ -1506,6 +1921,7 @@ mod tests {
             nodes: vec![file("y", 12)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(items(&t, "sub"), 1);
         assert_eq!(items(&t, "a"), 3);
@@ -1530,6 +1946,7 @@ mod tests {
             nodes: vec![file("x", 11), file("y", 12)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[t.root].items, 0, "orphan not grafted yet");
         t.apply(Batch {
@@ -1537,6 +1954,7 @@ mod tests {
             nodes: vec![dir("a", 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(t.orphans_is_empty());
         assert_eq!(items(&t, "a"), 2);
@@ -1563,18 +1981,21 @@ mod tests {
             nodes: vec![dir("a", 1), dir("b", 2)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![link("one", 50), file("x", 11)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 2,
             nodes: vec![link("two", 50)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t
     }
@@ -1600,6 +2021,7 @@ mod tests {
             }],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(!t.nodes[idx_of(&t, "elsewhere")].shared);
     }
@@ -1687,6 +2109,7 @@ mod tests {
             nodes: vec![link("one", 50), file("x", 11)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let again = t.nodes[a].children[0];
         assert!(
@@ -1711,6 +2134,7 @@ mod tests {
             nodes: vec![link("two", 50)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert!(!t.nodes[one].shared);
         assert!(t.nodes[t.nodes[b].children[0]].shared);
@@ -1733,6 +2157,7 @@ mod tests {
             ],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let (skipped, kept) = (idx_of(&t, "skipped"), idx_of(&t, "kept"));
         assert!(
@@ -1775,6 +2200,7 @@ mod tests {
             nodes: vec![counted, shared, excluded_dir, excluded_file],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[t.root].items, 4);
         assert_eq!(items(&t, "node_modules"), 0);
@@ -1855,6 +2281,7 @@ mod tests {
             nodes: vec![file("x", 11), dir("sub", base + 1), file("new", 13)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[a].items, 3);
         assert_eq!(t.nodes[t.root].items, 5);
@@ -1863,6 +2290,7 @@ mod tests {
             nodes: vec![file("y", 12)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[a].items, 4);
         assert_eq!(t.nodes[t.root].items, 6);
@@ -1886,12 +2314,14 @@ mod tests {
             nodes: vec![dir("a", 1)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         t.apply(Batch {
             parent_id: 1,
             nodes: vec![big("x", 10), big("y", 11)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         let a = idx_of(&t, "a");
         for idx in [a, t.root] {
@@ -1935,6 +2365,7 @@ mod tests {
             nodes: vec![file("p", 20), file("q", 21)],
             error: None,
             more: false,
+            ext: Vec::new(),
         });
         assert_eq!(t.nodes[a].items, u32::MAX);
         assert_eq!(t.nodes[t.root].items, u32::MAX);

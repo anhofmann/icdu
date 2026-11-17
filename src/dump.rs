@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use compact_str::CompactString;
 
-use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
+use crate::model::{Excluded, Ext, NodeIdx, NodeKind, Tree};
 
 const MAJOR: u32 = 1;
 const MINOR: u32 = 2;
@@ -137,6 +137,20 @@ fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> 
     {
         write!(w, ",\"dev\":{}", n.dev)?;
     }
+    if let Some(ext) = tree.ext(idx) {
+        if let Some(uid) = ext.uid() {
+            write!(w, ",\"uid\":{uid}")?;
+        }
+        if let Some(gid) = ext.gid() {
+            write!(w, ",\"gid\":{gid}")?;
+        }
+        if let Some(mode) = ext.mode() {
+            write!(w, ",\"mode\":{mode}")?;
+        }
+        if let Some(mtime) = ext.mtime() {
+            write!(w, ",\"mtime\":{mtime}")?;
+        }
+    }
     if n.hlink {
         write!(w, ",\"ino\":{},\"hlnkc\":true", n.ino)?;
         if let Some(nlink) = tree.nlink(idx) {
@@ -204,7 +218,15 @@ fn write_json_string<W: Write>(name: &[u8], w: &mut W) -> io::Result<()> {
 /// The dump is parsed as it is read: each entry goes straight into the tree, and nothing of
 /// the file is kept besides. Open directories are tracked on an explicit stack, so the depth
 /// of the tree is limited by memory only.
+#[cfg(test)]
 pub fn import<R: Read>(r: R) -> io::Result<Tree> {
+    import_with(r, false)
+}
+
+/// Read a dump. With `extended` (`-e`) the tree also keeps owner, group, mode and
+/// modification time of the entries that have them in the dump; without it they are passed
+/// over, as ncdu does, and cost no memory.
+pub fn import_with<R: Read>(r: R, extended: bool) -> io::Result<Tree> {
     let mut p = Parser::new(r);
     p.refuse_other_formats()?;
     p.expect(b'[')?;
@@ -240,6 +262,10 @@ pub fn import<R: Read>(r: R) -> io::Result<Tree> {
     let mut tree = Tree::new_imported(name, item.apparent, item.disk, root_dev, item.ino);
     if let Some(raw) = raw {
         tree.set_raw_name(tree.root, raw);
+    }
+    if extended {
+        tree.set_extended();
+        tree.set_ext(tree.root, item.ext);
     }
 
     // Dedup hard links during import too, so totals match a live scan.
@@ -301,6 +327,9 @@ pub fn import<R: Read>(r: R) -> io::Result<Tree> {
                 if let Some(nlink) = item.nlink {
                     tree.set_nlink(idx, u32::try_from(nlink).unwrap_or(u32::MAX));
                 }
+                if extended && item.ext.has != 0 {
+                    tree.set_ext(idx, item.ext);
+                }
                 if is_dir {
                     open.push(idx);
                 }
@@ -332,6 +361,8 @@ struct Item {
     notreg: bool,
     read_error: bool,
     excluded: Excluded,
+    /// Owner, group, mode and modification time, as far as the dump has them.
+    ext: Ext,
 }
 
 /// A name for the tree: the text to show, and the real bytes if they are not valid UTF-8.
@@ -366,6 +397,8 @@ struct Parser<R> {
     /// Reused for object keys and for strings that are skipped.
     scratch: Vec<u8>,
 }
+
+const WANT_UINT: &str = "expected a non-negative integer";
 
 impl<R: Read> Parser<R> {
     fn new(src: R) -> Self {
@@ -582,9 +615,17 @@ impl<R: Read> Parser<R> {
     /// A non-negative integer, the only kind of number the format uses for sizes, devices and
     /// inodes. A sign, a fraction or an exponent is an error, and so is a value above `u64`.
     fn uint(&mut self) -> io::Result<u64> {
-        const WANT: &str = "expected a non-negative integer";
+        let value = self.digits()?;
+        if matches!(self.peek()?, Some(b'.' | b'e' | b'E')) {
+            return Err(self.error(WANT_UINT));
+        }
+        Ok(value)
+    }
+
+    /// The digits of a non-negative integer.
+    fn digits(&mut self) -> io::Result<u64> {
         if !self.peek_token()?.is_ascii_digit() {
-            return Err(self.error(WANT));
+            return Err(self.error(WANT_UINT));
         }
         let mut value = 0u64;
         while let Some(digit @ b'0'..=b'9') = self.peek()? {
@@ -594,10 +635,31 @@ impl<R: Read> Parser<R> {
                 .ok_or_else(|| self.error("number too large"))?;
             self.bump();
         }
-        if matches!(self.peek()?, Some(b'.' | b'e' | b'E')) {
-            return Err(self.error(WANT));
+        Ok(value)
+    }
+
+    /// A time in seconds. ncdu takes a fraction here and drops it, so a dump of a tool that
+    /// writes one loads.
+    fn seconds(&mut self) -> io::Result<u64> {
+        let value = self.digits()?;
+        if self.peek()? == Some(b'.') {
+            self.bump();
+            while let Some(b'0'..=b'9') = self.peek()? {
+                self.bump();
+            }
+        }
+        if matches!(self.peek()?, Some(b'e' | b'E')) {
+            return Err(self.error(WANT_UINT));
         }
         Ok(value)
+    }
+
+    /// A number that has to fit the field it is for.
+    fn uint_up_to(&mut self, max: u64) -> io::Result<u64> {
+        match self.uint()? {
+            value if value <= max => Ok(value),
+            _ => Err(self.error("number too large")),
+        }
     }
 
     fn boolean(&mut self) -> io::Result<bool> {
@@ -714,6 +776,23 @@ impl<R: Read> Parser<R> {
             b"dev" => self.uint().map(|v| item.dev = Some(v)),
             b"nlink" => self.uint().map(|v| item.nlink = Some(v)),
             b"ino" => self.uint().map(|v| item.ino = v),
+            // ncdu's extended information, with the ranges ncdu gives the fields.
+            b"uid" => self.uint_up_to(u64::from(u32::MAX)).map(|v| {
+                item.ext.uid = v as u32;
+                item.ext.has |= Ext::UID;
+            }),
+            b"gid" => self.uint_up_to(u64::from(u32::MAX)).map(|v| {
+                item.ext.gid = v as u32;
+                item.ext.has |= Ext::GID;
+            }),
+            b"mode" => self.uint_up_to(u64::from(u16::MAX)).map(|v| {
+                item.ext.mode = v as u16;
+                item.ext.has |= Ext::MODE;
+            }),
+            b"mtime" => self.seconds().map(|v| {
+                item.ext.mtime = v;
+                item.ext.has |= Ext::MTIME;
+            }),
             b"hlnkc" => self.boolean().map(|v| item.hlink = v),
             b"notreg" => self.boolean().map(|v| item.notreg = v),
             b"read_error" => self.boolean().map(|v| item.read_error = v),
@@ -1116,6 +1195,113 @@ mod tests {
         assert!(!text.contains("\"age\""));
     }
 
+    /// What `ncdu -e` wrote for a tree with several owners, modes (setuid, sticky, a fifo, a
+    /// symlink) and times, a hard link and an excluded directory. (The path of the scanned
+    /// directory was shortened by hand.)
+    const NCDU_1_18_EXTENDED: &str = include_str!("../fixtures/ncdu-1.18-extended.json");
+
+    /// An extended dump, read with `-e` and written back: every entry has the fields ncdu
+    /// wrote, with the same values and in the same order.
+    #[test]
+    fn extended_dump_passes_through_unchanged() {
+        let t = import_with(NCDU_1_18_EXTENDED.as_bytes(), true).unwrap();
+        let mut out = Vec::new();
+        export(&t, &mut out).unwrap();
+        let ours = String::from_utf8(out).unwrap();
+        assert_eq!(entries(&ours), entries(NCDU_1_18_EXTENDED));
+
+        let ext = |name: &str| t.ext(named(&t, name).0);
+        let script = ext("script.sh").unwrap();
+        assert_eq!(
+            (script.uid, script.gid, script.mode, script.mtime),
+            (1000, 100, 0o100750, 1_709_208_000)
+        );
+        assert_eq!(ext("setuid-tool").unwrap().mode, 0o104755);
+        assert_eq!(ext("shared-tmp").unwrap().mode, 0o041777);
+        assert_eq!(ext("symlink").unwrap().mode, 0o120777);
+        assert_eq!(ext("/fixture").unwrap().mtime, 1_514_764_800);
+        // ncdu does not look at what a pattern excludes, so there is nothing about it.
+        assert_eq!(ext("build"), None);
+        // A directory's latest time is the latest below it.
+        assert_eq!(t.latest_mtime(named(&t, "docs").0), Some(1_709_208_000));
+        assert_eq!(t.latest_mtime(named(&t, "links").0), Some(1_640_995_200));
+        assert_eq!(t.latest_mtime(t.root), Some(1_709_208_000));
+    }
+
+    /// Without `-e` the fields are passed over, as in ncdu: the tree does not keep them, and
+    /// they are not written back. Everything else is the same tree.
+    #[test]
+    fn extended_fields_need_the_flag() {
+        let plain = import(NCDU_1_18_EXTENDED.as_bytes()).unwrap();
+        assert!(!plain.is_extended());
+        assert_eq!(plain.ext(plain.root), None);
+        let mut out = Vec::new();
+        export(&plain, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        for field in ["\"uid\"", "\"gid\"", "\"mode\"", "\"mtime\""] {
+            assert!(!text.contains(field), "{field} in {text}");
+        }
+        let extended = import_with(NCDU_1_18_EXTENDED.as_bytes(), true).unwrap();
+        assert_eq!(plain.nodes.len(), extended.nodes.len());
+        assert_eq!(
+            plain.nodes[plain.root].apparent,
+            extended.nodes[extended.root].apparent
+        );
+    }
+
+    /// The values of the four fields, read the way ncdu 1.18 reads them (probed with dumps
+    /// like these), with one exception: ncdu 1.18 stops at a uid of 2^31, ncdu 2 and the
+    /// kernel at 2^32.
+    #[test]
+    fn extended_fields_are_read_like_ncdu_reads_them() {
+        let dump =
+            |fields: &str| format!(r#"[1,2,{{}},[{{"name":"/r"}},{{"name":"f",{fields}}}]]"#);
+        let read = |fields: &str| {
+            import_with(dump(fields).as_bytes(), true).map(|t| (t.ext(1), written(&t)))
+        };
+        // A fraction of a second is dropped.
+        let (ext, text) = read(r#""mtime":17.999"#).unwrap();
+        assert_eq!(ext.unwrap().mtime(), Some(17));
+        assert!(text.contains(r#"{"name":"f","mtime":17}"#), "{text}");
+        let (ext, _) = read(r#""mtime":18446744073709551615"#).unwrap();
+        assert_eq!(ext.unwrap().mtime(), Some(u64::MAX));
+        // A dump may have some of the fields. Those are kept, and no others are made up.
+        let (ext, text) = read(r#""uid":5"#).unwrap();
+        let ext = ext.unwrap();
+        assert_eq!(
+            (ext.uid(), ext.gid(), ext.mode(), ext.mtime()),
+            (Some(5), None, None, None)
+        );
+        assert!(text.contains(r#"{"name":"f","uid":5}"#), "{text}");
+        let (ext, _) = read(r#""uid":4294967295,"gid":0,"mode":65535"#).unwrap();
+        let ext = ext.unwrap();
+        assert_eq!(
+            (ext.uid(), ext.gid(), ext.mode(), ext.mtime()),
+            (Some(u32::MAX), Some(0), Some(u16::MAX), None)
+        );
+        assert_eq!(read(r#""asize":1"#).unwrap().0, None);
+        // What does not fit, or is no number, is an error, with `-e` and without.
+        for bad in [
+            r#""mtime":-1"#,
+            r#""mtime":1e3"#,
+            r#""mtime":"yesterday""#,
+            r#""uid":4294967296"#,
+            r#""gid":-1"#,
+            r#""gid":1.5"#,
+            r#""mode":65536"#,
+            r#""mode":"x""#,
+        ] {
+            assert!(read(bad).is_err(), "{bad}");
+            assert!(import(dump(bad).as_bytes()).is_err(), "{bad} without -e");
+        }
+    }
+
+    fn written(t: &Tree) -> String {
+        let mut out = Vec::new();
+        export(t, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
     /// An entry without `dev` is on the device of its parent. Hard links are told apart by
     /// device and inode, so two files with the same inode number on different devices are two
     /// files; reading the missing `dev` as 0 merged them.
@@ -1370,11 +1556,11 @@ mod tests {
     }
 
     /// Fields this version does not know are skipped, whatever their value looks like, so a
-    /// dump with a higher minor version or extended information still loads.
+    /// dump with a higher minor version still loads.
     #[test]
     fn import_skips_unknown_fields() {
         let json = r#"[1, 3, {"progname":"ncdu","nested":{"a":[1,2,{"b":null}]},"n":-1.5e3},
-            [ {"name":"/r","mode":16877,"mtime":-1.5,"uid":0,"future":[[],{},"]}\"",true,null]} ,
+            [ {"name":"/r","kind":16877,"when":-1.5,"who":0,"future":[[],{},"]}\"",true,null]} ,
               {"extra":{"name":"not the name"},"name":"f","asize":10,"nlink":2,"x":false}
             ] ]
         "#;

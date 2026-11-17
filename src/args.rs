@@ -40,8 +40,10 @@ pub struct Args {
     pub feedback: Option<u8>,
     /// `-q`: redraw only every two seconds while scanning, for slow remote connections.
     pub slow_ui: bool,
-    /// `-e`: extended information. Accepted for compatibility; not implemented yet.
+    /// `-e`: record owner, group, mode and modification time of every entry.
     pub extended: bool,
+    /// `--show-mtime`: start with the modification time column. Only with `extended`.
+    pub show_mtime: bool,
 }
 
 impl Default for Args {
@@ -61,6 +63,7 @@ impl Default for Args {
             feedback: None,
             slow_ui: false,
             extended: false,
+            show_mtime: false,
         }
     }
 }
@@ -122,7 +125,8 @@ enum Action {
     Input,
     Feedback(u8),
     SlowUi(bool),
-    Extended,
+    Extended(bool),
+    Mtime(bool),
 }
 
 /// One flag: how it is spelled, whether it takes a value, and what `--help` says about it.
@@ -280,9 +284,34 @@ pub const FLAGS: &[Flag] = &[
         negation: Some("slow-ui-updates"),
         ..flag(&[], &["fast-ui-updates"], None, "", Action::SlowUi(false))
     },
-    // ncdu's extended information: accepted, so that command lines written for ncdu run, but
-    // without effect yet. Not advertised until it has one.
-    flag(&['e'], &["extended"], None, "", Action::Extended),
+    Flag {
+        negation: Some("no-extended"),
+        ..flag(
+            &['e'],
+            &["extended"],
+            None,
+            "record owner, group, mode and mtime of entries",
+            Action::Extended(true),
+        )
+    },
+    Flag {
+        negation: Some("extended"),
+        ..flag(&[], &["no-extended"], None, "", Action::Extended(false))
+    },
+    Flag {
+        negation: Some("hide-mtime"),
+        ..flag(
+            &[],
+            &["show-mtime"],
+            None,
+            "show or hide the mtime column (needs -e)",
+            Action::Mtime(true),
+        )
+    },
+    Flag {
+        negation: Some("show-mtime"),
+        ..flag(&[], &["hide-mtime"], None, "", Action::Mtime(false))
+    },
     flag(&['h'], &["help"], None, "show this help", Action::Help),
     flag(
         &['V', 'v'],
@@ -415,7 +444,8 @@ fn apply(
         Action::Input => args.import = Some(value),
         Action::Feedback(level) => args.feedback = Some(level),
         Action::SlowUi(slow) => args.slow_ui = slow,
-        Action::Extended => args.extended = true,
+        Action::Extended(on) => args.extended = on,
+        Action::Mtime(show) => args.show_mtime = show,
     }
     Ok(None)
 }
@@ -797,6 +827,17 @@ mod tests {
                     ..d()
                 },
             ),
+            // The last of a pair wins, as for every flag with a negation.
+            (&["-e", "--no-extended"], d()),
+            (
+                &["--no-extended", "-e", "--show-mtime"],
+                Args {
+                    extended: true,
+                    show_mtime: true,
+                    ..d()
+                },
+            ),
+            (&["--show-mtime", "--hide-mtime"], d()),
         ];
         for (line, want) in table {
             assert_eq!(args(line), want, "{line:?}");
@@ -1051,8 +1092,6 @@ mod tests {
                 );
             }
         }
-        // Flags that are accepted for compatibility only stay out of it.
-        assert!(!mentions("--extended"));
         // No line runs past the usual 80 columns.
         for line in help.lines() {
             assert!(line.chars().count() <= 80, "{line}");

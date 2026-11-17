@@ -59,6 +59,7 @@ KEYS:
     E               export JSON   b               shell in this directory
     x / !           next error    ?               help    q  quit
     Home/End, G     top/bottom    c               item counts
+    m               modification times (with -e)
     C-l             redraw        C-z             suspend (fg resumes)
     in the search:  C-u clear the line, C-w delete a word",
         env!("CARGO_PKG_VERSION"),
@@ -88,7 +89,7 @@ fn main() {
     if let Some(dest) = args.export.clone() {
         let tree = if let Some(src) = &args.import {
             // Convert/recompute: load a dump and write it back out.
-            unwrap_or_die(load_import(src), src)
+            unwrap_or_die(load_import(src, args.extended), src)
         } else {
             let (tree, root, opts) = prepare_scan(&args);
             scan_to_completion(tree, root, opts, args.feedback_mode())
@@ -103,9 +104,10 @@ fn main() {
 
     // --- Import mode: load a dump, browse it, no scanning. ---
     if let Some(src) = &args.import {
-        let tree = unwrap_or_die(load_import(src), src);
+        let tree = unwrap_or_die(load_import(src, args.extended), src);
         let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
         app.show_item_count = args.show_item_count;
+        app.show_mtime = args.show_mtime;
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
         run_ui(&mut app, args.slow_ui);
@@ -118,6 +120,7 @@ fn main() {
         let tree = scan_to_completion(tree, root, opts.clone(), mode);
         let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
         app.show_item_count = args.show_item_count;
+        app.show_mtime = args.show_mtime;
         // The scan is over, but `r` can still read a directory again.
         app.set_scan_opts(opts);
         run_ui(&mut app, args.slow_ui);
@@ -127,6 +130,7 @@ fn main() {
     let scan = scan::start(root, opts.clone());
     let mut app = App::new(tree, args.disk_usage, args.read_only > 0, true);
     app.show_item_count = args.show_item_count;
+    app.show_mtime = args.show_mtime;
     app.attach_scan(scan, opts);
 
     run_ui(&mut app, args.slow_ui);
@@ -186,6 +190,10 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
     if let Some(raw) = raw_root {
         tree.set_raw_name(tree.root, raw);
     }
+    if args.extended {
+        tree.set_extended();
+        tree.set_ext(tree.root, scan::ext_of(&meta));
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -198,6 +206,7 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
         // Precompute the mtime cutoffs once, at scan start.
         older_than: args.older_than.map(|d| now - d as i64),
         newer_than: args.newer_than.map(|d| now - d as i64),
+        extended: args.extended,
     };
     (tree, root, opts)
 }
@@ -272,11 +281,11 @@ fn draw_due(slow: bool, scanning: bool, acted: bool, since_last: Duration) -> bo
 /// How often `-q` redraws the screen while a scan runs.
 const SLOW_REDRAW: Duration = Duration::from_secs(2);
 
-fn load_import(src: &str) -> std::io::Result<Tree> {
+fn load_import(src: &str, extended: bool) -> std::io::Result<Tree> {
     if src == "-" {
-        dump::import(BufReader::new(std::io::stdin().lock()))
+        dump::import_with(BufReader::new(std::io::stdin().lock()), extended)
     } else {
-        dump::import(BufReader::new(std::fs::File::open(src)?))
+        dump::import_with(BufReader::new(std::fs::File::open(src)?), extended)
     }
 }
 
@@ -580,6 +589,7 @@ fn decode_key(
         KeyCode::Char('s') => KeyAction::ToggleSort,
         KeyCode::Char('a') => KeyAction::ToggleUsage,
         KeyCode::Char('c') => KeyAction::ToggleItemCount,
+        KeyCode::Char('m') => KeyAction::ToggleMtime,
         KeyCode::Char('d') => KeyAction::Delete,
         KeyCode::Char('o') => KeyAction::Open,
         KeyCode::Char('T') => KeyAction::TopFiles,
@@ -753,6 +763,7 @@ mod tests {
             (ch('s'), none, Some(ToggleSort)),
             (ch('a'), none, Some(ToggleUsage)),
             (ch('c'), none, Some(ToggleItemCount)),
+            (ch('m'), none, Some(ToggleMtime)),
             (ch('d'), none, Some(Delete)),
             (ch('o'), none, Some(Open)),
             (ch('T'), none, Some(TopFiles)),

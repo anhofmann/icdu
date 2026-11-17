@@ -31,7 +31,7 @@ use compact_str::CompactString;
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 
 use crate::glob;
-use crate::model::{Excluded, NodeKind};
+use crate::model::{Excluded, Ext, NodeKind};
 
 /// A single freshly-discovered filesystem entry, sent to the UI to be grafted into the tree.
 pub struct NewNode {
@@ -74,6 +74,9 @@ pub struct Batch {
     /// More batches for this directory follow. The directory counts as read with the batch
     /// that says `false`.
     pub more: bool,
+    /// With `Opts::extended`: owner, group, mode and modification time of each of `nodes`,
+    /// in the same order. Empty otherwise, so that an entry in transit is no larger for it.
+    pub ext: Vec<Ext>,
 }
 
 /// The most entries of one directory sent in one batch.
@@ -420,6 +423,8 @@ pub struct Opts {
     pub older_than: Option<i64>,
     /// `--newer-than`: entries modified after this Unix time (seconds) are excluded.
     pub newer_than: Option<i64>,
+    /// Record owner, group, mode and modification time of every entry (ncdu `-e`).
+    pub extended: bool,
 }
 
 /// State shared by workers only (NOT the UI), so it holds the event `Sender`.
@@ -436,6 +441,8 @@ struct Shared {
     older_than: Option<i64>,
     /// `--newer-than` cutoff in Unix seconds; entries modified after it are excluded.
     newer_than: Option<i64>,
+    /// Send extended information with every batch.
+    extended: bool,
     /// A rescan's starting directory: its job id and what it must still be when it is read.
     start_check: Option<(u64, Identity)>,
     /// The id of the directory the scan starts at.
@@ -555,6 +562,7 @@ fn start_limited(
             .collect(),
         older_than: opts.older_than,
         newer_than: opts.newer_than,
+        extended: opts.extended,
         start_check: identity.map(|identity| (id_base, identity)),
         start_id: id_base,
     });
@@ -610,22 +618,24 @@ fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
 
 fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     // Send entries of this directory to the UI, waiting if too much is on its way already.
-    let send = |nodes: Vec<NewNode>, error: Option<String>, more: bool| {
+    let send = |nodes: Vec<NewNode>, ext: Vec<Ext>, error: Option<String>, more: bool| {
+        debug_assert!(ext.is_empty() || ext.len() == nodes.len());
         shared.gate.enter(nodes.len());
         let _ = shared.ev_tx.send(Batch {
             parent_id: job.id,
             nodes,
             error,
             more,
+            ext,
         });
     };
-    let failed = |error: String| send(Vec::new(), Some(error), false);
+    let failed = |error: String| send(Vec::new(), Vec::new(), Some(error), false);
     let read = match std::fs::read_dir(&job.path) {
         Ok(r) => r,
         // Removed since its parent was listed: an empty directory, not an error. The
         // directory the scan was asked to start at is different: that one has to exist.
         Err(e) if vanished(&e) && job.id != shared.start_id => {
-            return send(Vec::new(), None, false);
+            return send(Vec::new(), Vec::new(), None, false);
         }
         Err(e) => return failed(e.to_string()),
     };
@@ -640,6 +650,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     }
 
     let mut nodes = Vec::new();
+    let mut exts = Vec::new();
     let mut child_jobs = Vec::new();
     // For the exclude patterns: this directory's path, and room to build an entry's path in.
     let dir_bytes = job.path.as_os_str().as_bytes();
@@ -681,6 +692,10 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                     error: Some(e.to_string().into()),
                     dir_id: None,
                 });
+                if shared.extended {
+                    // Nothing is known about an entry that could not be examined.
+                    exts.push(Ext::default());
+                }
                 continue;
             }
         };
@@ -742,20 +757,41 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
             error: None,
             dir_id,
         });
+        if shared.extended {
+            exts.push(ext_of(&meta));
+        }
         if let Some(id) = dir_id {
             child_jobs.push(DirJob { id, path });
         }
         // A directory with very many entries goes out in parts: what has been read so far is
         // on screen, and its subdirectories are being read, while the listing continues.
         if nodes.len() >= BATCH_ENTRIES {
-            send(std::mem::take(&mut nodes), None, true);
+            send(
+                std::mem::take(&mut nodes),
+                std::mem::take(&mut exts),
+                None,
+                true,
+            );
             enqueue(frontier, std::mem::take(&mut child_jobs));
         }
     }
 
     // The last (usually the only) batch says that the directory has been read.
-    send(nodes, listing.error, false);
+    send(nodes, exts, listing.error, false);
     enqueue(frontier, child_jobs);
+}
+
+/// The extended information (`-e`) in what `lstat` returned.
+pub fn ext_of(meta: &std::fs::Metadata) -> Ext {
+    Ext {
+        // The dump format has no negative times; one before 1970 becomes 1970.
+        mtime: u64::try_from(meta.mtime()).unwrap_or(0),
+        uid: meta.uid(),
+        gid: meta.gid(),
+        // The file type and the permission bits are the low 16 bits everywhere.
+        mode: meta.mode() as u16,
+        has: Ext::ALL,
+    }
 }
 
 /// Queue the subdirectories found, and wake idle workers. Always called AFTER the batch that
@@ -808,6 +844,7 @@ mod tests {
             root_dev,
             older_than: None,
             newer_than: None,
+            extended: false,
         }
     }
 
@@ -1862,6 +1899,85 @@ mod tests {
             assert_eq!(excluded, *expected, "--exclude {pattern:?}");
         }
         fs::remove_dir_all(&parent).unwrap();
+    }
+
+    /// With `-e` the scan delivers owner, group, mode and modification time of every entry,
+    /// and the tree keeps them; a directory then knows the latest change below it.
+    #[test]
+    fn extended_scan_records_owner_mode_and_time() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, UNIX_EPOCH};
+        let base = std::env::temp_dir().join(format!("icdu_extended_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("f"), b"12345").unwrap();
+        fs::write(base.join("sub/g"), b"1").unwrap();
+        std::os::unix::fs::symlink("f", base.join("link")).unwrap();
+        fs::set_permissions(base.join("f"), fs::Permissions::from_mode(0o640)).unwrap();
+        let touch = |path: &str, secs: u64| {
+            fs::File::open(base.join(path))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        touch("f", 1_000_000_000);
+        touch("sub/g", 1_500_000_000);
+        // The directory itself is older than what is in it.
+        touch("sub", 1_200_000_000);
+
+        let scan = |extended: bool| {
+            let meta = fs::symlink_metadata(&base).unwrap();
+            let mut o = opts(2, meta.dev());
+            o.extended = extended;
+            let mut tree = Tree::new(
+                base.to_string_lossy().into(),
+                meta.len(),
+                meta.blocks() * 512,
+                meta.dev(),
+                meta.ino(),
+            );
+            if extended {
+                tree.set_extended();
+                tree.set_ext(tree.root, ext_of(&meta));
+            }
+            for batch in start(base.clone(), o).events.iter() {
+                tree.apply(batch);
+            }
+            tree
+        };
+        let tree = scan(true);
+        let named = |name: &str| tree.nodes.iter().position(|n| n.name == name).unwrap();
+        // Every entry has what `lstat` says about it.
+        for (name, path) in [("f", "f"), ("g", "sub/g"), ("sub", "sub"), ("link", "link")] {
+            let on_disk = ext_of(&fs::symlink_metadata(base.join(path)).unwrap());
+            assert_eq!(tree.ext(named(name)), Some(on_disk), "{name}");
+        }
+        let f = tree.ext(named("f")).unwrap();
+        assert_eq!(f.mode, 0o100640);
+        assert_eq!(f.mtime, 1_000_000_000);
+        assert_eq!(tree.ext(named("link")).unwrap().mode & 0o170000, 0o120000);
+        assert_eq!(tree.ext(named("sub")).unwrap().mtime, 1_200_000_000);
+        assert_eq!(tree.latest_mtime(named("sub")), Some(1_500_000_000));
+        assert!(tree.latest_mtime(tree.root) >= Some(1_500_000_000));
+
+        // And the dump has the four fields, between the device and the inode as in ncdu.
+        let mut out = Vec::new();
+        crate::dump::export(&tree, &mut out).unwrap();
+        let dump = String::from_utf8(out).unwrap();
+        let fields = format!(
+            r#""uid":{},"gid":{},"mode":33184,"mtime":1000000000}}"#,
+            f.uid, f.gid
+        );
+        assert!(dump.contains(&fields), "{fields}\nnot in\n{dump}");
+
+        // Without the flag nothing of it is kept or written.
+        let plain = scan(false);
+        assert!(!plain.is_extended());
+        assert_eq!(plain.ext(named("f")), None);
+        let mut out = Vec::new();
+        crate::dump::export(&plain, &mut out).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("\"mtime\""));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// An entry that is gone is not an error; everything else is.
