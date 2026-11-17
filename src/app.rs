@@ -140,6 +140,8 @@ pub struct Find {
     pub scoped: bool,
     /// The query was edited since the last tick; the next tick (re)arms the debounce.
     edited: bool,
+    /// Run the pending query on the next tick, without waiting out the debounce.
+    rush: bool,
     /// When the debounced query is due to run.
     due: Option<Instant>,
     /// The query the current pass matches against; None while nothing is searched.
@@ -176,6 +178,7 @@ impl Find {
             dir,
             scoped: false,
             edited: false,
+            rush: false,
             due: None,
             active: None,
             cursor: 0,
@@ -202,6 +205,12 @@ impl Find {
     pub fn progress(&self, tree: &Tree) -> Option<u8> {
         (self.busy(tree) && !self.refreshing)
             .then(|| (self.cursor as f64 / tree.nodes.len().max(1) as f64 * 100.0) as u8)
+    }
+
+    /// True while the query in the input line has not been searched for yet: it was edited
+    /// and the debounce is still running. The list then belongs to the query before.
+    pub fn pending(&self) -> bool {
+        self.edited || self.due.is_some()
     }
 
     /// True once there are more matches than the list keeps.
@@ -264,6 +273,9 @@ impl Find {
         if self.edited {
             self.edited = false;
             self.due = Some(now + FIND_DEBOUNCE);
+        }
+        if std::mem::take(&mut self.rush) && self.due.is_some() {
+            self.due = Some(now);
         }
         if self.due.is_some_and(|d| now >= d) {
             self.due = None;
@@ -1625,6 +1637,14 @@ impl App {
                     }
                     KeyAction::Bottom => {
                         f.selected = f.hits.last().copied();
+                        true
+                    }
+                    // While a change of the query has not been searched for yet, the list
+                    // is still the one of the query before. Enter must not jump to one of
+                    // those: it runs the new query at once instead, and the next Enter
+                    // jumps to what that finds.
+                    KeyAction::Enter if f.pending() => {
+                        f.rush = true;
                         true
                     }
                     KeyAction::Enter => match f.selected {
@@ -5161,6 +5181,41 @@ mod tests {
         app.on_key(KeyAction::Enter);
         let sel = app.selected.expect("the hit is selected");
         assert!(app.sorted_children().contains(&sel));
+    }
+
+    /// For a moment after a key the list still shows the hits of the query before. Enter in
+    /// that moment does not jump to one of them. It runs the new query without waiting, and
+    /// a second Enter jumps to what that found.
+    #[test]
+    fn find_enter_does_not_jump_to_a_stale_hit() {
+        let mut app = app_for_find();
+        let t0 = search(&mut app, "readme");
+        assert_eq!(find_state(&app).total, 3);
+        let (cur, sel) = (app.cur, app.selected);
+
+        // The query becomes "readme.md"; the list is still the one for "readme".
+        type_query(&mut app, ".md");
+        app.find_tick(t0, usize::MAX);
+        assert!(find_state(&app).pending());
+        assert_eq!(find_state(&app).hits.len(), 3, "stale");
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::Find(_)), "no jump");
+        assert_eq!((app.cur, app.selected), (cur, sel));
+
+        // The very next frame searches, well before the debounce would have run out.
+        app.find_tick(t0 + Duration::from_millis(1), usize::MAX);
+        assert!(!find_state(&app).pending());
+        assert_eq!(hit_names(&app), vec!["readme.md"]);
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.selected, Some(idx_named(&app, "readme.md")));
+
+        // The same when the key has not even been seen by a frame yet.
+        let mut app = app_for_find();
+        search(&mut app, "readme");
+        type_query(&mut app, ".md");
+        app.on_key(KeyAction::Enter);
+        assert!(matches!(app.modal, Modal::Find(_)), "no jump");
     }
 
     /// Ctrl-U empties the query, Ctrl-W removes the last word, and each restarts the search.

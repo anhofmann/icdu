@@ -201,16 +201,64 @@ fn fmt_count(n: usize) -> String {
 /// next `/` when there is one, so the tail reads `…/deep/dir/name` and the name (where the
 /// match is) stays visible.
 fn truncate_left(path: &str, width: usize) -> usize {
-    let len = path.chars().count();
-    if len <= width {
+    if display_width(path) <= width {
         return 0;
     }
-    // Keep the last `width - 1` chars; one column goes to the ellipsis.
-    let skip = len - width.saturating_sub(1);
-    let start = path.char_indices().nth(skip).map_or(path.len(), |(i, _)| i);
+    // Keep as much of the end as fits in `width - 1` columns; one goes to the ellipsis.
+    let room = width.saturating_sub(1);
+    let mut used = 0;
+    let mut start = path.len();
+    for (at, c) in path.char_indices().rev() {
+        used += display_width(c.encode_utf8(&mut [0; 4]));
+        if used > room {
+            break;
+        }
+        start = at;
+    }
     match path[start..].find('/') {
         Some(rel) => start + rel,
         None => start,
+    }
+}
+
+/// The columns a string takes on screen. Not its number of characters: CJK characters and
+/// most emoji are two columns wide, combining marks none.
+fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Rows of hits the search popup shows in a terminal of the given height. The page keys move
+/// by this much, and drawing lays the popup out to match.
+pub fn find_rows(terminal_height: u16) -> usize {
+    // The popup leaves a row above and below (but is at least 7 high, as far as there is
+    // room); inside its border are the query line, the hits and the hint line.
+    let popup = terminal_height
+        .saturating_sub(2)
+        .max(7)
+        .min(terminal_height);
+    popup.saturating_sub(4).max(1) as usize
+}
+
+/// What the search popup says when it has no hits to list. `active` is the query the list
+/// belongs to, `query` the one in the input line.
+fn find_empty_message(
+    active: Option<&str>,
+    query: &str,
+    scoped: bool,
+    busy: bool,
+    scanning: bool,
+) -> &'static str {
+    match active {
+        None if !query.is_empty() => "",
+        None if scoped => "  type to search entry names below this directory",
+        None => "  type to search entry names across the whole tree",
+        // The list is for an earlier query, or the pass is still running.
+        Some(active) if active != query || busy => "",
+        // A scan may still bring a match: "no matches" would be a promise it cannot keep.
+        Some(_) if scanning && scoped => "  no matches below this directory yet, still scanning",
+        Some(_) if scanning => "  no matches yet, still scanning",
+        Some(_) if scoped => "  no matches below this directory (Tab searches the whole tree)",
+        Some(_) => "  no matches",
     }
 }
 
@@ -261,7 +309,8 @@ fn dir_label(name: &str, width: usize) -> String {
 /// to it. They are only built for the rows on screen.
 fn render_find(f: &mut Frame, app: &App, find: &Find) {
     let width = f.area().width.saturating_sub(4).clamp(28, 120);
-    let height = f.area().height.saturating_sub(2).max(7);
+    // The list gets `find_rows` rows; around it are the query line, the hint and the border.
+    let height = find_rows(f.area().height) as u16 + 4;
     let area = popup(f.area(), width, height);
     f.render_widget(Clear, area);
 
@@ -302,19 +351,13 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
 
     let dim = Style::default().fg(Color::DarkGray);
     if find.hits.is_empty() {
-        let msg = match (&find.active, scope) {
-            (None, None) if find.query.is_empty() => {
-                "  type to search entry names across the whole tree"
-            }
-            (None, Some(_)) if find.query.is_empty() => {
-                "  type to search entry names below this directory"
-            }
-            (Some(q), None) if *q == find.query && !busy => "  no matches",
-            (Some(q), Some(_)) if *q == find.query && !busy => {
-                "  no matches below this directory (Tab searches the whole tree)"
-            }
-            _ => "",
-        };
+        let msg = find_empty_message(
+            find.active.as_deref(),
+            &find.query,
+            scope.is_some(),
+            busy,
+            app.scanning,
+        );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(msg, dim))),
             list_area,
@@ -1054,10 +1097,11 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar_scale, confirm_export_text, dir_label, find_title, fmt_count, fmt_items, footer_split,
-        hard_link_note, help_layout, help_scroll_hint, item_cell, left_to_read, list_title,
-        listing_state, scan_progress, size_cell, truncate_left, HelpLayout, Listing,
-        HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH,
+        bar_scale, confirm_export_text, dir_label, display_width, find_empty_message, find_rows,
+        find_title, fmt_count, fmt_items, footer_split, hard_link_note, help_layout,
+        help_scroll_hint, item_cell, left_to_read, list_title, listing_state, scan_progress,
+        size_cell, truncate_left, HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS,
+        HELP_KEY_WIDTH, ITEMS_WIDTH,
     };
     use crate::model::{Excluded, NodeKind, Tree};
 
@@ -1501,5 +1545,85 @@ mod tests {
         let cut = truncate_left(p, 6);
         assert!(p.is_char_boundary(cut));
         assert_eq!(&p[cut..], "/ëëë");
+    }
+
+    /// What counts is the width on screen. CJK characters and emoji take two columns each,
+    /// so fewer of them fit; a combining mark takes none.
+    #[test]
+    fn truncate_left_measures_columns_not_characters() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("日本語"), 6);
+        assert_eq!(display_width("😀"), 2);
+        assert_eq!(display_width("u\u{308}"), 1, "u with a combining diaeresis");
+
+        // Eight characters, sixteen columns: it does not fit in ten.
+        let p = "写真/日本語のファイル";
+        assert!(p.chars().count() < 12);
+        let cut = truncate_left(p, 12);
+        assert!(cut > 0, "wider than it is long");
+        assert!(p.is_char_boundary(cut));
+        assert!(
+            display_width(&p[cut..]) < 12,
+            "the ellipsis and the tail fit: {:?}",
+            &p[cut..]
+        );
+        // As much as fits is kept: one more character would be too wide.
+        let before = p[..cut].chars().next_back().unwrap();
+        assert!(1 + display_width(&p[cut..]) + display_width(&before.to_string()) > 12);
+
+        // A path of wide characters that fits is not cut.
+        assert_eq!(truncate_left("日本/語", 7), 0);
+        assert_eq!(truncate_left("日本/語", 6), "日本".len());
+    }
+
+    /// "No matches" is only said when it is true: not for the query before, not while the
+    /// pass runs, and not while a scan may still deliver one.
+    #[test]
+    fn find_empty_message_does_not_promise_too_much() {
+        let msg = |active, query, scoped, busy, scanning| {
+            find_empty_message(active, query, scoped, busy, scanning).trim()
+        };
+        assert!(msg(None, "", false, false, false).starts_with("type to search"));
+        assert!(msg(None, "", true, false, true).contains("below this directory"));
+        assert_eq!(
+            msg(None, "ab", false, false, false),
+            "",
+            "typed, not searched yet"
+        );
+        assert_eq!(
+            msg(Some("a"), "ab", false, false, false),
+            "",
+            "list of an older query"
+        );
+        assert_eq!(
+            msg(Some("ab"), "ab", false, true, false),
+            "",
+            "still searching"
+        );
+        assert_eq!(msg(Some("ab"), "ab", false, false, false), "no matches");
+        assert_eq!(
+            msg(Some("ab"), "ab", false, false, true),
+            "no matches yet, still scanning"
+        );
+        assert_eq!(
+            msg(Some("ab"), "ab", true, false, true),
+            "no matches below this directory yet, still scanning"
+        );
+        assert!(msg(Some("ab"), "ab", true, false, false).contains("Tab searches"));
+    }
+
+    /// The page keys in the search popup move by the rows its list really has.
+    #[test]
+    fn find_rows_follow_the_terminal_height() {
+        assert_eq!(
+            find_rows(24),
+            18,
+            "24 rows: popup of 22, minus border, query and hint"
+        );
+        assert_eq!(find_rows(50), 44);
+        assert_eq!(find_rows(9), 3, "the popup keeps its minimum of 7");
+        assert_eq!(find_rows(7), 3);
+        assert_eq!(find_rows(5), 1, "never zero");
+        assert_eq!(find_rows(0), 1);
     }
 }

@@ -526,13 +526,15 @@ fn run(
             handled += 1;
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Page height = list rows (total minus header, footer, and the list's two
-                    // border rows), used by PgUp/PgDn and C-d/C-u.
+                    // What the page keys move by: the rows of the list they act on. For the
+                    // directory listing that is the terminal minus header, footer and the
+                    // list's two border rows; the search popup has a list of its own.
+                    let mode = app.input_mode();
                     let page = terminal
                         .size()
-                        .map(|s| (s.height.saturating_sub(5) as usize).max(1))
+                        .map(|s| page_rows(mode, s.height))
                         .unwrap_or(20);
-                    match decode_key(key.code, key.modifiers, app.input_mode(), page) {
+                    match decode_key(key.code, key.modifiers, mode, page) {
                         // The actions that need the terminal itself.
                         Some(KeyAction::Redraw) => terminal.clear()?,
                         Some(KeyAction::Suspend) => suspend(terminal, signals)?,
@@ -573,6 +575,14 @@ fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<Stri
     };
     *terminal = init_terminal();
     Some(outcome)
+}
+
+/// How many rows PgUp and PgDn move by in a terminal of the given height.
+fn page_rows(mode: InputMode, terminal_height: u16) -> usize {
+    match mode {
+        InputMode::Find => ui::find_rows(terminal_height),
+        InputMode::Normal => (terminal_height.saturating_sub(5) as usize).max(1),
+    }
 }
 
 fn decode_key(
@@ -675,7 +685,9 @@ mod tests {
 
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    use super::{decode_key, parse_args, parse_duration, plain_path, version_line, Args};
+    use super::{
+        decode_key, page_rows, parse_args, parse_duration, plain_path, version_line, Args,
+    };
     use crate::app::{InputMode, KeyAction};
 
     #[test]
@@ -845,6 +857,28 @@ mod tests {
                 "{code:?} with {mods:?}"
             );
         }
+    }
+
+    /// PgUp and PgDn move by the height of the list that has the focus. The search popup's
+    /// list is shorter than the directory listing behind it.
+    #[test]
+    fn page_keys_move_by_the_rows_of_the_list_in_front() {
+        assert_eq!(page_rows(InputMode::Normal, 24), 19);
+        assert_eq!(page_rows(InputMode::Find, 24), 18);
+        assert_eq!(page_rows(InputMode::Normal, 50), 45);
+        assert_eq!(page_rows(InputMode::Find, 50), 44);
+        // Tiny terminals still page by something.
+        assert_eq!(page_rows(InputMode::Normal, 3), 1);
+        assert_eq!(page_rows(InputMode::Find, 3), 1);
+        assert_eq!(
+            decode_key(
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+                InputMode::Find,
+                page_rows(InputMode::Find, 24)
+            ),
+            Some(KeyAction::PageDown(18))
+        );
     }
 
     /// A letter with Ctrl or Alt is not that letter. Only the combinations that are bound do
