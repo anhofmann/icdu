@@ -36,6 +36,8 @@ url="https://github.com/anhofmann/icdu"
 license=('MIT')
 provides=('icdu')
 conflicts=('icdu')
+# The binary comes stripped, and there is nothing to make a debug package from.
+options=('!strip' '!debug')
 source_x86_64=("$base/icdu-\$pkgver-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$base/icdu-\$pkgver-aarch64-unknown-linux-musl.tar.gz")
 sha256sums_x86_64=('$x86_64')
