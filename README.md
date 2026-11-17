@@ -24,23 +24,32 @@ the scan was slowed down for the recording; everything on screen is what icdu dr
 curl -fsSL https://raw.githubusercontent.com/anhofmann/icdu/main/install.sh | sh
 ```
 
-The script detects your platform (macOS Apple Silicon/Intel, Linux x86-64/ARM64), downloads the
-static binary from [Releases](https://github.com/anhofmann/icdu/releases), verifies its
-SHA-256 checksum, and installs it to `~/.local/bin`. Override the destination with
-`ICDU_INSTALL_DIR=...` or pin a version with `ICDU_VERSION=v0.5.0`. From source with a Rust
-toolchain instead: `cargo install --git https://github.com/anhofmann/icdu`.
+The script finds out what machine it is on (macOS on Apple Silicon or Intel, Linux on x86-64 or
+ARM64), downloads the archive of the latest
+[release](https://github.com/anhofmann/icdu/releases) for it, checks it against the release's
+SHA-256 checksums, and installs the binary to `~/.local/bin`.
 
-To upgrade, run the install script again: it replaces the binary with the latest release. There
-is no built-in updater, and icdu itself never connects to the network.
+- `ICDU_INSTALL_DIR=...` installs somewhere else.
+- `ICDU_VERSION=0.5.0` (or `v0.5.0`) installs that release instead of the latest.
+- **To upgrade, run it again.** It says what it replaced. There is no built-in updater, and
+  icdu itself never connects to the network.
+- If the [GitHub CLI](https://cli.github.com) is installed and logged in, the script also
+  verifies that the archive was built by this repository's release workflow, and refuses to
+  install one that was not. Without it, the script prints the command to check by hand. See
+  [What a release contains, and how to check it](#what-a-release-contains-and-how-to-check-it).
+
+Other ways: download an archive from the releases page and unpack it, or build from source
+with a Rust toolchain: `cargo install --git https://github.com/anhofmann/icdu`.
 
 ### Upgrading from rcdu
 
 Up to version 0.4.1 this program was called rcdu. Coming from it:
 
-- Install icdu with the script above, then remove the old binary (`rm ~/.local/bin/rcdu`).
-  `rcdu update` cannot do this step: it does not find releases published under the new name.
+- Install icdu with the script above, then remove the old binary (`rm ~/.local/bin/rcdu`);
+  the script reminds you if it finds one. `rcdu update` cannot do this step: it does not find
+  releases published under the new name.
 - The self-update command is gone. Upgrade by running the install script again.
-- The install script reads `ICDU_VERSION` and `ICDU_INSTALL_DIR`. Releases up to v0.4.1 stay
+- The install script reads `ICDU_VERSION` and `ICDU_INSTALL_DIR`. Releases up to 0.4.1 stay
   available: asked for one of them, the script installs it under its old name.
 - Some keys changed to match ncdu: `Esc` no longer quits, `/` is the only search key (the
   filter is part of the search now), export is on `E`, the largest files on `T`, and `r` and `b`

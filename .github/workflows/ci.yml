@@ -53,6 +53,44 @@ jobs:
   dist:
     uses: ./.github/workflows/dist.yml
 
+  # The install script, on the two systems it is for: with the archive that was just built
+  # standing in for a release, and against the latest release there is.
+  install:
+    name: install script (${{ matrix.os }})
+    needs: dist
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: macos-latest,  target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ matrix.target }}
+          path: release
+      - name: Install what was just built, twice
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          (cd release && shasum -a 256 icdu-*.tar.gz > sha256sums.txt)
+          export ICDU_BASE_URL="file://$PWD/release" ICDU_INSTALL_DIR="$RUNNER_TEMP/bin"
+          ICDU_VERSION="$version" sh install.sh | tee first.txt
+          grep -q "^installed icdu $version to " first.txt
+          ICDU_VERSION="v$version" sh install.sh | tee second.txt
+          grep -q "^icdu $version was installed in .* already" second.txt
+          test "$("$RUNNER_TEMP/bin/icdu" --version)" = "icdu $version"
+      - name: Install the latest release
+        run: |
+          ICDU_INSTALL_DIR="$RUNNER_TEMP/latest" sh install.sh
+          # Releases up to 0.4.1 install as rcdu.
+          if [ -x "$RUNNER_TEMP/latest/icdu" ]; then
+            "$RUNNER_TEMP/latest/icdu" --version
+          else
+            "$RUNNER_TEMP/latest/rcdu" --version
+          fi
+
   # The oldest Rust that icdu promises to build with: `rust-version` in Cargo.toml.
   msrv:
     name: minimum Rust (${{ matrix.os }})

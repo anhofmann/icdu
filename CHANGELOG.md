@@ -63,6 +63,9 @@ Everything since 0.4.1. It will be released as icdu 0.5.0.
   growing are marked; a delete or rescan that has to wait says for how much, and that part is
   read first; a directory with very many entries shows up in parts.
 - **The shell** (`b`) uses `NCDU_SHELL`, then `SHELL`, then `/bin/sh`, and sets `NCDU_LEVEL`.
+- **The install script** takes a version with or without `v`, says what it replaced, names a
+  tool it is missing, installs the ARM build in an x86 shell on Apple Silicon, and verifies the
+  attestation of the archive when the GitHub CLI is there.
 - `Ctrl-Z` suspends icdu, and `Ctrl-L` redraws the screen.
 - The info popup shows the reason of a read error, and the number of hard links.
 
