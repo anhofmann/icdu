@@ -1303,7 +1303,12 @@ mod tests {
         }
 
         let meta = fs::symlink_metadata(&base).unwrap();
-        let scan = start(base.clone(), opts(threads, meta.dev()));
+        // The workers start reading at once, and the priorities are set from this thread a
+        // moment later. How much is read in that moment must not depend on how busy the
+        // machine is. So the scan may have only one batch on its way at a time: until this
+        // thread takes the first one, which it does after steering, each worker gets as far
+        // as one directory and waits.
+        let scan = start_limited(base.clone(), opts(threads, meta.dev()), 0, None, 1);
         steer(&scan.control, &base);
 
         // Track which directory ids belong to each branch (batches arrive parent-first).
