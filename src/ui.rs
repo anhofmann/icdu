@@ -9,8 +9,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    find_ci, indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles, FIND_CAP,
+    indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles, FIND_CAP,
 };
+use crate::matcher::Matcher;
 use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -371,7 +372,7 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
             rows,
         );
         find.offset.set(offset);
-        let q = find.active.as_deref().unwrap_or("");
+        let matcher = Matcher::new(find.active.as_deref().unwrap_or(""));
         // Size column (10 + 2 spaces) and the rest for the path.
         let path_width = (list_area.width as usize).saturating_sub(12).max(8);
         let mark = Style::default()
@@ -385,7 +386,11 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
                 let mut path = app.tree.rel_path_from(idx, scope.unwrap_or(app.tree.root));
                 // The name is the path's last component; locate the match inside it.
                 let name_start = path.len() - n.name.len();
-                let hit = find_ci(&n.name, q).map(|m| (name_start + m, name_start + m + q.len()));
+                // The matched text can differ in length from the query (case folding, the
+                // two spellings of accented letters): highlight the range that was found.
+                let hit = matcher
+                    .find(&n.name)
+                    .map(|m| (name_start + m.start, name_start + m.end));
                 if n.is_dir() {
                     path.push('/');
                 }

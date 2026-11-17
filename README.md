@@ -161,9 +161,12 @@ Symlinks are never followed (counted as the link itself), matching ncdu's defaul
 
 ### Searching
 
-Press `/` to ask: *where in this tree is anything called X?* Type part of a name
-(case-insensitive); 100 ms after your last keystroke every entry in the tree is searched, and the
-matches are listed with their path and size, largest first, with the matched part highlighted.
+Press `/` to ask: *where in this tree is anything called X?* Type part of a name. Case is
+ignored for every letter (`übung` finds `Übung.pdf`), and an accented letter is found whether
+the name stores it as one character or, as macOS does, as a letter with a combining mark.
+
+100 ms after your last keystroke every entry in the tree is searched, and the matches are
+listed with their path and size, largest first, with the matched part highlighted.
 `↑`/`↓` and `PgUp`/`PgDn` move (letters all go to the query), `Enter` jumps to the directory
 containing the selected match with it highlighted, and `Esc` closes the popup without moving.
 To edit the query, `Backspace` deletes a character, `Ctrl-w` the last word and `Ctrl-u` the
@@ -370,6 +373,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 | `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, counts each hard-linked inode once, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
 | `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
 | `glob.rs` | `fnmatch`-style globbing for `--exclude`. |
+| `matcher.rs` | Matching a search query against names: case-insensitive for all letters, and across the two Unicode spellings of accented Latin letters. |
 | `dump.rs` | ncdu-compatible JSON import/export, both streaming: a hand-written writer, and a pull parser for exactly this format. |
 | `app.rs` | App state + key handling, modals (help/confirm), background delete and open. Selection tracks node *identity*, so the highlight doesn't jump as live updates reorder the list. |
 | `ui.rs` | ratatui rendering: size bars, percentages, type indicators, popups. |

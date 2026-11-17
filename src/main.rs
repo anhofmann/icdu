@@ -4,6 +4,7 @@ mod app;
 mod delete;
 mod dump;
 mod glob;
+mod matcher;
 mod model;
 mod scan;
 mod signals;

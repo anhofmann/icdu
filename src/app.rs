@@ -17,6 +17,7 @@ use crossbeam_channel::{unbounded, Receiver};
 
 use crate::delete::{Plan, Report};
 use crate::dump::Exporter;
+use crate::matcher::Matcher;
 use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
 use crate::scan::{
     check_identity, start_at, Events, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
@@ -303,7 +304,9 @@ impl Find {
             self.search_again();
         }
 
-        let Some(q) = &self.active else { return };
+        let Some(query) = &self.active else { return };
+        // Prepared once per frame, used for every node of the slice.
+        let matcher = Matcher::new(query);
         let was_busy = self.cursor < len;
         let end = len.min(self.cursor.saturating_add(budget));
         // Tombstones exist only after a delete or rescan; until then skip the parent walk.
@@ -313,7 +316,7 @@ impl Find {
         let scope = self.scope().filter(|&d| d != tree.root);
         for i in self.cursor..end {
             if i != tree.root
-                && contains_ci(&tree.nodes[i].name, q)
+                && matcher.matches(&tree.nodes[i].name)
                 && scope.is_none_or(|d| i != d && tree.is_within(i, d))
                 && (!check_attached || tree.is_attached(i))
             {
@@ -2152,24 +2155,6 @@ pub fn fmt_time(secs: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }
 
-/// Case-insensitive substring test used by the search. ASCII letters compare
-/// case-insensitively; other bytes must match exactly (a plain byte-substring test, so
-/// multi-byte UTF-8 names can't produce false positives). An empty needle matches everything.
-fn contains_ci(haystack: &str, needle: &str) -> bool {
-    find_ci(haystack, needle).is_some()
-}
-
-/// Byte offset of the first case-insensitive match of `needle` in `haystack` (same rules as
-/// [`contains_ci`]). The match always starts and ends on a char boundary: it begins and ends
-/// with the same bytes as the (valid UTF-8) needle.
-pub fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
-    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
-    if n.is_empty() {
-        return Some(0);
-    }
-    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2204,19 +2189,6 @@ mod tests {
             );
         }
         App::new(t, true, false, false)
-    }
-
-    #[test]
-    fn contains_ci_matches_ascii_case_insensitively() {
-        assert!(contains_ci("Hello, World", "WORLD"));
-        assert!(contains_ci("node_modules", "ODE_MOD"));
-        assert!(contains_ci("anything", ""));
-        assert!(!contains_ci("short", "shorter"));
-        assert!(
-            !contains_ci("résumé", "RESUME"),
-            "non-ASCII compares exactly"
-        );
-        assert!(contains_ci("résumé", "sum"));
     }
 
     fn app_with_tree_for_top_files() -> App {
@@ -5216,6 +5188,88 @@ mod tests {
         type_query(&mut app, ".md");
         app.on_key(KeyAction::Enter);
         assert!(matches!(app.modal, Modal::Find(_)), "no jump");
+    }
+
+    /// What one pass of the search over ten million entries costs. Not a pass/fail test, and
+    /// it needs about 2 GB of memory:
+    ///
+    /// ```sh
+    /// cargo test --release search_pass_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn search_pass_measurement() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for d in 0..10_000u64 {
+            let dir = t.import_child(
+                t.root,
+                format!("dir-{d:05}").into(),
+                NodeKind::Dir,
+                0,
+                0,
+                1,
+                d + 2,
+                false,
+                false,
+                Excluded::No,
+                false,
+            );
+            for f in 0..1_000u64 {
+                // One name in ten has letters outside ASCII.
+                let name = if f % 10 == 0 {
+                    format!("Übungsblatt-{f:04}.pdf")
+                } else {
+                    format!("file-{f:04}.dat")
+                };
+                file_under(&mut t, dir, &name, f);
+            }
+        }
+        let nodes = t.nodes.len();
+        let mut app = App::new(t, true, false, false);
+        for query in ["zzz", "file-0999", "ubung", "übung", "ÜBUNGSBLATT-0990"] {
+            let start = Instant::now();
+            search(&mut app, query);
+            let took = start.elapsed();
+            println!(
+                "{query:<18} {:>9} matches, {took:>9.2?}, {:>5.1} ns per entry",
+                find_state(&app).total,
+                took.as_nanos() as f64 / nodes as f64
+            );
+            app.on_key(KeyAction::Cancel);
+        }
+    }
+
+    /// The search ignores case for every letter, not only for ASCII, and finds a name
+    /// whichever way its accented letters are stored.
+    #[test]
+    fn find_matches_non_ascii_names_whatever_their_case_or_spelling() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for (name, size) in [
+            ("Übung.pdf", 40),
+            ("ÜBUNG 2", 30),
+            ("U\u{308}bung als macOS sie speichert", 20),
+            ("Uebung", 10),
+            ("Отчёт.docx", 5),
+        ] {
+            file_under(&mut t, 0, name, size);
+        }
+        let mut app = App::new(t, true, false, false);
+        search(&mut app, "übung");
+        assert_eq!(
+            hit_names(&app),
+            vec![
+                "Übung.pdf",
+                "ÜBUNG 2",
+                "U\u{308}bung als macOS sie speichert"
+            ]
+        );
+        // A new query in the same popup: Ctrl-U, then Cyrillic in the other case.
+        app.on_key(KeyAction::FindClear);
+        type_query(&mut app, "ОТЧЁТ");
+        let later = Instant::now() + FIND_DEBOUNCE * 4;
+        app.find_tick(later, usize::MAX);
+        app.find_tick(later + FIND_DEBOUNCE, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["Отчёт.docx"]);
     }
 
     /// Ctrl-U empties the query, Ctrl-W removes the last word, and each restarts the search.
