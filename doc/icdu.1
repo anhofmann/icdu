@@ -575,8 +575,15 @@ ncdu 2 uses one.
 Deleting, shell, opening and rescanning are always off for an imported file, also with
 .BR \-\-enable\-delete .
 .PP
-Deleting removes only what the scan listed, entry by entry.
-Something that appeared in a directory after the scan stays, and the directory with it.
+Before an entry is deleted it is checked to be the one that was scanned: same type, device
+and inode.
+One that has been replaced since stays, and the directory with it.
+.PP
+A file with several names is counted at one of them (see
+.BR "HARD LINKS" ).
+ncdu counts it once in every directory that holds one of its names, so the size of a
+directory can differ between the two where a file's names lie in different directories.
+The total of the scanned directory is the same.
 .SH SEE ALSO
 .BR ncdu (1),
 .BR du (1)

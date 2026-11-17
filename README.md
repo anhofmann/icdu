@@ -9,7 +9,8 @@ that is compatible with [ncdu](https://dev.yorhel.nl/ncdu).
 - **Search the whole tree by name.** `/` finds entries anywhere below, largest first, as you
   type, including what the scan has only just reached. Enter takes you there.
 - **Compatible with ncdu.** Its keys and command-line options work, its config files are
-  read, and its JSON dumps are read and written without loss.
+  read, and its JSON dumps are read and written without loss. What is different is listed
+  under [Differences from ncdu](#differences-from-ncdu).
 
 <p align="center">
   <img src=".github/assets/demo.svg" alt="icdu while a scan is running: the list fills in, a search finds a directory deep in the tree, and Enter jumps to it" width="97%">
@@ -41,6 +42,12 @@ SHA-256 checksums, and installs the binary to `~/.local/bin`.
 Other ways: download an archive from the releases page and unpack it, or build from source
 with a Rust toolchain: `cargo install --git https://github.com/anhofmann/icdu`.
 
+### Uninstalling
+
+icdu is one file. Remove it: `rm ~/.local/bin/icdu` (or wherever `ICDU_INSTALL_DIR` pointed).
+It keeps no state. The only other files are config files you may have written yourself,
+`~/.config/icdu/config` and `/etc/icdu.conf`.
+
 ### Upgrading from rcdu
 
 Up to version 0.4.1 this program was called rcdu. Coming from it:
@@ -70,7 +77,7 @@ ARGS:
     PATH                     directory to scan (default: current directory)
 
 OPTIONS:
-    -t, --threads N          scanner threads (default: cores*4)
+    -t, --threads N          scanner threads (default: 4 per core, 4 to 64)
     -a, --apparent-size, --disk-usage
                              show apparent sizes, or disk usage (default)
     -x, --one-file-system, --cross-file-system
@@ -597,12 +604,78 @@ While the scan is still running, `E` asks first, because the dump will be partia
 that have not been read yet are then written with the read-error flag, so icdu and ncdu show
 them as incomplete (`!`) instead of as empty.
 
+## Platform support
+
+Linux and macOS, on x86-64 and ARM64. icdu works with what Unix filesystems report (device and
+inode numbers, block counts, link counts), so there is no Windows version; a build for
+Windows stops with a sentence saying so.
+
+Building from source needs Rust 1.88 or newer.
+
+## Differences from ncdu
+
+icdu aims to do what ncdu does wherever ncdu does it. Checked against ncdu 1.18 on the same
+trees, the dumps of the two agree entry for entry.
+
+**What icdu adds**
+
+- The browser while the scan is still running, with the directory on screen scanned first.
+- The search: `/`, and `]` / `[` through its matches.
+- `T` (largest files), `x` (next read error), `o` (open), `E` (export from the browser).
+- `--older-than` / `--newer-than`.
+- A scan on many threads by default (`-t`; ncdu 2 uses one unless told otherwise).
+- A check before every removal: an entry is only deleted if it is still the one that was
+  scanned (same type, device and inode).
+
+**What icdu does not have**
+
+- ncdu 2's binary export and its compression (`-O`, `-c`, `--compress`, `--compress-level`,
+  `--export-block-size`). The flags are refused by name, and such files cannot be read. A
+  JSON dump compressed with zstd or gzip can be piped in.
+- The column for sizes that directories share through hard links (`u`, `--shared-column`).
+  The flag is accepted and ignored.
+
+**What is different**
+
+- Times are shown in UTC, not in local time.
+- Bar and percentage are both shown by default; ncdu shows the bar. `--hide-percent` gives
+  ncdu's look.
+- An imported dump can never be acted on: delete, shell, open and rescan stay off, also with
+  `--enable-delete`.
+- `-rr` also turns off opening and the export key, since both touch the local filesystem.
+- **Hard links.** icdu counts a file with several names at one of them, the first the scan
+  comes across; the other names are listed with their size, flagged `H`, and count nowhere.
+  ncdu (1.7 and later) counts such a file once in every directory that holds one of its
+  names. The total of the scanned directory is the same in both. The size of a directory
+  below it can differ where a file's names lie in different directories: ncdu's is larger
+  for every directory that holds only names icdu flags `H`.
+- A directory excluded by a pattern is written to a dump as a directory, and with its owner
+  and time under `-e`. ncdu writes it as a plain entry without them, because it never looks
+  at it. Both programs read both forms.
+- In a config file, `--option=value` and a leading `@` work as in ncdu 2, also where
+  ncdu 1 would refuse them.
+
+## Limitations
+
+- **Memory.** The whole tree is kept in memory: about 165 bytes per entry (331 MB for a tree
+  of two million entries; names longer than 24 bytes add their length, `-e` adds 32 bytes).
+  Ten million entries need about 1.7 GB.
+- **What was deleted or rescanned stays in memory** until icdu exits. A session with many
+  rescans of large directories grows.
+- **A running scan cannot be cancelled**, only left by quitting.
+- **Paths longer than the system's limit** (4096 bytes on Linux, 1024 on macOS): the entry at
+  which the limit is passed is flagged `!`, and nothing below it is scanned or counted.
+- **The search is by name.** There is no search by path, size or type.
+- **Kernel filesystems** (`--exclude-kernfs`) are known from the mount table when the scan
+  starts. One that is mounted later is not recognised until the next scan or rescan.
+
 ## Portable, dependency-free binaries
 
 `icdu`'s core — scan, sort, delete, JSON import/export — makes **no external process calls**: no
-`du`, no coreutils, nothing; it's pure Rust `std`. Two features deliberately start another
-program: `o` hands the selected entry to the platform's default handler, and `b` opens your
-shell. The binaries are self-contained:
+`du`, no coreutils, nothing; it's pure Rust `std`. Three features start another program, each
+because you asked for it: `o` hands the selected entry to the platform's default handler, `b`
+opens your shell, and `--delete-command` runs the command you gave it. The binaries are
+self-contained:
 
 - **Linux** builds are **fully static musl** binaries: libc is baked in, there are no `.so`
   dependencies and no dynamic loader. Copy to any x86-64 or ARM64 Linux box — Alpine, Ubuntu,
@@ -668,21 +741,13 @@ compiler, no Docker and no C library to install.
 cargo test
 ```
 
-The test builds a known directory tree, runs the real scanner to completion, and asserts the
-root aggregates every file's bytes for both the apparent and on-disk metrics, with no batch left
-buffered — verifying the concurrency and size-propagation logic.
-
-## Status
-
-Implemented: live/progressive parallel scan, **navigation-prioritized
-scanning**, sort, apparent/disk toggle, delete (background, with the still-scanning safety gate,
-`-r`, and a guarded Ctrl-C), hard-link dedup, `--exclude` / `-X`, `-x` one-file-system, ncdu JSON
-import/export, open (`o`, via the platform's default handler), help dialog, a memory-lean node
-representation, and static portable binaries.
-
-Possible future work: in-place refresh (`r`) of a subtree, the ncdu "shared/unique" size
-breakdown column, and a file-info panel. Further memory wins are available if needed (`u32`
-node indices, splitting file/dir storage, a per-tree device table).
+The tests are in the source files they test. The scanner is run for real on directory trees
+built for the purpose (hard links, symlinks, special files, excludes, mount points,
+unreadable directories, entries that vanish). Deleting is tested on real files, including
+everything it must leave alone. The dump reader and writer are held against dumps written by
+ncdu. The interface is driven key by key without a terminal, and whole frames are drawn on a
+test backend and compared as text. CI runs all of it on Linux and macOS, in debug and release
+builds, and with the oldest supported Rust.
 
 ## Contributing, changes, security
 

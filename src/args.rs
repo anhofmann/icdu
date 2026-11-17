@@ -251,7 +251,7 @@ pub const FLAGS: &[Flag] = &[
         &['t'],
         &["threads"],
         Some("N"),
-        "scanner threads (default: cores*4)",
+        "scanner threads (default: 4 per core, 4 to 64)",
         Action::Threads,
     ),
     Flag {
