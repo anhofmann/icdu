@@ -317,6 +317,8 @@ NUL), or whose root path contains a `..` component.
 Press `E` in the UI to write the currently browsed tree — including deletions made this session —
 to `icdu-dump.json` in the working directory (`icdu-dump-2.json` and so on if one already
 exists), in the same format as `-o`: handy for snapshotting a long scan without redoing it.
+A large dump is written in the background of the UI, with its progress in the footer; you can
+keep browsing, but deleting and rescanning wait until it is done.
 While the scan is still running, `E` asks first, because the dump will be partial. Directories
 that have not been read yet are then written with the read-error flag, so icdu and ncdu show
 them as incomplete (`!`) instead of as empty.

@@ -439,6 +439,9 @@ fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::i
 /// there is a backlog, to working it off.
 const SCAN_TIME_PER_FRAME: Duration = Duration::from_millis(12);
 
+/// How long a frame may spend writing a dump that was started from the UI.
+const EXPORT_TIME_PER_FRAME: Duration = Duration::from_millis(12);
+
 /// The most input events handled between two frames.
 const MAX_EVENTS_PER_FRAME: usize = 256;
 
@@ -484,6 +487,8 @@ fn run(
         app.poll_open();
         // A directory the user is waiting for may have become complete.
         app.check_wait();
+        // A dump being written gets its share of the frame too.
+        app.poll_export(Some(Instant::now() + EXPORT_TIME_PER_FRAME));
 
         // A requested shell: fully tear down the TUI, hand the tty to the user's shell in the
         // target directory, and rebuild the UI when it exits. The scan keeps running in the
@@ -506,7 +511,7 @@ fn run(
         // and wake up in time for a debounced search query.
         let busy = app.scanning || app.is_deleting();
         let mut timeout = Duration::from_millis(if busy { 80 } else { 250 });
-        if app.find_busy() || app.scan_backlog() {
+        if app.find_busy() || app.scan_backlog() || app.is_exporting() {
             // More to do right away: check for input, then carry on.
             timeout = Duration::ZERO;
         } else if let Some(due) = app.find_due() {

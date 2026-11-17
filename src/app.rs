@@ -6,7 +6,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Receiver};
 
 use crate::delete::{Plan, Report};
+use crate::dump::Exporter;
 use crate::model::{Excluded, NodeIdx, NodeKind, Tree};
 use crate::scan::{
     check_identity, start_at, Events, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
@@ -366,6 +367,12 @@ struct PendingOpen {
     rx: Receiver<std::io::Result<()>>,
 }
 
+/// A dump being written from the UI, and where it goes.
+struct ExportJob {
+    path: PathBuf,
+    exporter: Exporter<BufWriter<std::fs::File>>,
+}
+
 /// One live batch stream: the original scan (`refresh: false`) or a subtree rescan
 /// (`refresh: true`). `alive` flips false once the stream's channel disconnects.
 struct ScanHandle {
@@ -455,6 +462,8 @@ pub struct App {
     /// A directory on which a delete or rescan was refused because it is not read completely
     /// yet. The scans read it first, and the footer says when it is ready.
     waiting_for: Option<NodeIdx>,
+    /// A dump that is being written a slice at a time.
+    exporting: Option<ExportJob>,
     /// The last `poll_scans` ran out of budget: more batches may be waiting.
     scan_backlog: bool,
     /// When the frame being prepared started. The event loop sets it; without it (in tests)
@@ -499,6 +508,7 @@ impl App {
             list_offset: Cell::new(0),
             row_order: RefCell::new(None),
             waiting_for: None,
+            exporting: None,
             scan_backlog: false,
             frame_time: None,
             tick: 0,
@@ -670,12 +680,24 @@ impl App {
         self.imported
     }
 
+    /// While a dump is being written, nothing may take entries out of the tree: the export
+    /// remembers positions in it (see `dump::Exporter`). Says so and returns true if `what`
+    /// has to wait for that reason.
+    fn refused_for_export(&mut self, what: &str) -> bool {
+        if self.exporting.is_some() {
+            self.status = Some(format!(
+                "can't {what} while the export is being written — try again in a moment"
+            ));
+        }
+        self.exporting.is_some()
+    }
+
     /// Rescan the viewed directory in place (at the top level: the whole tree). The model
     /// tears its subtree down and a new scanner generation re-reads it from disk, grafting
     /// back into the same node. Browsing stays live the whole time; totals of surrounding
     /// directories stay correct throughout.
     fn request_refresh(&mut self) {
-        if self.refused_for_import("rescan") {
+        if self.refused_for_import("rescan") || self.refused_for_export("rescan") {
             return;
         }
         let sel = self.cur;
@@ -800,6 +822,16 @@ impl App {
     /// While directories are still unread, the dump would be partial yet look like the result
     /// of a finished scan to whoever reads it, so that case is confirmed first.
     fn request_export(&mut self) {
+        if self.exporting.is_some() {
+            self.status = Some("an export is already being written".into());
+            return;
+        }
+        // A deletion takes entries out of the tree when it finishes, which the export, written
+        // a piece at a time, could not follow (see `dump::Exporter`).
+        if self.is_deleting() {
+            self.status = Some("can't export while a deletion is running".into());
+            return;
+        }
         if self.tree.unread_dirs() > 0 {
             self.modal = Modal::ConfirmExport;
         } else {
@@ -816,13 +848,50 @@ impl App {
         self.export_into(&dir);
     }
 
+    /// Start writing a dump into `dir` and give it a first slice of time. A small tree is
+    /// written by the time this returns; a large one is carried on by `poll_export`.
     fn export_into(&mut self, dir: &Path) {
-        let written = create_export_file(dir)
-            .and_then(|(path, file)| self.export_tree_to(file).map(|()| path));
-        match written {
-            Ok(path) => {
+        self.start_export(dir);
+        self.poll_export(Some(Instant::now() + Duration::from_millis(10)));
+    }
+
+    /// Create the file and write the beginning of the dump (the ncdu JSON format of `-o`).
+    fn start_export(&mut self, dir: &Path) {
+        let started = create_export_file(dir).and_then(|(path, file)| {
+            Exporter::new(&self.tree, BufWriter::new(file)).map(|exporter| (path, exporter))
+        });
+        match started {
+            Ok((path, exporter)) => self.exporting = Some(ExportJob { path, exporter }),
+            Err(e) => self.status = Some(format!("export failed: {e}")),
+        }
+    }
+
+    /// True while a dump is being written.
+    pub fn is_exporting(&self) -> bool {
+        self.exporting.is_some()
+    }
+
+    /// Entries the running export has written so far.
+    pub fn export_progress(&self) -> Option<u64> {
+        self.exporting.as_ref().map(|job| job.exporter.written)
+    }
+
+    /// Carry on with the dump being written, until `deadline` (to the end, if `None`). The
+    /// event loop gives it a few milliseconds per frame, so a dump of millions of entries
+    /// does not freeze the UI. The outcome lands in the status line.
+    pub fn poll_export(&mut self, deadline: Option<Instant>) {
+        self.advance_export(|| deadline.is_none_or(|d| Instant::now() < d));
+    }
+
+    fn advance_export(&mut self, keep_going: impl FnMut() -> bool) {
+        let Some(mut job) = self.exporting.take() else {
+            return;
+        };
+        match job.exporter.step(&self.tree, keep_going) {
+            Ok(false) => self.exporting = Some(job),
+            Ok(true) => {
                 let entries = self.tree.total_dirs + self.tree.total_files;
-                let path = path.display();
+                let path = job.path.display();
                 self.status = Some(match self.tree.unread_dirs() {
                     0 => format!("exported {entries} entries to {path}"),
                     1 => format!(
@@ -835,13 +904,6 @@ impl App {
             }
             Err(e) => self.status = Some(format!("export failed: {e}")),
         }
-    }
-
-    /// Write the tree as ncdu-compatible JSON (the `-o` format, via `dump::export`).
-    fn export_tree_to(&self, file: std::fs::File) -> std::io::Result<()> {
-        let mut w = BufWriter::new(file);
-        crate::dump::export(&self.tree, &mut w)?;
-        w.flush()
     }
 
     /// The aggregated size metric we currently sort and display by.
@@ -1527,6 +1589,8 @@ impl App {
                         );
                     }
                 } else {
+                    // A dump that is half written is of no use: finish it first.
+                    self.poll_export(None);
                     self.quit = true;
                 }
             }
@@ -1673,6 +1737,9 @@ impl App {
         }
         if self.read_only {
             self.status = Some("read-only mode (-r): deletion disabled".into());
+            return;
+        }
+        if self.refused_for_export("delete") {
             return;
         }
         // One deletion at a time keeps the locking simple; browsing stays available meanwhile.
@@ -2607,8 +2674,22 @@ mod tests {
             let file = std::fs::File::create("/dev/null").unwrap();
             let mut out = BufWriter::new(file);
             crate::dump::export(&app.tree, &mut out).unwrap();
-            out.flush().unwrap();
         });
+        // The same from the UI: in slices of 12 ms, as the event loop gives them.
+        let file = std::fs::File::create("/dev/null").unwrap();
+        let exporter = Exporter::new(&app.tree, BufWriter::new(file)).unwrap();
+        app.exporting = Some(ExportJob {
+            path: "/dev/null".into(),
+            exporter,
+        });
+        let (mut slices, mut longest) = (0u32, Duration::ZERO);
+        while app.is_exporting() {
+            let start = Instant::now();
+            app.poll_export(Some(start + Duration::from_millis(12)));
+            longest = longest.max(start.elapsed());
+            slices += 1;
+        }
+        println!("... from the UI: {slices} slices, the longest {longest:.2?}");
     }
 
     /// The row highlighted in the open top-files popup.
@@ -3195,13 +3276,13 @@ mod tests {
     /// An exported dump is readable again by the importer, with the same totals and children.
     #[test]
     fn export_writes_an_importable_dump() {
-        let app = app_with_entries();
+        let mut app = app_with_entries();
         let dir = std::env::temp_dir().join(format!("icdu_export_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("dump.json");
-        app.export_tree_to(std::fs::File::create(&path).unwrap())
-            .unwrap();
+        let path = dir.join("icdu-dump.json");
+        app.export_into(&dir);
+        assert!(!app.is_exporting(), "a small tree is written at once");
         let re = crate::dump::import(std::io::BufReader::new(std::fs::File::open(&path).unwrap()))
             .unwrap();
         assert_eq!(
@@ -3209,6 +3290,132 @@ mod tests {
             "totals survive the round-trip"
         );
         assert_eq!(re.nodes[re.root].children.len(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tree of 5,001 entries (five export steps) and a scratch directory to export into.
+    fn app_with_a_dump_to_write(tag: &str) -> (PathBuf, App) {
+        let dir = scratch_dir(tag);
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let sub = t.import_child(
+            t.root,
+            "sub".into(),
+            NodeKind::Dir,
+            0,
+            0,
+            1,
+            2,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        for i in 0..4_999u64 {
+            file_under(&mut t, sub, &format!("f{i}"), i);
+        }
+        let mut app = App::new(t, true, false, false);
+        app.export_dir = Some(dir.clone());
+        (dir, app)
+    }
+
+    /// A dump is written a slice at a time. Until it is complete the app says so, refuses
+    /// what would take entries out of the tree, and does not start a second one.
+    #[test]
+    fn export_is_written_in_slices() {
+        let (dir, mut app) = app_with_a_dump_to_write("export_slices");
+        app.scan_opts = Some(test_opts());
+        app.imported = false;
+        app.start_export(&dir);
+        assert!(app.is_exporting());
+        assert_eq!(app.export_progress(), Some(1), "the root's own entry");
+
+        // One slice that is stopped at the first look at the clock.
+        app.advance_export(|| false);
+        assert!(app.is_exporting(), "not done yet");
+        assert_eq!(app.export_progress(), Some(1025));
+        assert_eq!(app.status, None, "nothing to report yet");
+
+        // Meanwhile: no delete, no rescan, no second export.
+        app.selected = Some(idx_named(&app, "sub"));
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no delete dialog");
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("export is being written"));
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None);
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("export is being written"));
+        app.on_key(KeyAction::Export);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("an export is already being written")
+        );
+        assert_eq!(
+            app.export_progress(),
+            Some(1025),
+            "the first one is untouched"
+        );
+
+        // The remaining slices.
+        let mut slices = 1;
+        while app.is_exporting() {
+            app.advance_export(|| false);
+            slices += 1;
+            assert!(slices < 50, "the export does not finish");
+        }
+        assert_eq!(slices, 5);
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .starts_with("exported 5001 entries to "));
+        let written =
+            crate::dump::import(std::fs::File::open(dir.join("icdu-dump.json")).unwrap()).unwrap();
+        assert_eq!(written.total_files, 4_999);
+        assert_eq!(written.total_dirs, 2);
+
+        // And now deleting is possible again.
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::ConfirmDelete(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Quitting does not leave half a dump behind: the export is finished first.
+    #[test]
+    fn quit_finishes_a_running_export() {
+        let (dir, mut app) = app_with_a_dump_to_write("export_quit");
+        app.start_export(&dir);
+        app.advance_export(|| false);
+        assert!(app.is_exporting());
+        app.on_key(KeyAction::Quit);
+        assert!(app.quit);
+        assert!(!app.is_exporting());
+        let written =
+            crate::dump::import(std::fs::File::open(dir.join("icdu-dump.json")).unwrap()).unwrap();
+        assert_eq!(written.total_files, 4_999);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While a deletion runs, an export is not started: the deletion will take entries out
+    /// of the tree under it.
+    #[test]
+    fn export_waits_for_a_running_deletion() {
+        let (dir, mut app) = app_with_a_dump_to_write("export_delete");
+        let sub = idx_named(&app, "sub");
+        let _worker = start_fake_delete(&mut app, sub);
+        app.on_key(KeyAction::Export);
+        assert!(!app.is_exporting());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't export while a deletion is running")
+        );
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no file");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

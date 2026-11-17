@@ -23,47 +23,93 @@ const MINOR: u32 = 2;
 
 // ---- Export ---------------------------------------------------------------------------------
 
+/// Write the whole tree as a dump.
 pub fn export<W: Write>(tree: &Tree, w: &mut W) -> io::Result<()> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    write!(
-        w,
-        "[{MAJOR},{MINOR},{{\"progname\":\"icdu\",\"progver\":\"{}\",\"timestamp\":{ts}}},",
-        env!("CARGO_PKG_VERSION")
-    )?;
-    write_node(tree, tree.root, w)?;
-    writeln!(w, "]")
+    let mut exporter = Exporter::new(tree, w)?;
+    while !exporter.step(tree, || true)? {}
+    Ok(())
 }
 
-/// Write the entry `idx`; a directory with everything below it, as `[info, child, ...]`.
+/// How many entries an [`Exporter`] writes between two looks at the clock.
+const EXPORT_CHECK_EVERY: u64 = 1024;
+
+/// A dump that is written a piece at a time, so that writing a large one does not freeze the
+/// UI: the event loop calls [`Exporter::step`] for a few milliseconds per frame.
+///
 /// The directories being written are kept on a stack on the heap, each with the position of
-/// its next child, so a very deep tree cannot exhaust the call stack.
-fn write_node<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> {
-    if !tree.nodes[idx].is_dir() {
-        return write_item(tree, idx, w);
+/// its next child, so a very deep tree cannot exhaust the call stack either.
+///
+/// The tree may grow between steps (a scan is still delivering): entries that arrive in a
+/// directory that is not finished yet are written too. Entries must not be removed while an
+/// export runs, because that shifts the positions; the app refuses deletes and rescans for
+/// that time.
+pub struct Exporter<W: Write> {
+    w: W,
+    open: Vec<(NodeIdx, usize)>,
+    /// Entries written so far.
+    pub written: u64,
+    done: bool,
+}
+
+impl<W: Write> Exporter<W> {
+    /// Start a dump of `tree`: writes the header and the root's own entry.
+    pub fn new(tree: &Tree, mut w: W) -> io::Result<Self> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        write!(
+            w,
+            "[{MAJOR},{MINOR},{{\"progname\":\"icdu\",\"progver\":\"{}\",\"timestamp\":{ts}}},",
+            env!("CARGO_PKG_VERSION")
+        )?;
+        w.write_all(b"[")?;
+        write_item(tree, tree.root, &mut w)?;
+        Ok(Exporter {
+            w,
+            open: vec![(tree.root, 0)],
+            written: 1,
+            done: false,
+        })
     }
-    w.write_all(b"[")?;
-    write_item(tree, idx, w)?;
-    let mut open: Vec<(NodeIdx, usize)> = vec![(idx, 0)];
-    while let Some((dir, next)) = open.last_mut() {
-        let Some(&child) = tree.nodes[*dir].children.get(*next) else {
-            w.write_all(b"]")?;
-            open.pop();
-            continue;
-        };
-        *next += 1;
-        w.write_all(b",")?;
-        if tree.nodes[child].is_dir() {
-            w.write_all(b"[")?;
-            write_item(tree, child, w)?;
-            open.push((child, 0));
-        } else {
-            write_item(tree, child, w)?;
+
+    /// Write on until the dump is complete or `keep_going` says no (it is asked every
+    /// [`EXPORT_CHECK_EVERY`] entries). Returns whether the dump is complete; it is flushed
+    /// then.
+    pub fn step(&mut self, tree: &Tree, mut keep_going: impl FnMut() -> bool) -> io::Result<bool> {
+        if self.done {
+            return Ok(true);
         }
+        let mut until_check = EXPORT_CHECK_EVERY;
+        while let Some((dir, next)) = self.open.last_mut() {
+            let Some(&child) = tree.nodes[*dir].children.get(*next) else {
+                self.w.write_all(b"]")?;
+                self.open.pop();
+                continue;
+            };
+            *next += 1;
+            self.w.write_all(b",")?;
+            if tree.nodes[child].is_dir() {
+                self.w.write_all(b"[")?;
+                write_item(tree, child, &mut self.w)?;
+                self.open.push((child, 0));
+            } else {
+                write_item(tree, child, &mut self.w)?;
+            }
+            self.written += 1;
+            until_check -= 1;
+            if until_check == 0 {
+                if !keep_going() {
+                    return Ok(false);
+                }
+                until_check = EXPORT_CHECK_EVERY;
+            }
+        }
+        self.w.write_all(b"]\n")?;
+        self.w.flush()?;
+        self.done = true;
+        Ok(true)
     }
-    Ok(())
 }
 
 fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> {
@@ -765,6 +811,106 @@ mod tests {
         assert_eq!(t.nodes[find("e")].items, 0);
         assert_eq!(t.nodes[find("node_modules")].items, 0);
         assert_eq!(t.nodes[t.root].items, 6, "d (+3), node_modules, g");
+    }
+
+    /// The body of a dump: everything after the metadata object, whose timestamp differs
+    /// from one export to the next.
+    fn body(dump: &[u8]) -> &[u8] {
+        let meta_end = dump.iter().position(|&b| b == b'}').unwrap();
+        &dump[meta_end..]
+    }
+
+    /// Written in many small steps, a dump is byte for byte what it is written in one go.
+    #[test]
+    fn export_in_steps_writes_the_same_dump() {
+        let mut t = Tree::new_imported("/r".into(), 4096, 4096, 1, 1);
+        let mut dirs = vec![t.root];
+        for i in 0..5_000u64 {
+            let parent = dirs[(i as usize * 7) % dirs.len()];
+            let kind = if i % 9 == 0 {
+                NodeKind::Dir
+            } else {
+                NodeKind::File
+            };
+            let idx = t.import_child(
+                parent,
+                format!("entry-{i}").into(),
+                kind,
+                i,
+                i * 2,
+                1,
+                i + 2,
+                false,
+                false,
+                Excluded::No,
+                false,
+            );
+            if kind == NodeKind::Dir {
+                dirs.push(idx);
+            }
+        }
+        let mut whole = Vec::new();
+        export(&t, &mut whole).unwrap();
+
+        let mut pieces = Vec::new();
+        let mut exporter = Exporter::new(&t, &mut pieces).unwrap();
+        let mut steps = 0;
+        while !exporter.step(&t, || false).unwrap() {
+            steps += 1;
+            assert!(steps < 100, "the export does not advance");
+        }
+        assert_eq!(steps, 4, "5,001 entries, {EXPORT_CHECK_EVERY} per step");
+        assert_eq!(exporter.written, 5_001);
+        assert!(exporter.step(&t, || false).unwrap(), "done stays done");
+        drop(exporter);
+        assert_eq!(body(&pieces), body(&whole));
+        assert_eq!(import(&pieces[..]).unwrap().total_files, t.total_files);
+    }
+
+    /// Entries that arrive while an export is under way are written if their directory has
+    /// not been finished yet, and the dump stays well-formed either way.
+    #[test]
+    fn export_in_steps_copes_with_a_growing_tree() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let add = |t: &mut Tree, parent, name: String, kind| {
+            t.import_child(
+                parent,
+                name.into(),
+                kind,
+                1,
+                1,
+                1,
+                2,
+                false,
+                false,
+                Excluded::No,
+                false,
+            )
+        };
+        let first = add(&mut t, 0, "first".into(), NodeKind::Dir);
+        for i in 0..2_000 {
+            add(&mut t, first, format!("f{i}"), NodeKind::File);
+        }
+        let last = add(&mut t, 0, "last".into(), NodeKind::Dir);
+
+        let mut out = Vec::new();
+        let mut exporter = Exporter::new(&t, &mut out).unwrap();
+        assert!(
+            !exporter.step(&t, || false).unwrap(),
+            "stopped inside `first`"
+        );
+        // The scan delivers more: into the directory being written, into one that is still
+        // to come, and a new one at the top.
+        add(&mut t, first, "late-in-first".into(), NodeKind::File);
+        add(&mut t, last, "late-in-last".into(), NodeKind::File);
+        add(&mut t, 0, "late-at-top".into(), NodeKind::Dir);
+        while !exporter.step(&t, || false).unwrap() {}
+        drop(exporter);
+
+        let again = import(&out[..]).unwrap();
+        let has = |name: &str| again.nodes.iter().any(|n| n.name == name);
+        assert!(has("late-in-first") && has("late-in-last") && has("late-at-top"));
+        assert_eq!(again.nodes.len(), t.nodes.len());
     }
 
     /// A dump `depth` directories deep, with one file at the bottom.

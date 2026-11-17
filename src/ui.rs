@@ -666,6 +666,15 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             format!("{spinner} deleting {} …", app.tree.nodes[didx].name),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ))
+    } else if let Some(written) = app.export_progress() {
+        // Brief, and asked for: it comes before the progress of the scan.
+        Some((
+            format!(
+                "{spinner} exporting… {} entries written",
+                fmt_count(written as usize)
+            ),
+            Style::default().fg(Color::Cyan),
+        ))
     } else if app.scanning {
         let mut text = format!(
             "{spinner} {}",
