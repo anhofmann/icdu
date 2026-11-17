@@ -163,7 +163,9 @@ jobs:
           su builder -c 'makepkg --printsrcinfo > .SRCINFO && cat .SRCINFO && makepkg --noconfirm'
           # namcap reports and does not fail: an "E:" line is what fails here.
           namcap PKGBUILD icdu-bin-*.pkg.tar.zst | tee namcap.txt
-          ! grep -q ' E: ' namcap.txt
+          if grep -q ' E: ' namcap.txt; then
+            exit 1
+          fi
           pacman -U --noconfirm icdu-bin-*.pkg.tar.zst
           test "$(icdu --version)" = "icdu $version"
           man -w icdu
