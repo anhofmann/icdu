@@ -122,6 +122,9 @@ pub const FIND_DEBOUNCE: Duration = Duration::from_millis(100);
 pub const FIND_CAP: usize = 10_000;
 /// The shortest interval between re-sorts of the hit list while it grows or sizes change.
 const FIND_RESORT: Duration = Duration::from_millis(250);
+/// How long a capped hit list stands during a scan before the tree is searched again: sizes
+/// grow, and what was too small to be listed may not be any more.
+pub const FIND_REPASS: Duration = Duration::from_secs(2);
 
 /// State of the search popup (`/`).
 ///
@@ -143,9 +146,20 @@ pub struct Find {
     pub active: Option<String>,
     /// Next node the pass will look at.
     pub cursor: NodeIdx,
-    /// Matching nodes (at most `FIND_CAP`), sorted for display.
+    /// The largest matches the running pass has found, at most `FIND_CAP`, the smallest on
+    /// top so it can make way for a larger one. Sizes are as they were when the match was
+    /// found.
+    kept: BinaryHeap<Reverse<(u64, Reverse<NodeIdx>)>>,
+    /// Every match the running pass has found, kept or not.
+    counted: usize,
+    /// The running pass repeats a search whose list is on screen. That list stays until the
+    /// pass is complete, instead of being emptied and filled again under the user's eyes.
+    refreshing: bool,
+    /// When the last pass reached the end of the tree.
+    passed: Option<Instant>,
+    /// The matches on screen (at most `FIND_CAP`, the largest), sorted for display.
     pub hits: Vec<NodeIdx>,
-    /// Every match found, including those past the cap.
+    /// Every match there is, including those past the cap.
     pub total: usize,
     /// Highlighted hit, by identity, so re-sorts and live inserts don't move the highlight.
     pub selected: Option<NodeIdx>,
@@ -165,6 +179,10 @@ impl Find {
             due: None,
             active: None,
             cursor: 0,
+            kept: BinaryHeap::new(),
+            counted: 0,
+            refreshing: false,
+            passed: None,
             hits: Vec::new(),
             total: 0,
             selected: None,
@@ -179,9 +197,16 @@ impl Find {
         self.active.is_some() && self.cursor < tree.nodes.len()
     }
 
-    /// True once more matches were found than the list keeps.
+    /// How far the pass has come, in percent, for the title. `None` when it is done, and
+    /// while it only refreshes a list that is already on screen.
+    pub fn progress(&self, tree: &Tree) -> Option<u8> {
+        (self.busy(tree) && !self.refreshing)
+            .then(|| (self.cursor as f64 / tree.nodes.len().max(1) as f64 * 100.0) as u8)
+    }
+
+    /// True once there are more matches than the list keeps.
     pub fn capped(&self) -> bool {
-        self.total > self.hits.len()
+        self.total > FIND_CAP
     }
 
     /// The directory the search is limited to, if it is.
@@ -205,13 +230,32 @@ impl Find {
         }
     }
 
-    /// Start a fresh pass over the tree for the active query.
+    /// Start a fresh pass over the tree for the active query, with an empty list.
     fn restart(&mut self) {
-        self.cursor = 0;
+        self.search_again();
+        self.refreshing = false;
         self.hits.clear();
         self.total = 0;
         self.selected = None;
         self.sort_dirty = false;
+    }
+
+    /// Start a pass over the tree for the same query, leaving the list on screen as it is
+    /// until the pass is complete.
+    fn search_again(&mut self) {
+        self.cursor = 0;
+        self.kept.clear();
+        self.counted = 0;
+        self.refreshing = true;
+        self.passed = None;
+    }
+
+    /// The matches the running pass has kept, as the list for the screen. Still to be sorted.
+    fn show_kept(&mut self) {
+        self.hits.clear();
+        self.hits
+            .extend(self.kept.iter().map(|Reverse((_, Reverse(idx)))| *idx));
+        self.total = self.counted;
     }
 
     /// One frame's worth of work: debounce, then up to `budget` nodes of the pass, then a
@@ -226,9 +270,28 @@ impl Find {
             self.active = (!self.query.is_empty()).then(|| self.query.clone());
             self.restart();
         }
-        let Some(q) = &self.active else { return };
-
+        if self.active.is_none() {
+            return;
+        }
+        let size = |i: NodeIdx| {
+            let n = &tree.nodes[i];
+            if disk_usage {
+                n.disk
+            } else {
+                n.apparent
+            }
+        };
         let len = tree.nodes.len();
+        // A capped list during a scan goes stale in a way sorting cannot fix: an entry that
+        // was passed over as too small may have grown. Search again every so often.
+        let due = self
+            .passed
+            .is_some_and(|at| now.saturating_duration_since(at) >= FIND_REPASS);
+        if scanning && self.capped() && self.cursor >= len && due {
+            self.search_again();
+        }
+
+        let Some(q) = &self.active else { return };
         let was_busy = self.cursor < len;
         let end = len.min(self.cursor.saturating_add(budget));
         // Tombstones exist only after a delete or rescan; until then skip the parent walk.
@@ -242,15 +305,38 @@ impl Find {
                 && scope.is_none_or(|d| i != d && tree.is_within(i, d))
                 && (!check_attached || tree.is_attached(i))
             {
-                self.total += 1;
-                if self.hits.len() < FIND_CAP {
-                    self.hits.push(i);
+                self.counted += 1;
+                // Keep it if there is room, or if it is larger than the smallest one kept
+                // (`Reverse` turns the order around: less means larger).
+                let candidate = Reverse((size(i), Reverse(i)));
+                if self.kept.len() < FIND_CAP {
+                    self.kept.push(candidate);
+                    self.sort_dirty = true;
+                } else if self
+                    .kept
+                    .peek()
+                    .is_some_and(|smallest| candidate < *smallest)
+                {
+                    self.kept.pop();
+                    self.kept.push(candidate);
                     self.sort_dirty = true;
                 }
             }
         }
         self.cursor = end;
         let finished = was_busy && end == len;
+        if finished {
+            self.passed = Some(now);
+        }
+        if self.refreshing && !finished {
+            // The list on screen is the one from the pass before; it stays for now.
+            return;
+        }
+        if self.refreshing {
+            self.refreshing = false;
+            self.sort_dirty = true;
+        }
+        self.total = self.counted;
 
         // Sizes keep changing while a scan runs, so the order goes stale even without new hits.
         let stale = self.sort_dirty || (scanning && !self.hits.is_empty());
@@ -258,14 +344,9 @@ impl Find {
             .last_sort
             .is_some_and(|t| now.saturating_duration_since(t) < FIND_RESORT);
         if stale && (finished || !throttled) {
-            let size = |i: NodeIdx| {
-                let n = &tree.nodes[i];
-                if disk_usage {
-                    n.disk
-                } else {
-                    n.apparent
-                }
-            };
+            if self.sort_dirty {
+                self.show_kept();
+            }
             self.hits.sort_by(|&a, &b| {
                 size(b)
                     .cmp(&size(a))
@@ -278,19 +359,24 @@ impl Find {
         self.ensure_selection();
     }
 
-    /// Drop hits that a delete or rescan turned into tombstones. Past the cap the true count
-    /// can't be corrected from the kept hits alone, so the pass starts over instead.
+    /// Drop hits that a delete or rescan turned into tombstones. They leave the list at
+    /// once. Past the cap the true count, and what moves up into the list, can't be worked
+    /// out from the kept hits alone, so the tree is searched again; the rest of the list
+    /// stays on screen until that is done.
     fn prune(&mut self, tree: &Tree) {
         if self.active.is_none() {
             return;
         }
-        if self.capped() {
-            self.restart();
-            return;
-        }
-        let before = self.hits.len();
         self.hits.retain(|&i| tree.is_attached(i));
-        self.total -= before - self.hits.len();
+        if self.capped() || self.refreshing {
+            self.search_again();
+        } else {
+            // Every match found so far is kept, so the count can simply follow.
+            self.kept
+                .retain(|Reverse((_, Reverse(i)))| tree.is_attached(*i));
+            self.counted = self.kept.len();
+            self.total = self.counted;
+        }
         self.ensure_selection();
     }
 
@@ -4050,19 +4136,99 @@ mod tests {
         assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
     }
 
-    /// A broad query keeps at most FIND_CAP hits but still counts all matches.
+    /// A broad query lists at most FIND_CAP hits but counts every match, and the ones it
+    /// lists are the largest: a big match that comes late in the tree is there, the small
+    /// ones that were found first are not.
     #[test]
-    fn find_caps_hits_but_counts_all() {
+    fn find_keeps_the_largest_matches_and_counts_all() {
         let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
-        for i in 0..FIND_CAP + 5 {
-            file_under(&mut t, 0, &format!("hit{i}"), i as u64);
+        // Small ones first, in the order the pass meets them...
+        for i in 0..FIND_CAP as u64 + 40 {
+            file_under(&mut t, 0, &format!("hit{i}"), 100 + i);
+        }
+        // ...then a few large ones at the very end.
+        for i in 0..10u64 {
+            file_under(&mut t, 0, &format!("late-hit{i}"), 1_000_000 + i);
         }
         let mut app = App::new(t, true, false, false);
         search(&mut app, "hit");
         let f = find_state(&app);
+        assert_eq!(f.total, FIND_CAP + 50, "every match is counted");
         assert_eq!(f.hits.len(), FIND_CAP);
-        assert_eq!(f.total, FIND_CAP + 5);
         assert!(f.capped());
+
+        let names = hit_names(&app);
+        assert_eq!(names[0], "late-hit9", "the largest comes first");
+        assert!(names[..10].iter().all(|n| n.starts_with("late-hit")));
+        // The 50 smallest are the ones left out: hit0 to hit49.
+        assert!(!names.contains(&"hit0".to_string()));
+        assert!(!names.contains(&"hit49".to_string()));
+        assert!(names.contains(&"hit50".to_string()));
+        assert_eq!(names.last().map(String::as_str), Some("hit50"));
+    }
+
+    /// While a scan runs, sizes grow: a directory that was small when the pass went by, and
+    /// was left out of a capped list for it, may be the largest match a moment later. So a
+    /// capped list is searched again every so often. The list on screen stays as it is until
+    /// the new pass is complete.
+    #[test]
+    fn find_refreshes_a_capped_list_while_the_scan_runs() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let grows = file_under(&mut t, 0, "hit-that-grows", 1);
+        for i in 0..FIND_CAP as u64 + 20 {
+            file_under(&mut t, 0, &format!("hit{i}"), 1_000 + i);
+        }
+        let mut app = App::new(t, true, false, true);
+        let t0 = search(&mut app, "hit");
+        assert!(find_state(&app).capped());
+        assert!(
+            !find_state(&app).hits.contains(&grows),
+            "too small to be kept"
+        );
+        assert!(!app.find_busy());
+
+        // The scan brings its size up. Nothing happens before the refresh is due.
+        app.tree.nodes[grows].disk = 5_000_000;
+        app.find_tick(t0 + FIND_REPASS - Duration::from_millis(1), usize::MAX);
+        assert!(!find_state(&app).hits.contains(&grows));
+
+        // Due: a new pass starts. Half-way through, the screen still shows the old list.
+        app.find_tick(t0 + FIND_REPASS, 5_000);
+        assert!(app.find_busy(), "searching again");
+        let f = find_state(&app);
+        assert_eq!(f.hits.len(), FIND_CAP, "the list is not emptied meanwhile");
+        assert_eq!(f.total, FIND_CAP + 21);
+        assert!(!f.hits.contains(&grows));
+        assert_eq!(
+            f.progress(&app.tree),
+            None,
+            "and no progress display flickers"
+        );
+
+        // Complete: the grown match leads the list.
+        app.find_tick(t0 + FIND_REPASS, usize::MAX);
+        assert!(!app.find_busy());
+        let f = find_state(&app);
+        assert_eq!(f.hits.first(), Some(&grows));
+        assert_eq!(f.hits.len(), FIND_CAP);
+        assert_eq!(f.total, FIND_CAP + 21);
+
+        // Without a running scan sizes do not change, and nothing is searched again.
+        app.scanning = false;
+        app.find_tick(t0 + FIND_REPASS * 10, usize::MAX);
+        assert!(!app.find_busy());
+    }
+
+    /// A list that is not capped holds every match, so it never needs a second pass.
+    #[test]
+    fn find_does_not_repeat_a_complete_list() {
+        let mut app = app_for_find();
+        app.scanning = true;
+        let t0 = search(&mut app, "readme");
+        assert_eq!(find_state(&app).total, 3);
+        app.find_tick(t0 + FIND_REPASS * 3, usize::MAX);
+        assert!(!app.find_busy());
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
     }
 
     /// The footer's byte counter saturates like the totals do.
@@ -4828,9 +4994,10 @@ mod tests {
         }
     }
 
-    /// Past the cap the count can't be fixed up from the kept hits: the pass starts over.
+    /// Past the cap the count can't be fixed up from the kept hits: the tree is searched
+    /// again. What was deleted leaves the list at once; the rest stays on screen meanwhile.
     #[test]
-    fn find_prune_restarts_a_capped_pass() {
+    fn find_prune_searches_a_capped_list_again() {
         let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
         let dir = t.import_child(
             t.root,
@@ -4855,7 +5022,14 @@ mod tests {
 
         app.tree.delete_subtree(dir);
         app.prune_find();
-        assert!(app.find_busy(), "restarted");
+        assert!(app.find_busy(), "searching again");
+        assert!(
+            find_state(&app)
+                .hits
+                .iter()
+                .all(|&hit| app.tree.is_attached(hit)),
+            "the deleted hits are gone at once"
+        );
         app.find_tick(now, usize::MAX);
         assert_eq!(hit_names(&app), vec!["hit-root"]);
         assert_eq!(find_state(&app).total, 1);

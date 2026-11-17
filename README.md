@@ -177,8 +177,8 @@ down a huge directory: go into it, press `/`, then `Tab`.
 The search runs in slices between frames, so the UI stays responsive even on trees with
 millions of entries; the title shows the match count and progress. While a scan or rescan is
 running, new matches appear as they are discovered, and entries you delete or rescan away
-drop out of the list. Very broad queries keep the first 10,000 matches and report
-`10,000+ matches`: refine the query to narrow them down.
+drop out of the list. A very broad query lists its 10,000 largest matches and says how many
+there are in all: `123,456 matches in the whole tree, showing the largest 10,000`.
 
 ### Largest files
 

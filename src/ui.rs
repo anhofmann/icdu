@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    find_ci, indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles,
+    find_ci, indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles, FIND_CAP,
 };
 use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
 
@@ -216,8 +216,8 @@ fn truncate_left(path: &str, width: usize) -> usize {
 
 /// The search popup's title: what is searched, and once a query runs, the match count and the
 /// progress of the pass. `scope` is the name of the directory a scoped search is limited to,
-/// `shown` the number of hits kept (fewer than `total` once the cap is reached), `progress`
-/// the percentage done while the pass is still running.
+/// `shown` the number of hits the list can hold (fewer than `total` once the cap is reached),
+/// `progress` the percentage done while the pass is still running.
 fn find_title(
     searching: bool,
     total: usize,
@@ -235,12 +235,12 @@ fn find_title(
     let place = place("in the whole tree");
     let running = progress.map_or(String::new(), |pct| format!(" · searching… {pct}%"));
     if total > shown {
-        let hint = if progress.is_some() {
-            ""
-        } else {
-            " — refine the query"
-        };
-        format!(" {}+ matches {place}{running}{hint} ", fmt_count(shown))
+        // The count is the real one; the list holds the largest of them.
+        format!(
+            " {} matches {place}, showing the largest {}{running} ",
+            fmt_count(total),
+            fmt_count(shown)
+        )
     } else {
         let s = if total == 1 { "" } else { "es" };
         format!(" {} match{s} {place}{running} ", fmt_count(total))
@@ -266,16 +266,14 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
     f.render_widget(Clear, area);
 
     let busy = find.busy(&app.tree);
-    let progress =
-        busy.then(|| (find.cursor as f64 / app.tree.nodes.len().max(1) as f64 * 100.0) as u8);
     let scope = find.scope();
     let scope_name = scope.map(|dir| dir_label(&app.tree.nodes[dir].name, 30));
     let title = find_title(
         find.active.is_some(),
         find.total,
-        find.hits.len(),
+        find.total.min(FIND_CAP),
         scope_name.as_deref(),
-        progress,
+        find.progress(&app.tree),
     );
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -1386,14 +1384,14 @@ mod tests {
             find_title(true, 0, 0, Some("docs/"), None),
             " 0 matches under docs/ "
         );
-        // Past the cap the count is a lower bound; the hint waits until the pass is done.
+        // Past the cap the title gives the real count and says what the list holds.
         assert_eq!(
             find_title(true, 25_000, 10_000, None, Some(7)),
-            " 10,000+ matches in the whole tree · searching… 7% "
+            " 25,000 matches in the whole tree, showing the largest 10,000 · searching… 7% "
         );
         assert_eq!(
-            find_title(true, 25_000, 10_000, Some("docs/"), None),
-            " 10,000+ matches under docs/ — refine the query "
+            find_title(true, 123_456, 10_000, Some("docs/"), None),
+            " 123,456 matches under docs/, showing the largest 10,000 "
         );
     }
 
