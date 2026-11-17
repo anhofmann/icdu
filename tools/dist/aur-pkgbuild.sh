@@ -26,7 +26,7 @@ x86_64=$(sum x86_64-unknown-linux-musl)
 aarch64=$(sum aarch64-unknown-linux-musl)
 
 cat <<PKGBUILD
-# Maintainer: icdu maintainers <anhofmann at users dot noreply dot github dot com>
+# Maintainer: Ansgar Hofmann <mail at ahofmann dot org>
 pkgname=icdu-bin
 pkgver=$version
 pkgrel=1

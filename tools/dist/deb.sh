@@ -42,7 +42,7 @@ Source: https://github.com/anhofmann/icdu
 Files: *
 Copyright: $(sed -n 's/^Copyright (c) //p' "$top/LICENSE" | paste -sd ';' - | sed 's/;/\n           /g')
 License: Expat
-$(sed -e '1,/^Copyright/d' -e '/./,$!d' -e 's/^$/./' -e 's/^/ /' "$top/LICENSE")
+$(sed -e '1,/^Copyright/d' -e '/^Copyright/d' -e '/./,$!d' -e 's/^$/./' -e 's/^/ /' "$top/LICENSE")
 COPYRIGHT
 
 # What changed is in the project's changelog; this is the form Debian's tools expect.
@@ -50,7 +50,7 @@ COPYRIGHT
   printf 'icdu (%s) unstable; urgency=medium\n\n' "$version"
   printf '  * Release %s. What changed:\n' "$version"
   printf '    https://github.com/anhofmann/icdu/blob/v%s/CHANGELOG.md\n\n' "$version"
-  printf ' -- icdu maintainers <anhofmann@users.noreply.github.com>  %s\n' \
+  printf ' -- Ansgar Hofmann <mail@ahofmann.org>  %s\n' \
     "$(date -u -R -d "@$epoch" 2>/dev/null || date -u -R -r "$epoch")"
 } | gzip -9n > "$doc/changelog.gz"
 
@@ -71,7 +71,7 @@ cat > "$stage/DEBIAN/control" <<CONTROL
 Package: icdu
 Version: $version
 Architecture: $arch
-Maintainer: icdu maintainers <anhofmann@users.noreply.github.com>
+Maintainer: Ansgar Hofmann <mail@ahofmann.org>
 Installed-Size: $installed
 Section: utils
 Priority: optional
