@@ -6540,6 +6540,118 @@ mod tests {
         (root, app)
     }
 
+    /// Two streams feed the tree at once (the scan, and a rescan of a directory). Each ends
+    /// when its sender is gone. The app is scanning until the last one has ended, and the
+    /// end of the rescan is what the status line reports.
+    #[test]
+    fn streams_end_one_by_one() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        let t0 = Instant::now();
+        let scan = add_stream(&mut app, false, t0);
+        let rescan = add_stream(&mut app, true, t0);
+        scan.send(sized_batch(0, "from-the-scan", 10, 10)).unwrap();
+        app.poll_scans(usize::MAX);
+        let root = app.tree.root;
+        app.refreshing_idx = Some(root);
+        assert!(app.scanning);
+
+        // The scan ends first. The rescan is still running.
+        drop(scan);
+        app.poll_scans(usize::MAX);
+        assert!(app.scanning, "one stream is left");
+        assert_eq!(app.refreshing_idx, Some(root));
+        assert_eq!(app.status, None);
+
+        // What the rescan still delivers is taken in, and then it ends too.
+        let mut late = sized_batch(0, "from-the-rescan", 5, 5);
+        late.more = true;
+        rescan.send(late).unwrap();
+        drop(rescan);
+        app.poll_scans(usize::MAX);
+        assert!(app.tree.nodes.iter().any(|n| n.name == "from-the-rescan"));
+        assert!(!app.scanning, "the last stream has ended");
+        assert_eq!(app.refreshing_idx, None);
+        assert_eq!(app.status.as_deref(), Some("rescanned /r"));
+        assert!(app.tree.orphans_is_empty());
+        // Polling a finished scan again changes nothing.
+        app.status = None;
+        app.poll_scans(usize::MAX);
+        assert!(!app.scanning);
+        assert_eq!(app.status, None);
+    }
+
+    /// After a deletion the highlight is on the row that took the place of the deleted one:
+    /// the next row, or the new last row when the last one was deleted. A view elsewhere
+    /// keeps its own highlight.
+    #[test]
+    fn after_a_delete_the_highlight_is_on_the_neighbour() {
+        let root = real_dir("delete_selection");
+        for (name, size) in [("a-big", 3000), ("b-mid", 2000), ("c-small", 1000)] {
+            std::fs::write(root.join(name), vec![0u8; size]).unwrap();
+        }
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/inner"), b"x").unwrap();
+        let mut app = scanned_app(&root, &[]);
+        app.sort.column = SortColumn::Name;
+        app.sort.descending = false;
+        assert_eq!(row_names(&app), ["a-big", "b-mid", "c-small", "sub"]);
+
+        delete_by_keys(&mut app, "b-mid");
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert_eq!(row_names(&app), ["a-big", "c-small", "sub"]);
+        assert_eq!(
+            app.selected,
+            Some(idx_named(&app, "c-small")),
+            "the next row"
+        );
+
+        delete_by_keys(&mut app, "sub");
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert_eq!(
+            app.selected,
+            Some(idx_named(&app, "c-small")),
+            "the new last row"
+        );
+
+        // Looking at another directory while the deletion runs: the highlight there stays.
+        std::fs::create_dir(root.join("other")).unwrap();
+        std::fs::write(root.join("other/keep"), b"x").unwrap();
+        let mut app = scanned_app(&root, &[]);
+        let (other, keep) = (idx_named(&app, "other"), idx_named(&app, "keep"));
+        delete_by_keys(&mut app, "a-big");
+        app.cur = other;
+        app.selected = Some(keep);
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert_eq!((app.cur, app.selected), (other, Some(keep)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One deletion at a time: while one runs, `d` on something else starts nothing and
+    /// says why.
+    #[test]
+    fn a_second_delete_waits_for_the_first() {
+        let root = real_dir("delete_twice");
+        std::fs::write(root.join("first"), b"x").unwrap();
+        std::fs::write(root.join("second"), b"x").unwrap();
+        let mut app = scanned_app(&root, &[]);
+        delete_by_keys(&mut app, "first");
+        assert!(app.is_deleting());
+        let second = idx_named(&app, "second");
+        app.selected = Some(second);
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no second question");
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("already in progress"));
+        pump(&mut app, "the deletion", |a| !a.is_deleting());
+        assert!(!root.join("first").exists());
+        assert!(root.join("second").exists(), "the second was not touched");
+        assert!(app.tree.is_attached(second));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// The outcome every refused rescan must have: nothing started, the tree as it was, and
     /// a message that names the reason.
     fn assert_rescan_refused(app: &App, dir: NodeIdx) {

@@ -2515,6 +2515,119 @@ not a line of the table
         fs::remove_dir_all(&base).unwrap();
     }
 
+    /// A symlink to a directory is an entry of its own and is not followed (without `-L`,
+    /// and with it): what it points to is listed once, where it is.
+    #[test]
+    fn a_symlink_to_a_directory_is_not_entered() {
+        let base = std::env::temp_dir().join(format!("icdu_dirlink_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("real")).unwrap();
+        fs::write(base.join("real/inside"), b"12345").unwrap();
+        std::os::unix::fs::symlink("real", base.join("link")).unwrap();
+        // A link back up the tree would make a scan that followed links run for ever.
+        std::os::unix::fs::symlink("..", base.join("real/up")).unwrap();
+
+        let tree = scan_tree(&base, 2);
+        let named = |name: &str| -> Vec<NodeIdx> {
+            (0..tree.nodes.len())
+                .filter(|&i| tree.nodes[i].name == name)
+                .collect()
+        };
+        assert_eq!(named("inside").len(), 1, "listed once");
+        for name in ["link", "up"] {
+            let i = named(name)[0];
+            assert_eq!(tree.nodes[i].kind, NodeKind::Link, "{name}");
+            assert!(tree.nodes[i].children.is_empty(), "{name}");
+        }
+        assert_eq!(tree.total_dirs, 2, "the root and `real`");
+        assert!(tree.subtree_complete(tree.root));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A special file (here a socket) is listed as what it is, counts as a file, and reading
+    /// it is never attempted.
+    #[test]
+    fn special_files_are_listed_and_not_read() {
+        let base = std::env::temp_dir().join(format!("icdu_special_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(base.join("socket")).unwrap();
+        fs::write(base.join("plain"), b"x").unwrap();
+
+        let tree = scan_tree(&base, 2);
+        let socket = tree.nodes.iter().position(|n| n.name == "socket").unwrap();
+        assert_eq!(tree.nodes[socket].kind, NodeKind::Other);
+        assert!(!tree.nodes[socket].read_error);
+        assert_eq!(tree.total_files, 2, "the socket and the file");
+        // In a dump it is flagged as not a regular file, like a symlink.
+        let mut out = Vec::new();
+        crate::dump::export(&tree, &mut out).unwrap();
+        let dump = String::from_utf8(out).unwrap();
+        assert!(
+            dump.contains(r#"{"name":"socket","notreg":true}"#),
+            "{dump}"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `-x` at a real boundary between filesystems: the mount point is listed, marked, and
+    /// not entered. Needs a directory with another filesystem mounted right below it, which
+    /// `/dev` has on Linux (`/dev/shm`, `/dev/pts`). Where there is none, there is nothing
+    /// to test, and the test says so.
+    #[test]
+    fn one_file_system_stops_at_a_real_mount_point() {
+        let parent = Path::new("/dev");
+        let Ok(meta) = fs::metadata(parent) else {
+            eprintln!("skipped: no /dev");
+            return;
+        };
+        let mounted: Vec<String> = fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                fs::symlink_metadata(e.path()).is_ok_and(|m| m.is_dir() && m.dev() != meta.dev())
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if mounted.is_empty() {
+            eprintln!("skipped: nothing is mounted directly below /dev here");
+            return;
+        }
+        let scan = |one_file_system: bool| {
+            let mut o = opts(2, meta.dev());
+            o.one_file_system = one_file_system;
+            let mut tree = Tree::new("/dev".into(), 0, 0, meta.dev(), meta.ino());
+            for batch in start(parent.to_path_buf(), o).events.iter() {
+                tree.apply(batch);
+            }
+            tree
+        };
+        let tree = scan(true);
+        for name in &mounted {
+            let i = tree
+                .nodes
+                .iter()
+                .position(|n| n.name == *name && n.parent == Some(tree.root))
+                .unwrap_or_else(|| panic!("{name} is not listed"));
+            let n = &tree.nodes[i];
+            assert_eq!(n.excluded, Excluded::OtherFs, "{name}");
+            assert!(n.children.is_empty(), "{name} was entered");
+            assert_ne!(n.dev, meta.dev(), "{name} keeps its own device");
+        }
+        // Everything else is on the filesystem the scan started on.
+        let elsewhere = tree.nodes.iter().filter(|n| n.excluded == Excluded::No);
+        assert!(elsewhere
+            .clone()
+            .all(|n| n.dev == meta.dev() || n.read_error));
+        // Without `-x` the same directories are entered: none is marked.
+        let crossing = scan(false);
+        assert!(crossing
+            .nodes
+            .iter()
+            .all(|n| n.excluded != Excluded::OtherFs));
+    }
+
     /// An entry that is gone is not an error; everything else is.
     #[test]
     fn only_a_missing_entry_counts_as_vanished() {

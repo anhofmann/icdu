@@ -23,7 +23,7 @@ cargo run -- -f dump.json -o -               # import + re-export a dump
 tools/dist/build.sh x86_64-unknown-linux-musl # a release binary, as CI and the release workflow build it
 ```
 
-The TUI needs a real terminal, so check behavior headlessly with `-o -` or through unit tests on `App`/`Tree`.
+The TUI needs a real terminal, so check behavior headlessly with `-o -`, through unit tests on `App`/`Tree`, or by drawing a frame on ratatui's `TestBackend` (see Tests below).
 
 ## Platform
 
@@ -90,4 +90,4 @@ Touch all of these in one change:
 Tests live in `#[cfg(test)]` modules at the bottom of each file. Patterns to reuse:
 - **`scan.rs`**: builds a real temporary directory tree, runs the real scanner to completion, and asserts on aggregates. Covers concurrency, hard links, excludes, focus priority and rescan.
 - **`app.rs`**: builds a `Tree` in memory with `Tree::new_imported` + `import_child` (see `app_with_entries()`), wraps it in `App::new(tree, disk_usage, read_only, scanning)`, and drives it through `on_key(KeyAction::…)`. No terminal is needed.
-- Rendering in `ui.rs` isn't unit-tested. Per AGENTS.md, say so in the PR and verify it manually.
+- **`ui.rs`**: the pieces a frame is made of (cells, titles, notes) are plain functions with tests of their own. A whole frame can be drawn without a terminal on ratatui's `TestBackend`: `screen(&app, width, height)` in the tests of `ui.rs` returns the screen as rows of text (`the_list_is_drawn_row_by_row`, `the_footer_shows_keys_order_and_progress`, `the_search_popup_is_drawn_over_the_list`), and the buffer itself gives colours and reverse video (`color_off_draws_the_same_screen_without_colours`). Use that for anything about what is on screen where. What it cannot show is the real terminal: the hand-over to a shell or the delete command, signals, resizing. Per AGENTS.md, say so in the PR and check those by hand (a detached `tmux` session works).

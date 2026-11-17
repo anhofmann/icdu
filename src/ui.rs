@@ -1693,6 +1693,173 @@ mod tests {
         assert!(confirm_quit_text(12_345).contains("12,345 directories have not"));
     }
 
+    /// What a frame looks like as text: the rows of the screen, without trailing blanks.
+    /// Drawing goes to ratatui's `TestBackend`, so no terminal is needed.
+    fn screen(app: &crate::app::App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| super::render(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    /// A small tree for drawing: a directory, two files and an excluded directory.
+    fn app_to_draw() -> crate::app::App {
+        let mut t = Tree::new_imported("/data".into(), 0, 0, 1, 1);
+        let mut add = |parent, name: &str, kind, size, excluded| {
+            t.import_child(
+                parent,
+                name.into(),
+                kind,
+                size,
+                size,
+                1,
+                1,
+                false,
+                false,
+                excluded,
+                false,
+            )
+        };
+        let photos = add(0, "photos", NodeKind::Dir, 4096, Excluded::No);
+        add(photos, "holiday.jpg", NodeKind::File, 3 << 20, Excluded::No);
+        add(0, "notes.txt", NodeKind::File, 1 << 20, Excluded::No);
+        add(0, "tiny", NodeKind::File, 100, Excluded::No);
+        add(0, "skipped", NodeKind::Dir, 4096, Excluded::Pattern);
+        let mut app = crate::app::App::new(t, true, false, false);
+        app.settle_selection();
+        app
+    }
+
+    /// The list as it is drawn: header, title with the number of rows, one line per entry
+    /// with flag, size, bar, percentage and name, largest first, and the first row
+    /// highlighted.
+    #[test]
+    fn the_list_is_drawn_row_by_row() {
+        use ratatui::style::Modifier;
+        use ratatui::{backend::TestBackend, Terminal};
+        let app = app_to_draw();
+        let rows = screen(&app, 80, 12);
+        assert_eq!(rows[0], "icdu  /data");
+        assert!(rows[1].contains("total: 4.0 MiB") && rows[1].contains("(disk usage)"));
+        assert!(rows[2].starts_with(" 4 items ─"), "{}", rows[2]);
+        assert_eq!(
+            &rows[3..7],
+            [
+                "     3.0 MiB [##########]  75.0% /photos",
+                "     1.0 MiB [###       ]  25.0%  notes.txt",
+                "<    4.0 KiB [          ]   0.1% /skipped  <excluded>",
+                "     100   B [          ]   0.0%  tiny",
+            ]
+        );
+        assert_eq!(rows[7], "", "nothing below the last entry");
+        assert!(rows[10].starts_with("─"), "the line above the footer");
+
+        // The highlight is on the first row, across its whole text, and nowhere else.
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| super::render(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let highlighted: Vec<u16> = (0..12)
+            .filter(|&y| buffer[(4, y)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(highlighted, [3]);
+    }
+
+    /// The columns the user can switch: hidden ones leave no gap, shown ones stand between
+    /// size and name.
+    #[test]
+    fn the_columns_follow_the_switches() {
+        let mut app = app_to_draw();
+        app.show_graph = false;
+        app.show_percent = false;
+        app.show_item_count = true;
+        let rows = screen(&app, 80, 12);
+        assert_eq!(rows[3], "     3.0 MiB     1 /photos");
+        assert_eq!(rows[4], "     1.0 MiB        notes.txt");
+        app.show_hidden = false;
+        let rows = screen(&app, 80, 12);
+        assert!(rows[2].starts_with(" 3 items · 1 hidden ─"), "{}", rows[2]);
+        assert!(!rows.iter().any(|row| row.contains("skipped")));
+    }
+
+    /// The footer: the keys that are on offer, the order of the list, and what the scan is
+    /// doing. A status message takes the place of the keys; the progress of a running scan
+    /// stays next to it.
+    #[test]
+    fn the_footer_shows_keys_order_and_progress() {
+        let mut app = app_to_draw();
+        let footer = |app: &crate::app::App| screen(app, 100, 12)[11].clone();
+        assert_eq!(
+            footer(&app),
+            " ? help  / search  d delete  sort:size↓  a usage  q quit   │   done  3 dirs  3 files"
+        );
+        app.on_key(crate::app::KeyAction::SortByName);
+        assert!(footer(&app).contains("sort:name↑"));
+        // Deleting is not on offer where it is switched off.
+        app.read_only = true;
+        assert!(!footer(&app).contains("d delete"));
+        app.status = Some("deleting is disabled (-r or --disable-delete)".into());
+        assert_eq!(
+            footer(&app),
+            " deleting is disabled (-r or --disable-delete)"
+        );
+
+        // While a scan runs, its progress keeps its place next to a message.
+        let mut scanning =
+            crate::app::App::new(Tree::new("/data".into(), 0, 0, 1, 1), true, false, true);
+        assert!(footer(&scanning).contains("│   "), "{}", footer(&scanning));
+        assert!(footer(&scanning).contains("scanning"));
+        scanning.status = Some("no read errors".into());
+        let both = footer(&scanning);
+        assert!(both.starts_with(" no read errors"), "{both}");
+        assert!(
+            both.contains("scanning") && both.contains("1 dir left"),
+            "{both}"
+        );
+    }
+
+    /// The search popup over the list: a title with the number of matches and the scope,
+    /// the query, and the matches with size and path, largest first.
+    #[test]
+    fn the_search_popup_is_drawn_over_the_list() {
+        use crate::app::KeyAction;
+        let mut app = app_to_draw();
+        app.on_key(KeyAction::Find);
+        for c in "o".chars() {
+            app.on_key(KeyAction::FindChar(c));
+        }
+        // The search starts after a pause in the typing: one tick to see the key, one after
+        // the pause to go through the whole tree.
+        let typed = std::time::Instant::now();
+        app.find_tick(typed, usize::MAX);
+        app.find_tick(typed + std::time::Duration::from_secs(1), usize::MAX);
+        let rows = screen(&app, 80, 14);
+        let popup: Vec<&String> = rows.iter().filter(|row| row.contains('│')).collect();
+        assert!(
+            rows[1].contains("┌ 3 matches in the whole tree "),
+            "{}",
+            rows[1]
+        );
+        assert!(popup[0].contains("search  o"), "{}", popup[0]);
+        // The directory holds the file, so it is the larger of the two by its own 4 KiB.
+        assert!(popup[1].contains("3.0 MiB  photos/"), "{}", popup[1]);
+        assert!(!popup[1].contains("holiday"), "{}", popup[1]);
+        assert!(
+            popup[2].contains("3.0 MiB  photos/holiday.jpg"),
+            "{}",
+            popup[2]
+        );
+        assert!(popup[3].contains("1.0 MiB  notes.txt"), "{}", popup[3]);
+        assert!(rows.iter().any(|row| row.contains("Enter go to entry")));
+        // The list is still there around it.
+        assert!(rows[0].starts_with("icdu  /data"));
+    }
+
     /// No row may be larger than what a full bar stands for.
     #[test]
     fn bar_scale_covers_the_rows_on_screen() {

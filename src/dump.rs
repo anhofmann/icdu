@@ -873,6 +873,8 @@ mod tests {
         t.set_raw_name(raw, Box::from(&b"bad_\xffname"[..]));
         add(&mut t, "q\"uote\\back\nline\u{1}ctl");
         add(&mut t, "ünï");
+        add(&mut t, "tab\tcr\resc\u{1b}del\u{7f}");
+        add(&mut t, "smile \u{1F600} and 𝄞");
 
         let mut buf = Vec::new();
         export(&t, &mut buf).unwrap();
@@ -881,6 +883,32 @@ mod tests {
         assert!(!has("\u{FFFD}".as_bytes()), "not the replacement character");
         assert!(has(br#""name":"q\"uote\\back\nline\u0001ctl""#), "escapes");
         assert!(has("\"name\":\"ünï\"".as_bytes()), "UTF-8 passes through");
+        // Every control character is escaped; DEL is none in JSON and stays as it is.
+        assert!(
+            has(b"\"name\":\"tab\\tcr\\resc\\u001bdel\x7f\""),
+            "more escapes"
+        );
+        // Characters outside the basic plane are written as their UTF-8 bytes, like the
+        // others, and not as pairs of \u escapes.
+        assert!(
+            has("\"name\":\"smile \u{1F600} and 𝄞\"".as_bytes()),
+            "beyond the basic plane"
+        );
+        assert!(!has(b"\\ud83d"));
+        // And what was written reads back as the same names.
+        let again = import(buf.as_slice()).unwrap();
+        let names: Vec<&str> = again.nodes[1..].iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "bad_\u{FFFD}name",
+                "q\"uote\\back\nline\u{1}ctl",
+                "ünï",
+                "tab\tcr\resc\u{1b}del\u{7f}",
+                "smile \u{1F600} and 𝄞"
+            ]
+        );
+        assert_eq!(again.raw_name(1), Some(&b"bad_\xffname"[..]));
     }
 
     #[test]
