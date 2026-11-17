@@ -72,22 +72,42 @@ KEYS:
 }
 
 fn main() {
+    // Defaults come from the config files, and the command line has the last word.
+    let config = args::Config::from_env(
+        std::env::var("HOME").ok(),
+        std::env::var("XDG_CONFIG_HOME").ok(),
+    );
     // Usage errors exit with status 1, as in ncdu.
-    let args = match args::parse(std::env::args().skip(1)) {
-        Ok(Parsed::Run(args)) => *args,
-        Ok(Parsed::Help) => {
-            print_help();
-            return;
-        }
-        Ok(Parsed::Version) => {
-            println!("{}", version_line());
-            return;
-        }
-        Err(e) => {
-            eprintln!("icdu: {e}\nTry 'icdu --help'.");
-            std::process::exit(1);
-        }
-    };
+    let (args, warnings) =
+        match args::parse_with_config(std::env::args().skip(1).collect(), &config) {
+            Ok((Parsed::Run(args), warnings)) => {
+                // A path in the home directory is shown the short way, so that the message has
+                // room in the status line.
+                let short = |warning: String| match &config.home {
+                    Some(home) => warning.replacen(&format!("{home}/"), "~/", 1),
+                    None => warning,
+                };
+                (*args, warnings.into_iter().map(short).collect::<Vec<_>>())
+            }
+            Ok((Parsed::Help, _)) => {
+                print_help();
+                return;
+            }
+            Ok((Parsed::Version, _)) => {
+                println!("{}", version_line());
+                return;
+            }
+            Err(e) => {
+                eprintln!("icdu: {e}\nTry 'icdu --help'.");
+                std::process::exit(1);
+            }
+        };
+
+    // What was passed over in ncdu's config files. On the terminal before the browser
+    // takes it, where it is found again after quitting, and in the browser's first status.
+    for warning in &warnings {
+        eprintln!("icdu: {warning}");
+    }
 
     // Every size that is printed from here on is in the units asked for.
     ui::set_si(args.si);
@@ -113,7 +133,7 @@ fn main() {
     if let Some(src) = &args.import {
         let tree = unwrap_or_die(load_import(src, args.extended), src);
         let mut app = App::new(tree, args.disk_usage, !args.can_delete, false);
-        apply_options(&mut app, &args);
+        apply_options(&mut app, &args, &warnings);
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
         run_ui(&mut app, args.slow_ui);
@@ -125,7 +145,7 @@ fn main() {
         // --- `-0` / `-1`: scan first, with little or no feedback, then browse. ---
         let tree = scan_to_completion(tree, root, opts.clone(), mode);
         let mut app = App::new(tree, args.disk_usage, !args.can_delete, false);
-        apply_options(&mut app, &args);
+        apply_options(&mut app, &args, &warnings);
         // The scan is over, but `r` can still read a directory again.
         app.set_scan_opts(opts);
         run_ui(&mut app, args.slow_ui);
@@ -134,14 +154,20 @@ fn main() {
     // --- Interactive scan mode: browse while the scan runs. ---
     let scan = scan::start(root, opts.clone());
     let mut app = App::new(tree, args.disk_usage, !args.can_delete, true);
-    apply_options(&mut app, &args);
+    apply_options(&mut app, &args, &warnings);
     app.attach_scan(scan, opts);
 
     run_ui(&mut app, args.slow_ui);
 }
 
 /// What the command line says about the browser: what it may do, and how the list looks.
-fn apply_options(app: &mut App, args: &Args) {
+fn apply_options(app: &mut App, args: &Args, warnings: &[String]) {
+    // What was passed over in a config file is the first thing the status line says.
+    app.status = match warnings {
+        [] => None,
+        [only] => Some(only.clone()),
+        [first, more @ ..] => Some(format!("{first} (and {} more)", more.len())),
+    };
     app.delete_command = args.delete_command.clone();
     app.no_shell = !args.can_shell;
     app.no_refresh = !args.can_refresh;

@@ -180,6 +180,7 @@ enum Action {
     ExcludeFrom,
     OlderThan,
     NewerThan,
+    IgnoreConfig,
     ReadOnly,
     Delete(bool),
     Shell(bool),
@@ -707,6 +708,13 @@ pub const FLAGS: &[Flag] = &[
         "",
         Action::Unsupported("it belongs to the binary export, which there is none of"),
     ),
+    flag(
+        &[],
+        &["ignore-config"],
+        None,
+        "do not read the config files",
+        Action::IgnoreConfig,
+    ),
     flag(&['h'], &["help"], None, "show this help", Action::Help),
     flag(
         &['V', 'v'],
@@ -748,16 +756,68 @@ fn parse_sort(value: &str) -> Result<(SortColumn, bool), String> {
 /// Parse the command line (without the program name).
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut parsed = Args::default();
-    let mut path: Option<String> = None;
+    let mut path = None;
+    match read_args(&mut parsed, &mut path, args.into_iter(), &From::CommandLine)? {
+        Some(stop) => Ok(stop),
+        None => Ok(finish(parsed, path)),
+    }
+}
+
+fn finish(mut parsed: Args, path: Option<String>) -> Parsed {
+    if let Some(path) = path {
+        parsed.path = PathBuf::from(path);
+    }
+    Parsed::Run(Box::new(parsed))
+}
+
+/// Where arguments are being read from. A config file is not a command line: it sets
+/// defaults and cannot name what to scan or what to do.
+enum From<'a> {
+    CommandLine,
+    /// A line of a config file. `home` is what a leading `~/` in a file name stands for
+    /// there (on a command line the shell has seen to that).
+    Config {
+        home: Option<&'a str>,
+    },
+}
+
+/// Apply `args` to `parsed`, in order. Returns `Some` for the flags that end parsing
+/// (`--help`, `--version`). The directory to scan, if one is named, goes to `path`.
+fn read_args(
+    parsed: &mut Args,
+    path: &mut Option<String>,
+    mut args: impl Iterator<Item = String>,
+    from: &From,
+) -> Result<Option<Parsed>, String> {
+    let in_config = matches!(from, From::Config { .. });
+    // What a config file may not say, and the value of a flag as a config file means it.
+    let check = |flag: &Flag, shown: &str, value: Option<String>| match from {
+        From::CommandLine => Ok(value),
+        From::Config { home } => {
+            let per_run = matches!(
+                flag.action,
+                Action::Help | Action::Version | Action::Output | Action::Input
+            );
+            if per_run || flag.action == Action::IgnoreConfig {
+                return Err(format!("{shown} cannot be set in a config file"));
+            }
+            Ok(match (flag.action, value, home) {
+                (Action::ExcludeFrom, Some(file), Some(home)) => Some(expand_home(&file, home)),
+                (_, value, _) => value,
+            })
+        }
+    };
     let mut only_paths = false;
-    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         // A lone `-` is not an option; neither is anything after `--`.
         if only_paths || arg == "-" || !arg.starts_with('-') {
+            if in_config {
+                return Err(format!("not an option: {arg}"));
+            }
             if let Some(first) = &path {
                 return Err(format!("more than one directory given: {first} and {arg}"));
             }
-            path = Some(arg);
+            *path = Some(arg);
         } else if arg == "--" {
             only_paths = true;
         } else if let Some(long) = arg.strip_prefix("--") {
@@ -776,8 +836,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 (None, Some(_)) => return Err(format!("{shown} does not take a value")),
                 (None, None) => None,
             };
-            match apply(flag.action, value, &shown, &mut parsed)? {
-                Some(stop) => return Ok(stop),
+            let value = check(flag, &shown, value)?;
+            match apply(flag.action, value, &shown, parsed)? {
+                Some(stop) => return Ok(Some(stop)),
                 None => continue,
             }
         } else {
@@ -800,8 +861,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                     None => None,
                 };
                 let took_the_rest = value.is_some();
-                if let Some(stop) = apply(flag.action, value, &shown, &mut parsed)? {
-                    return Ok(stop);
+                let value = check(flag, &shown, value)?;
+                if let Some(stop) = apply(flag.action, value, &shown, parsed)? {
+                    return Ok(Some(stop));
                 }
                 if took_the_rest {
                     break;
@@ -809,10 +871,149 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             }
         }
     }
-    if let Some(path) = path {
-        parsed.path = PathBuf::from(path);
+    Ok(None)
+}
+
+/// `~/x` in a config file is `x` in the home directory, as in ncdu 2. Nothing else is
+/// expanded (no `~user`, no variables).
+fn expand_home(file: &str, home: &str) -> String {
+    match file.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
+        None if file == "~" => home.to_string(),
+        None => file.to_string(),
     }
-    Ok(Parsed::Run(Box::new(parsed)))
+}
+
+/// A file of default options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigFile {
+    pub path: PathBuf,
+    /// One of ncdu's own files. It was written for another program, which may have options
+    /// icdu does not: what cannot be used is reported and passed over. In icdu's own files
+    /// a mistake is an error.
+    pub foreign: bool,
+}
+
+/// The config files and what `~` means in them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Config {
+    pub files: Vec<ConfigFile>,
+    pub home: Option<String>,
+}
+
+impl Config {
+    /// The files that are read, in this order, so that each can override the ones before
+    /// it: ncdu's (`/etc/ncdu.conf`, then the user's `ncdu/config`), so that an existing
+    /// ncdu setup applies, then icdu's (`/etc/icdu.conf`, the user's `icdu/config`), for
+    /// what is to differ and for options only icdu has. The user's files are in
+    /// `$XDG_CONFIG_HOME`, or in `~/.config` if that is not set.
+    pub fn from_env(home: Option<String>, xdg_config_home: Option<String>) -> Config {
+        let home = home.filter(|h| !h.is_empty());
+        let user_dir = match (xdg_config_home.filter(|x| !x.is_empty()), &home) {
+            (Some(xdg), _) => Some(PathBuf::from(xdg)),
+            (None, Some(home)) => Some(PathBuf::from(home).join(".config")),
+            (None, None) => None,
+        };
+        let mut files = Vec::new();
+        for (system, program, foreign) in [
+            ("/etc/ncdu.conf", "ncdu", true),
+            ("/etc/icdu.conf", "icdu", false),
+        ] {
+            files.push(ConfigFile {
+                path: PathBuf::from(system),
+                foreign,
+            });
+            if let Some(dir) = &user_dir {
+                files.push(ConfigFile {
+                    path: dir.join(program).join("config"),
+                    foreign,
+                });
+            }
+        }
+        Config { files, home }
+    }
+}
+
+/// What `--ignore-config` is told when a config file stops icdu.
+const SKIP_HINT: &str = "Run with --ignore-config to skip the config files.";
+
+/// Parse the command line on top of the defaults from the config files. Also returns what
+/// was passed over in ncdu's files, for the user to be told.
+///
+/// The command line is looked at first, on its own. `--help` and `--version` have to work
+/// with a broken config file, a mistake on the command line is the one to report, and
+/// `--ignore-config` has to be known before anything is read.
+pub fn parse_with_config(
+    args: Vec<String>,
+    config: &Config,
+) -> Result<(Parsed, Vec<String>), String> {
+    let alone = parse(args.iter().cloned())?;
+    let options = args.iter().take_while(|arg| *arg != "--");
+    let ignore = options.clone().any(|arg| arg == "--ignore-config");
+    if ignore || !matches!(alone, Parsed::Run(_)) {
+        return Ok((alone, Vec::new()));
+    }
+    let mut parsed = Args::default();
+    let mut warnings = Vec::new();
+    for file in &config.files {
+        let text = match std::fs::read_to_string(&file.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warnings.push(format!("{}: {e}", file.path.display()));
+                continue;
+            }
+        };
+        for (number, problem) in read_config(&mut parsed, &text, config.home.as_deref()) {
+            let problem = format!("{}:{number}: {problem}", file.path.display());
+            if file.foreign {
+                warnings.push(format!("{problem} (line ignored)"));
+            } else {
+                return Err(format!("{problem}\n{SKIP_HINT}"));
+            }
+        }
+    }
+    let mut path = None;
+    match read_args(&mut parsed, &mut path, args.into_iter(), &From::CommandLine)? {
+        Some(stop) => Ok((stop, warnings)),
+        None => Ok((finish(parsed, path), warnings)),
+    }
+}
+
+/// Apply the lines of a config file to `parsed`, and return what was wrong with which line
+/// (counted from 1).
+///
+/// The format is ncdu's: one option per line, as it would be written on a command line,
+/// with the option's value after it on the same line. The value is the rest of the line as
+/// it stands, without quoting: `--exclude My Documents` excludes `My Documents`. Empty
+/// lines and lines that start with `#` are passed over. A line that starts with `@` may
+/// fail without that being a problem (ncdu 2), for a file that may or may not be there:
+/// `@--exclude-from ~/.ncduexcludes`.
+fn read_config(parsed: &mut Args, text: &str, home: Option<&str>) -> Vec<(usize, String)> {
+    let mut problems = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (line, may_fail) = match line.strip_prefix('@') {
+            Some(rest) => (rest.trim_start(), true),
+            None => (line, false),
+        };
+        // The option, and after the first run of blanks its value.
+        let words: Vec<String> = match line.split_once(char::is_whitespace) {
+            Some((option, value)) => vec![option.to_string(), value.trim_start().to_string()],
+            None => vec![line.to_string()],
+        };
+        let mut path = None;
+        let from = From::Config { home };
+        if let Err(problem) = read_args(parsed, &mut path, words.into_iter(), &from) {
+            if !may_fail {
+                problems.push((index + 1, problem));
+            }
+        }
+    }
+    problems
 }
 
 fn needs_value(flag: &Flag, shown: &str) -> String {
@@ -880,6 +1081,8 @@ fn apply(
                 args.can_export = false;
             }
         }
+        // Acted on before any config file is read; see `parse_with_config`.
+        Action::IgnoreConfig => {}
         Action::Delete(on) => args.can_delete = on,
         Action::Shell(on) => args.can_shell = on,
         Action::Refresh(on) => args.can_refresh = on,
@@ -985,6 +1188,7 @@ pub fn options_help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn run(args: &[&str]) -> Result<Parsed, String> {
         parse(args.iter().map(|a| a.to_string()))
@@ -1803,6 +2007,361 @@ mod tests {
             6
         );
         std::fs::remove_file(&file).unwrap();
+    }
+
+    /// The defaults, to spell a result as its differences from them.
+    fn d() -> Args {
+        Args::default()
+    }
+
+    /// A directory for config files of one test.
+    fn config_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("icdu_config_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file(dir: &Path, name: &str, text: &str, foreign: bool) -> ConfigFile {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        ConfigFile { path, foreign }
+    }
+
+    fn with_config(args: &[&str], config: &Config) -> Result<(Args, Vec<String>), String> {
+        let args = args.iter().map(|a| a.to_string()).collect();
+        match parse_with_config(args, config)? {
+            (Parsed::Run(parsed), warnings) => Ok((*parsed, warnings)),
+            (other, _) => panic!("{other:?}"),
+        }
+    }
+
+    /// Which files are read, and in which order: ncdu's before icdu's, the system's before
+    /// the user's, and the user's in `$XDG_CONFIG_HOME` if that is set to something.
+    #[test]
+    fn config_files_are_ncdus_and_then_icdus() {
+        let paths = |home: Option<&str>, xdg: Option<&str>| -> Vec<(String, bool)> {
+            Config::from_env(home.map(String::from), xdg.map(String::from))
+                .files
+                .into_iter()
+                .map(|f| (f.path.to_string_lossy().to_string(), f.foreign))
+                .collect()
+        };
+        let named = |list: &[(&str, bool)]| -> Vec<(String, bool)> {
+            list.iter().map(|&(p, f)| (p.to_string(), f)).collect()
+        };
+        assert_eq!(
+            paths(Some("/home/me"), None),
+            named(&[
+                ("/etc/ncdu.conf", true),
+                ("/home/me/.config/ncdu/config", true),
+                ("/etc/icdu.conf", false),
+                ("/home/me/.config/icdu/config", false),
+            ])
+        );
+        assert_eq!(
+            paths(Some("/home/me"), Some("/xdg")),
+            named(&[
+                ("/etc/ncdu.conf", true),
+                ("/xdg/ncdu/config", true),
+                ("/etc/icdu.conf", false),
+                ("/xdg/icdu/config", false),
+            ])
+        );
+        // An empty variable is no variable.
+        assert_eq!(
+            paths(Some("/home/me"), Some("")),
+            paths(Some("/home/me"), None)
+        );
+        // Without a home there are only the system's files.
+        assert_eq!(
+            paths(None, None),
+            named(&[("/etc/ncdu.conf", true), ("/etc/icdu.conf", false)])
+        );
+        assert_eq!(paths(Some(""), None), paths(None, None));
+        assert_eq!(
+            Config::from_env(Some("/home/me".into()), None)
+                .home
+                .as_deref(),
+            Some("/home/me")
+        );
+    }
+
+    /// The acceptance case: a config written for ncdu takes effect.
+    #[test]
+    fn an_ncdu_config_takes_effect() {
+        let dir = config_dir("ncdu");
+        let config = Config {
+            files: vec![file(
+                &dir,
+                "config",
+                "# Always enable extended mode\n-e\n\n# Disable file deletion\n--disable-delete\n\n\
+                 # Exclude .git directories\n--exclude .git\n",
+                true,
+            )],
+            home: None,
+        };
+        let (args, warnings) = with_config(&["/data"], &config).unwrap();
+        assert_eq!(
+            args,
+            Args {
+                extended: true,
+                can_delete: false,
+                excludes: vec![".git".into()],
+                path: "/data".into(),
+                ..d()
+            }
+        );
+        assert!(warnings.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The format of a line, as ncdu 1.18 reads it (probed with files like these), plus the
+    /// two things ncdu 2 adds: `--option=value` and the `@` prefix.
+    #[test]
+    fn config_lines_are_read_like_ncdu_reads_them() {
+        let read = |text: &str| {
+            let mut parsed = Args::default();
+            let problems = read_config(&mut parsed, text, Some("/home/me"));
+            (parsed, problems)
+        };
+        let excludes = |text: &str| {
+            let (parsed, problems) = read(text);
+            assert!(problems.is_empty(), "{text:?}: {problems:?}");
+            parsed.excludes
+        };
+        // The value is the rest of the line: no quotes, no comment after it, blanks inside
+        // it kept, blanks around it dropped.
+        assert_eq!(excludes("--exclude sub\n"), ["sub"]);
+        assert_eq!(excludes("--exclude   sub  \n"), ["sub"]);
+        assert_eq!(excludes("  --exclude sub\n"), ["sub"]);
+        assert_eq!(excludes("\t--exclude\tsub\n"), ["sub"]);
+        assert_eq!(excludes("--exclude pad dir\n"), ["pad dir"]);
+        assert_eq!(excludes("--exclude \"sub\"\n"), ["\"sub\""]);
+        assert_eq!(excludes("--exclude sub # trailing\n"), ["sub # trailing"]);
+        assert_eq!(
+            excludes("--exclude ~/x\n"),
+            ["~/x"],
+            "only file names get a home"
+        );
+        assert_eq!(excludes("--exclude=sub\n"), ["sub"]);
+        // Comments, also indented, empty lines, a last line without its end, and CR LF.
+        assert_eq!(
+            excludes("# one\n   # two\n\n\n--exclude a\r\n--exclude b"),
+            ["a", "b"]
+        );
+        // Short flags can be bundled, as on a command line.
+        let (parsed, problems) = read("-ex\n");
+        assert!(problems.is_empty());
+        assert!(parsed.extended && parsed.one_file_system);
+
+        // What is wrong is reported with its line, and the lines around it still count.
+        let (parsed, problems) = read(
+            "-e\n--no-such-flag\n--exclude\n-e --exclude c\nsub\n--sort sideways\n--exclude kept\n",
+        );
+        assert!(parsed.extended);
+        assert_eq!(parsed.excludes, ["kept"]);
+        assert_eq!(
+            problems,
+            [
+                (2, "unknown option: --no-such-flag".to_string()),
+                (3, "--exclude needs a pattern".to_string()),
+                (4, "unknown option: --exclude c".to_string()),
+                (5, "not an option: sub".to_string()),
+                (
+                    6,
+                    "unknown --sort column: sideways (disk-usage, name, apparent-size, \
+                     itemcount or mtime, optionally followed by -asc or -desc)"
+                        .to_string()
+                ),
+            ]
+        );
+        // What belongs to one run cannot be a default.
+        for line in [
+            "--help",
+            "-h",
+            "--version",
+            "-o out.json",
+            "-f in.json",
+            "--ignore-config",
+        ] {
+            let (_, problems) = read(line);
+            assert_eq!(problems.len(), 1, "{line}");
+            assert!(
+                problems[0].1.ends_with("cannot be set in a config file"),
+                "{problems:?}"
+            );
+        }
+        // `@`: a line that may fail.
+        let (parsed, problems) = read("@--no-such-flag\n@--exclude-from /no/such/file\n@ -e\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(parsed.extended, "and one that works does");
+    }
+
+    /// `~/` in the file name of `-X` is the home directory, in a config file only.
+    #[test]
+    fn exclude_files_in_a_config_are_found_in_the_home_directory() {
+        let home = config_dir("home");
+        std::fs::write(home.join("patterns"), "*.o\nbuild\n").unwrap();
+        let home_str = home.to_string_lossy().to_string();
+        for line in ["-X ~/patterns", "--exclude-from ~/patterns", "-X~/patterns"] {
+            let mut parsed = Args::default();
+            let problems = read_config(&mut parsed, line, Some(&home_str));
+            assert!(problems.is_empty(), "{line}: {problems:?}");
+            assert_eq!(parsed.excludes, ["*.o", "build"], "{line}");
+        }
+        assert_eq!(expand_home("~/a/b", "/home/me"), "/home/me/a/b");
+        assert_eq!(expand_home("~/a", "/home/me/"), "/home/me/a");
+        assert_eq!(expand_home("~", "/home/me"), "/home/me");
+        assert_eq!(expand_home("~other/a", "/home/me"), "~other/a");
+        assert_eq!(expand_home("/abs/~/a", "/home/me"), "/abs/~/a");
+        // On a command line the shell has done that, and icdu does not do it again.
+        let err = parse(["-X".to_string(), "~/patterns".to_string()]).unwrap_err();
+        assert!(err.starts_with("~/patterns: "), "{err}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Later files override earlier ones, and the command line overrides them all, also
+    /// with the counterpart of a flag. What only adds (excludes) adds up.
+    #[test]
+    fn the_command_line_has_the_last_word() {
+        let dir = config_dir("order");
+        let config = Config {
+            files: vec![
+                file(
+                    &dir,
+                    "ncdu.conf",
+                    "-e\n--exclude system\n--sort name\n",
+                    true,
+                ),
+                file(
+                    &dir,
+                    "ncdu-user",
+                    "--no-extended\n-x\n--exclude user\n--si\n",
+                    true,
+                ),
+                file(
+                    &dir,
+                    "icdu-user",
+                    "--sort itemcount-asc\n--older-than 30d\n",
+                    false,
+                ),
+            ],
+            home: None,
+        };
+        let (args, warnings) = with_config(&[], &config).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            args,
+            Args {
+                one_file_system: true,
+                si: true,
+                excludes: vec!["system".into(), "user".into()],
+                sort: Some((SortColumn::Items, false)),
+                older_than: Some(30 * 86_400),
+                ..d()
+            }
+        );
+        let (args, _) = with_config(
+            &[
+                "--cross-file-system",
+                "--no-si",
+                "-e",
+                "--exclude",
+                "mine",
+                "--sort=mtime",
+            ],
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            Args {
+                extended: true,
+                excludes: vec!["system".into(), "user".into(), "mine".into()],
+                sort: Some((SortColumn::Mtime, true)),
+                older_than: Some(30 * 86_400),
+                ..d()
+            }
+        );
+        // `--ignore-config`: as if there were no files. Wherever it stands, but not as the
+        // name of a directory after `--`.
+        let (args, _) = with_config(&["-x", "--ignore-config"], &config).unwrap();
+        assert_eq!(
+            args,
+            Args {
+                one_file_system: true,
+                ..d()
+            }
+        );
+        let (args, _) = with_config(&["--", "--ignore-config"], &config).unwrap();
+        assert!(args.si, "the files were read");
+        assert_eq!(args.path, PathBuf::from("--ignore-config"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A mistake in one of ncdu's files is reported and passed over: the file was written
+    /// for another program. In one of icdu's own it stops icdu, with file and line. A file
+    /// that is not there is nothing to speak of.
+    #[test]
+    fn config_mistakes_warn_in_ncdus_files_and_stop_in_icdus() {
+        let dir = config_dir("mistakes");
+        let ncdu = file(
+            &dir,
+            "ncdu",
+            "-e\n-O dump.bin\n--some-new-ncdu-option\n-x\n",
+            true,
+        );
+        let missing = ConfigFile {
+            path: dir.join("not-there"),
+            foreign: false,
+        };
+        let config = Config {
+            files: vec![ncdu.clone(), missing.clone()],
+            home: None,
+        };
+        let (args, warnings) = with_config(&[], &config).unwrap();
+        assert!(
+            args.extended && args.one_file_system,
+            "the other lines count"
+        );
+        let at = |line: usize| format!("{}:{line}: ", ncdu.path.display());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with(&(at(2) + "-O is not supported by icdu")));
+        assert_eq!(
+            warnings[1],
+            at(3) + "unknown option: --some-new-ncdu-option (line ignored)"
+        );
+
+        let own = file(&dir, "icdu", "--si\n--colour off\n", false);
+        let config = Config {
+            files: vec![ncdu, missing, own.clone()],
+            home: None,
+        };
+        let err = with_config(&[], &config).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "{}:2: unknown option: --colour\nRun with --ignore-config to skip the config files.",
+                own.path.display()
+            )
+        );
+        // With a broken file, `--help`, `--version` and `--ignore-config` still work, and a
+        // mistake on the command line is the one that is reported.
+        let run = |args: &[&str]| {
+            parse_with_config(args.iter().map(|a| a.to_string()).collect(), &config)
+        };
+        assert_eq!(run(&["--help"]).unwrap().0, Parsed::Help);
+        assert_eq!(run(&["-V"]).unwrap().0, Parsed::Version);
+        assert!(matches!(
+            run(&["--ignore-config"]).unwrap().0,
+            Parsed::Run(_)
+        ));
+        assert_eq!(
+            run(&["--nonsense"]).unwrap_err(),
+            "unknown option: --nonsense"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The table is consistent: no spelling is used twice, every negation exists and points

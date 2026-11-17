@@ -121,6 +121,7 @@ OPTIONS:
                              record owner, group, mode and mtime of entries
         --show-mtime, --hide-mtime
                              show or hide the mtime column (needs -e)
+        --ignore-config      do not read the config files
     -h, --help               show this help
     -V, --version            show version
 ```
@@ -140,6 +141,8 @@ something has a counterpart that switches it back (`--apparent-size` / `--disk-u
 `-t` sets the number of scanner threads. It defaults to four per core (at least 4, at most
 64); ncdu 2 uses one unless told otherwise.
 
+Options you always want can go into a config file; see [Configuration](#configuration).
+
 Examples:
 
 ```sh
@@ -150,6 +153,39 @@ icdu -f backup.json             # browse a previous dump, no scanning
 ncdu -o - / | icdu -f -         # pipe an ncdu scan straight into icdu
 icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/dedup)
 ```
+
+### Configuration
+
+Default options are read from config files, in ncdu's format: one option per line, written as
+on the command line, with its value after it on the same line.
+
+```
+# Always record owner, mode and time
+-e
+# The value is the rest of the line, as it stands: no quotes
+--exclude My Documents
+--sort name
+# A line with @ in front may fail: this file need not exist
+@--exclude-from ~/.ncduexcludes
+```
+
+Empty lines and lines that start with `#` are passed over. In a file name, `~/` is your home
+directory. Options that belong to one run (`-o`, `-f`, `--help`) cannot be set there.
+
+Four files are read, each overriding the ones before it, and the command line overrides them
+all (that is what the counterparts are for: `--no-extended` undoes a `-e` from a file):
+
+1. `/etc/ncdu.conf` and
+2. `$XDG_CONFIG_HOME/ncdu/config` (`~/.config/ncdu/config` if the variable is not set): ncdu's
+   own files, so that a setup you have for ncdu applies to icdu as well. What icdu cannot
+   use in them, such as an option of a newer ncdu, is reported and passed over.
+3. `/etc/icdu.conf` and
+4. `$XDG_CONFIG_HOME/icdu/config` (`~/.config/icdu/config`): for what icdu is to do
+   differently, and for options ncdu does not have (`--older-than`, `--newer-than`), which
+   would stop ncdu if they stood in its file. A mistake in these stops icdu, with the file and
+   the line.
+
+`--ignore-config` reads none of them.
 
 ### Keys
 
