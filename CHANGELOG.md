@@ -12,6 +12,12 @@ history was separated; they do not match the pull requests of this repository.
 
 ## [Unreleased]
 
+### Fixed
+
+- The install script refused to install when the GitHub CLI on the machine was logged in but
+  too old to have `gh attestation` (the one in Debian 12, for example). It installs now and
+  says that it could not check who built the archive.
+
 ## [0.5.0] - 2026-11-17
 
 The first release under the name icdu, with everything since rcdu 0.4.1.

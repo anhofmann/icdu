@@ -63,6 +63,9 @@ jobs:
     name: install script (${{ matrix.os }})
     needs: dist
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
     strategy:
       fail-fast: false
       matrix:
@@ -85,15 +88,29 @@ jobs:
           ICDU_VERSION="v$version" sh install.sh | tee second.txt
           grep -q "^icdu $version was installed in .* already" second.txt
           test "$("$RUNNER_TEMP/bin/icdu" --version)" = "icdu $version"
-      - name: Install the latest release
+      # The runner's GitHub CLI is logged in through the token, so the script checks the
+      # attestation here: this is also the test that a published release can be verified.
+      - name: Install the latest release, verified
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          ICDU_INSTALL_DIR="$RUNNER_TEMP/latest" sh install.sh
-          # Releases up to 0.4.1 install as rcdu.
-          if [ -x "$RUNNER_TEMP/latest/icdu" ]; then
-            "$RUNNER_TEMP/latest/icdu" --version
-          else
-            "$RUNNER_TEMP/latest/rcdu" --version
-          fi
+          ICDU_INSTALL_DIR="$RUNNER_TEMP/latest" sh install.sh | tee latest.txt
+          grep -q "^verified: built by the release workflow of " latest.txt
+          "$RUNNER_TEMP/latest/icdu" --version
+      - name: A GitHub CLI without the attestation command does not stop the install
+        run: |
+          mkdir "$RUNNER_TEMP/old-gh"
+          cat > "$RUNNER_TEMP/old-gh/gh" <<'GH'
+          #!/bin/sh
+          # What gh 2.23 does (the one in Debian 12): it is logged in, and has no such command.
+          [ "$1" = auth ] && exit 0
+          echo "unknown command \"$1\" for \"gh\"" >&2
+          exit 1
+          GH
+          chmod +x "$RUNNER_TEMP/old-gh/gh"
+          PATH="$RUNNER_TEMP/old-gh:$PATH" ICDU_INSTALL_DIR="$RUNNER_TEMP/old" sh install.sh | tee old.txt
+          grep -q "^not verified who built it" old.txt
+          "$RUNNER_TEMP/old/icdu" --version
 
   # The Homebrew formula as the tap will carry it: written for the archives this run built,
   # put into a tap on the runner, installed from there, tested, and removed again.

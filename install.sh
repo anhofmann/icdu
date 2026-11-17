@@ -106,14 +106,15 @@ expected=$(awk -v a="$ASSET" '$2 == a { print $1 }' "$TMP/sha256sums.txt")
   die "checksum mismatch for $ASSET (expected $expected, got $actual): not installing"
 
 # Who built it: GitHub keeps a signed statement for every archive that it came out of this
-# repository's release workflow. The GitHub CLI can check it, if it is there and logged in.
+# repository's release workflow. The GitHub CLI can check it, if it is there, has the command
+# for it (an old one, like the one in Debian 12, does not) and is logged in.
 if [ "$archive" = yes ] && [ -z "${ICDU_BASE_URL:-}" ]; then
-  if have gh && gh auth status >/dev/null 2>&1; then
+  if have gh && gh attestation --help >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     gh attestation verify "$TMP/$ASSET" --repo "$REPO" >/dev/null 2>&1 ||
       die "the attestation of $ASSET could not be verified: not installing (try: gh attestation verify FILE --repo $REPO)"
     log "verified: built by the release workflow of $REPO"
   else
-    log "not verified who built it (that needs the GitHub CLI, logged in):"
+    log "not verified who built it (that needs a GitHub CLI that has 'gh attestation', logged in):"
     log "  gh attestation verify $ASSET --repo $REPO"
   fi
 fi

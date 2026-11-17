@@ -36,7 +36,8 @@ SHA-256 checksums, and installs the binary to `~/.local/bin`.
   icdu itself never connects to the network.
 - If the [GitHub CLI](https://cli.github.com) is installed and logged in, the script also
   verifies that the archive was built by this repository's release workflow, and refuses to
-  install one that was not. Without it, the script prints the command to check by hand. See
+  install one that was not. Without it, or with one too old to have `gh attestation`, the
+  script installs and prints the command to check by hand. See
   [What a release contains, and how to check it](#what-a-release-contains-and-how-to-check-it).
 
 Other ways:
