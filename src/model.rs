@@ -48,6 +48,10 @@ pub enum Excluded {
     OtherFs,
     /// Outside the `--older-than`/`--newer-than` mtime window.
     Age,
+    /// A Linux pseudo filesystem (`/proc`, `/sys`, ...), left out by `--exclude-kernfs`.
+    Kernfs,
+    /// A macOS firmlink, which ncdu does not follow.
+    FrmLink,
 }
 
 pub struct Node {
@@ -112,6 +116,9 @@ pub struct Tree {
     /// Why an entry is flagged with a read error, in the words of the OS. Only entries a scan
     /// could not read have one; an imported dump carries the flag without a reason.
     errors: HashMap<NodeIdx, Box<str>>,
+    /// The link count of the entries that have more than one link, where it is known. A
+    /// dump needs it (`nlink`), a node has no room for it, and few entries have one.
+    nlinks: HashMap<NodeIdx, u32>,
     /// How many entries with a read error lie below a directory, for the directories that
     /// have any. It lets a search for errors skip every subtree without one instead of
     /// walking the whole tree, and it stays small: errors are rare. Kept in step by
@@ -163,6 +170,7 @@ impl Tree {
             orphans: HashMap::new(),
             raw_names: HashMap::new(),
             errors: HashMap::new(),
+            nlinks: HashMap::new(),
             errors_below: HashMap::new(),
             links: HashMap::new(),
             generation: 0,
@@ -674,6 +682,21 @@ impl Tree {
             self.bump_errors(self.nodes[idx].parent, -(below + own));
         } else {
             self.bump_errors(Some(idx), -below);
+        }
+    }
+
+    /// The link count of `idx`, if it has more than one link and the count is known.
+    pub fn nlink(&self, idx: NodeIdx) -> Option<u32> {
+        if self.nlinks.is_empty() {
+            return None;
+        }
+        self.nlinks.get(&idx).copied()
+    }
+
+    /// Record the link count of an entry. Only counts above 1 are worth keeping.
+    pub fn set_nlink(&mut self, idx: NodeIdx, nlink: u32) {
+        if nlink > 1 {
+            self.nlinks.insert(idx, nlink);
         }
     }
 

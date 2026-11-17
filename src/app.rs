@@ -1352,7 +1352,12 @@ impl App {
             }
         }
         if n.hlink {
-            rows.push(("hard links".to_string(), "yes".to_string()));
+            // The number of links, where the tree has it (from a dump); "yes" otherwise.
+            let links = match self.tree.nlink(idx) {
+                Some(count) => count.to_string(),
+                None => "yes".to_string(),
+            };
+            rows.push(("hard links".to_string(), links));
         }
         if n.shared {
             rows.push((
@@ -1378,6 +1383,15 @@ impl App {
                     "excluded".to_string(),
                     "outside --older-than/--newer-than window".to_string(),
                 ));
+            }
+            Excluded::Kernfs => {
+                rows.push((
+                    "excluded".to_string(),
+                    "kernel pseudo filesystem".to_string(),
+                ));
+            }
+            Excluded::FrmLink => {
+                rows.push(("excluded".to_string(), "firmlink".to_string()));
             }
             Excluded::No => {}
         }
@@ -2407,6 +2421,30 @@ mod tests {
         assert!(!sub.is_empty() && sub.len() < 400);
         assert!(sub.iter().all(|e| app.tree.is_within(e.idx, dirs[1])));
         assert!(sub.iter().all(|e| !e.path.starts_with("d0/")));
+    }
+
+    /// For an imported dump nothing is read from disk, but the link count that the dump
+    /// recorded is shown.
+    #[test]
+    fn info_shows_the_link_count_of_a_dump() {
+        let json = r#"[1,2,{},[{"name":"/r"},
+            {"name":"linked","ino":5,"hlnkc":true,"nlink":3},
+            {"name":"flagged","ino":6,"hlnkc":true}]]"#;
+        let mut app = App::new(
+            crate::dump::import(json.as_bytes()).unwrap(),
+            true,
+            false,
+            false,
+        );
+        app.imported = true;
+        let links = |app: &App, name: &str| {
+            app.info_pairs(idx_named(app, name))
+                .into_iter()
+                .find(|(label, _)| label == "hard links")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(links(&app, "linked").as_deref(), Some("3"));
+        assert_eq!(links(&app, "flagged").as_deref(), Some("yes"));
     }
 
     /// The info popup looks at the disk once, when it opens. What it shows afterwards is

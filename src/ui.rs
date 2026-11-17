@@ -628,6 +628,8 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
                 Excluded::OtherFs => "  <other filesystem>".to_string(),
                 Excluded::Pattern => "  <excluded>".to_string(),
                 Excluded::Age => "  <mtime filter>".to_string(),
+                Excluded::Kernfs => "  <kernel filesystem>".to_string(),
+                Excluded::FrmLink => "  <firmlink>".to_string(),
                 Excluded::No => String::new(),
             };
             (name_style, suffix)

@@ -140,6 +140,8 @@ fn write_item<W: Write>(tree: &Tree, idx: NodeIdx, w: &mut W) -> io::Result<()> 
         Excluded::Pattern => write!(w, ",\"excluded\":\"pattern\"")?,
         Excluded::OtherFs => write!(w, ",\"excluded\":\"otherfs\"")?,
         Excluded::Age => write!(w, ",\"excluded\":\"age\"")?,
+        Excluded::Kernfs => write!(w, ",\"excluded\":\"kernfs\"")?,
+        Excluded::FrmLink => write!(w, ",\"excluded\":\"frmlink\"")?,
         Excluded::No => {}
     }
     w.write_all(b"}")
@@ -183,9 +185,16 @@ fn write_json_string<W: Write>(name: &[u8], w: &mut W) -> io::Result<()> {
 /// of the tree is limited by memory only.
 pub fn import<R: Read>(r: R) -> io::Result<Tree> {
     let mut p = Parser::new(r);
+    p.refuse_other_formats()?;
     p.expect(b'[')?;
-    // Format version. Unknown fields are skipped, so a higher minor version still loads.
-    p.uint()?;
+    // Format version. Only major version 1 is understood. A higher minor version still
+    // loads: what it adds is in fields, and unknown fields are skipped.
+    let major = p.uint()?;
+    if major != MAJOR as u64 {
+        return Err(p.error(format_args!(
+            "incompatible major format version {major} (this is version {MAJOR})"
+        )));
+    }
     p.expect(b',')?;
     p.uint()?;
     p.expect(b',')?;
@@ -206,7 +215,8 @@ pub fn import<R: Read>(r: R) -> io::Result<Tree> {
         return Err(p.error(e));
     }
     let (name, raw) = display_name(&item.name);
-    let mut tree = Tree::new_imported(name, item.apparent, item.disk, item.dev, item.ino);
+    let root_dev = item.dev.unwrap_or(0);
+    let mut tree = Tree::new_imported(name, item.apparent, item.disk, root_dev, item.ino);
     if let Some(raw) = raw {
         tree.set_raw_name(tree.root, raw);
     }
@@ -240,8 +250,16 @@ pub fn import<R: Read>(r: R) -> io::Result<Tree> {
                     (false, true) => NodeKind::Other,
                     (false, false) => NodeKind::File,
                 };
+                // The format writes `dev` only where it changes: without one, an entry is on
+                // the device of its parent.
+                let dev = item.dev.unwrap_or(tree.nodes[parent].dev);
                 // Re-derive hard-link sharing so imported totals dedupe like a live scan.
-                let shared = !is_dir && item.hlink && !seen.insert((item.dev, item.ino));
+                // As there, an excluded link is never the one that counts, and so does not
+                // make a later link a duplicate.
+                let shared = !is_dir
+                    && item.hlink
+                    && item.excluded == Excluded::No
+                    && !seen.insert((dev, item.ino));
                 let (name, raw) = display_name(&item.name);
                 let idx = tree.import_child(
                     parent,
@@ -249,7 +267,7 @@ pub fn import<R: Read>(r: R) -> io::Result<Tree> {
                     kind,
                     item.apparent,
                     item.disk,
-                    item.dev,
+                    dev,
                     item.ino,
                     item.hlink,
                     shared,
@@ -258,6 +276,9 @@ pub fn import<R: Read>(r: R) -> io::Result<Tree> {
                 );
                 if let Some(raw) = raw {
                     tree.set_raw_name(idx, raw);
+                }
+                if let Some(nlink) = item.nlink {
+                    tree.set_nlink(idx, u32::try_from(nlink).unwrap_or(u32::MAX));
                 }
                 if is_dir {
                     open.push(idx);
@@ -281,8 +302,11 @@ struct Item {
     has_name: bool,
     apparent: u64,
     disk: u64,
-    dev: u64,
+    /// Absent where it is the parent's.
+    dev: Option<u64>,
     ino: u64,
+    /// The number of links, written for entries that have more than one.
+    nlink: Option<u64>,
     hlink: bool,
     notreg: bool,
     read_error: bool,
@@ -355,6 +379,45 @@ impl<R: Read> Parser<R> {
             }
         }
         Ok(Some(self.buf[self.pos]))
+    }
+
+    /// Before anything is parsed: say so if the input is one of the other things ncdu can
+    /// write since 2.6, a zstd-compressed dump (`-c`) or a binary export (`-O`). Neither is
+    /// supported, and "expected `[`" would be no help.
+    fn refuse_other_formats(&mut self) -> io::Result<()> {
+        const ZSTD: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+        const BINARY: &[u8] = b"\xbfncduEX1";
+        // Gather the first few bytes, however slowly the reader hands them out.
+        while self.len < BINARY.len() {
+            match self.src.read(&mut self.buf[self.len..]) {
+                Ok(0) => break,
+                Ok(n) => self.len += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let start = &self.buf[..self.len];
+        if start.starts_with(ZSTD) {
+            return Err(self.error(
+                "this is a zstd-compressed ncdu export, which icdu cannot read; \
+                 decompress it first: zstd -dc FILE | icdu -f -",
+            ));
+        }
+        // Not something ncdu writes itself, but what its man page suggests for saving space
+        // (`ncdu -o- | gzip >export.gz`), and easy to pass in by mistake.
+        if start.starts_with(&[0x1f, 0x8b]) {
+            return Err(self.error(
+                "this is a gzip-compressed file; decompress it first: \
+                 zcat FILE | icdu -f -",
+            ));
+        }
+        if start.starts_with(BINARY) {
+            return Err(self.error(
+                "this is a binary export of ncdu (-O), which icdu cannot read; \
+                 convert it first: ncdu -f FILE -o - | icdu -f -",
+            ));
+        }
+        Ok(())
     }
 
     /// Consume the byte `peek` just returned.
@@ -627,7 +690,8 @@ impl<R: Read> Parser<R> {
             }
             b"asize" => self.uint().map(|v| item.apparent = v),
             b"dsize" => self.uint().map(|v| item.disk = v),
-            b"dev" => self.uint().map(|v| item.dev = v),
+            b"dev" => self.uint().map(|v| item.dev = Some(v)),
+            b"nlink" => self.uint().map(|v| item.nlink = Some(v)),
             b"ino" => self.uint().map(|v| item.ino = v),
             b"hlnkc" => self.boolean().map(|v| item.hlink = v),
             b"notreg" => self.boolean().map(|v| item.notreg = v),
@@ -636,8 +700,12 @@ impl<R: Read> Parser<R> {
                 let mut reason = Vec::new();
                 self.string(&mut reason)?;
                 item.excluded = match reason.as_slice() {
-                    b"otherfs" => Excluded::OtherFs,
+                    // `othfs` is what ncdu wrote before 1.21 and 2.5.
+                    b"otherfs" | b"othfs" => Excluded::OtherFs,
+                    b"kernfs" => Excluded::Kernfs,
+                    b"frmlink" => Excluded::FrmLink,
                     b"age" => Excluded::Age,
+                    // `pattern`, and any reason a later version may add.
                     _ => Excluded::Pattern,
                 };
                 Ok(())
@@ -911,6 +979,220 @@ mod tests {
         let has = |name: &str| again.nodes.iter().any(|n| n.name == name);
         assert!(has("late-in-first") && has("late-in-last") && has("late-at-top"));
         assert_eq!(again.nodes.len(), t.nodes.len());
+    }
+
+    /// A dump written by ncdu 1.18 for a small tree with one of everything: nested
+    /// directories, an empty file, two links to one inode, a symlink, a fifo, a directory
+    /// excluded by pattern and one that could not be read. (The path of the scanned directory
+    /// and the timestamp were shortened by hand; everything else is as ncdu wrote it.)
+    const NCDU_1_18: &str = include_str!("../fixtures/ncdu-1.18.json");
+
+    fn named<'a>(t: &'a Tree, name: &str) -> (NodeIdx, &'a crate::model::Node) {
+        let idx = t
+            .nodes
+            .iter()
+            .position(|n| n.name == name)
+            .unwrap_or_else(|| panic!("no entry called {name}"));
+        (idx, &t.nodes[idx])
+    }
+
+    /// After importing ncdu's dump, the totals and every field are what ncdu recorded.
+    #[test]
+    fn import_reads_an_ncdu_dump_completely() {
+        let t = import(NCDU_1_18.as_bytes()).unwrap();
+        let root = &t.nodes[t.root];
+        assert_eq!(root.name, "/fixture");
+        assert_eq!(root.items, 12);
+        // Every size once: the second link to the inode and the excluded directory add nothing.
+        assert_eq!(root.apparent, 4096 * 5 + 5000 + 2 + 18 + 6);
+        assert_eq!(root.disk, 4096 * 5 + 8192 + 4096 + 4096);
+        // ncdu writes an excluded directory as a plain entry, so it counts as a file here.
+        assert_eq!((t.total_dirs, t.total_files), (5, 8));
+
+        // `dev` is written once, at the root, and holds for everything below it.
+        for name in [
+            "links", "hard.txt", "docs", "deep", "data.bin", "empty", "locked",
+        ] {
+            assert_eq!(named(&t, name).1.dev, 64513, "{name}");
+        }
+        // The excluded directory carries a `dev` of its own in the dump.
+        let (_, build) = named(&t, "build");
+        assert_eq!((build.dev, build.excluded), (0, Excluded::Pattern));
+
+        let (hard, first) = named(&t, "hard.txt");
+        let (again, second) = named(&t, "hard-again.txt");
+        assert_eq!((first.ino, second.ino), (3297454, 3297454));
+        assert!(first.hlink && second.hlink);
+        assert!(
+            !first.shared && second.shared,
+            "the first link in the dump counts"
+        );
+        assert_eq!((t.nlink(hard), t.nlink(again)), (Some(2), Some(2)));
+        assert_eq!(t.nlink(named(&t, "readme.txt").0), None);
+
+        assert!(named(&t, "locked").1.read_error);
+        assert!(!named(&t, "docs").1.read_error);
+        for (name, apparent) in [("fifo", 0), ("symlink", 18)] {
+            let (idx, n) = named(&t, name);
+            assert!(
+                matches!(n.kind, NodeKind::Other),
+                "{name} is not a regular file"
+            );
+            assert_eq!(t.own_apparent(idx), apparent);
+        }
+        let (data, _) = named(&t, "data.bin");
+        assert_eq!((t.own_apparent(data), t.own_disk(data)), (5000, 8192));
+        assert_eq!(t.path_of(data), "/fixture/docs/deep/data.bin");
+    }
+
+    /// An entry without `dev` is on the device of its parent. Hard links are told apart by
+    /// device and inode, so two files with the same inode number on different devices are two
+    /// files; reading the missing `dev` as 0 merged them.
+    #[test]
+    fn import_inherits_dev_from_the_parent() {
+        let json = r#"[1,2,{},[{"name":"/r","dev":10},
+            [{"name":"a"},{"name":"f1","asize":100,"ino":7,"hlnkc":true}],
+            [{"name":"mnt","dev":20},
+                {"name":"f2","asize":100,"ino":7,"hlnkc":true},
+                [{"name":"deeper"},{"name":"f3","asize":100,"ino":7,"hlnkc":true}]]]]"#;
+        let t = import(json.as_bytes()).unwrap();
+        let dev = |name| named(&t, name).1.dev;
+        assert_eq!((dev("a"), dev("f1")), (10, 10));
+        assert_eq!(
+            (dev("mnt"), dev("f2"), dev("deeper"), dev("f3")),
+            (20, 20, 20, 20)
+        );
+        assert!(!named(&t, "f1").1.shared);
+        assert!(!named(&t, "f2").1.shared, "another device: another file");
+        assert!(named(&t, "f3").1.shared, "the same device and inode as f2");
+        assert_eq!(t.nodes[t.root].apparent, 200);
+    }
+
+    /// Only format version 1 can be read. A higher minor version is fine: what it adds is
+    /// in fields that are skipped.
+    #[test]
+    fn import_checks_the_major_version() {
+        for (dump, ok) in [
+            (r#"[1,0,{},[{"name":"/r"}]]"#, true),
+            (r#"[1,2,{},[{"name":"/r"}]]"#, true),
+            (r#"[1,99,{},[{"name":"/r"}]]"#, true),
+            (r#"[2,0,{},[{"name":"/r"}]]"#, false),
+            (r#"[0,2,{},[{"name":"/r"}]]"#, false),
+        ] {
+            match import(dump.as_bytes()) {
+                Ok(_) => assert!(ok, "accepted: {dump}"),
+                Err(e) => {
+                    assert!(!ok, "{dump}: {e}");
+                    assert!(e.to_string().contains("major format version"), "{e}");
+                }
+            }
+        }
+    }
+
+    /// Why an entry was left out survives an import and goes back out unchanged, in the
+    /// spelling of today. A reason this version does not know is treated as a pattern.
+    #[test]
+    fn import_keeps_exclusion_reasons() {
+        let json = r#"[1,2,{},[{"name":"/r"},
+            {"name":"p","excluded":"pattern"},
+            {"name":"o","excluded":"otherfs"},
+            {"name":"old","excluded":"othfs"},
+            {"name":"k","excluded":"kernfs"},
+            {"name":"f","excluded":"frmlink"},
+            {"name":"future","excluded":"something new"}]]"#;
+        let t = import(json.as_bytes()).unwrap();
+        let reason = |name| named(&t, name).1.excluded;
+        assert_eq!(reason("p"), Excluded::Pattern);
+        assert_eq!(reason("o"), Excluded::OtherFs);
+        assert_eq!(
+            reason("old"),
+            Excluded::OtherFs,
+            "the spelling before ncdu 1.21"
+        );
+        assert_eq!(reason("k"), Excluded::Kernfs);
+        assert_eq!(reason("f"), Excluded::FrmLink);
+        assert_eq!(reason("future"), Excluded::Pattern);
+
+        let mut out = Vec::new();
+        export(&t, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        for written in [
+            r#""name":"o","asize":0,"dsize":0,"ino":0,"dev":0,"excluded":"otherfs""#,
+            r#""name":"old","asize":0,"dsize":0,"ino":0,"dev":0,"excluded":"otherfs""#,
+            r#""excluded":"kernfs""#,
+            r#""excluded":"frmlink""#,
+        ] {
+            assert!(text.contains(written), "{written} not in {text}");
+        }
+    }
+
+    /// An excluded link to an inode is not the one that counts. If it comes first in the
+    /// dump, the next link still has to be counted, or the inode is counted nowhere.
+    #[test]
+    fn import_does_not_count_an_excluded_link_as_seen() {
+        let json = r#"[1,2,{},[{"name":"/r","dev":1},
+            {"name":"skipped","asize":500,"ino":9,"hlnkc":true,"excluded":"pattern"},
+            {"name":"kept","asize":500,"ino":9,"hlnkc":true},
+            {"name":"again","asize":500,"ino":9,"hlnkc":true}]]"#;
+        let t = import(json.as_bytes()).unwrap();
+        assert!(
+            !named(&t, "kept").1.shared,
+            "the first link that is not excluded counts"
+        );
+        assert!(named(&t, "again").1.shared);
+        assert_eq!(t.nodes[t.root].apparent, 500);
+    }
+
+    /// `nlink` is kept for the entries that have more than one link.
+    #[test]
+    fn import_keeps_link_counts() {
+        let json = r#"[1,2,{},[{"name":"/r"},
+            {"name":"three","ino":5,"hlnkc":true,"nlink":3},
+            {"name":"one","nlink":1},
+            {"name":"none"}]]"#;
+        let t = import(json.as_bytes()).unwrap();
+        assert_eq!(t.nlink(named(&t, "three").0), Some(3));
+        assert_eq!(t.nlink(named(&t, "one").0), None);
+        assert_eq!(t.nlink(named(&t, "none").0), None);
+    }
+
+    /// ncdu 2.6 and later can write zstd-compressed dumps and a binary export. Neither can
+    /// be read here, and the error says what the file is instead of complaining about JSON.
+    #[test]
+    fn import_names_compressed_and_binary_exports() {
+        let zstd = [0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x45, 0x00];
+        let e = import(&zstd[..]).err().unwrap().to_string();
+        assert!(e.contains("zstd-compressed"), "{e}");
+        assert!(e.contains("zstd -dc"), "{e}");
+
+        let gzip = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let e = import(&gzip[..]).err().unwrap().to_string();
+        assert!(e.contains("gzip-compressed") && e.contains("zcat"), "{e}");
+
+        let binary = b"\xbfncduEX1\x00\x00\x00\x08";
+        let e = import(&binary[..]).err().unwrap().to_string();
+        assert!(e.contains("binary export"), "{e}");
+        assert!(e.contains("ncdu -f"), "{e}");
+
+        // Recognised however the bytes arrive, and nothing else is taken for either.
+        struct OneByte<'a>(&'a [u8]);
+        impl Read for OneByte<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match (self.0.split_first(), buf.first_mut()) {
+                    (Some((&byte, rest)), Some(slot)) => {
+                        *slot = byte;
+                        self.0 = rest;
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let e = import(OneByte(&zstd)).err().unwrap().to_string();
+        assert!(e.contains("zstd-compressed"), "{e}");
+        let e = import(&b"(not a dump)"[..]).err().unwrap().to_string();
+        assert!(e.contains("expected `[`"), "{e}");
+        assert!(import(&b""[..]).is_err());
     }
 
     /// A dump `depth` directories deep, with one file at the bottom.

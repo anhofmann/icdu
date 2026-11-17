@@ -326,6 +326,14 @@ leaves the rest on disk. Any other key disarms the prompt.
 Names are read and written byte for byte, as ncdu does, so a name that is not valid UTF-8
 survives an import and a re-export unchanged.
 
+What ncdu records is kept: an entry without a device number is on the device of its parent, the
+reason an entry was excluded (`pattern`, `otherfs`, `kernfs`, `frmlink`) and the link count of
+hard-linked files survive an import and a re-export, and a hard link that was excluded is never
+the one whose size is counted. Only format version 1 is read. ncdu 2.6 and later can also write
+zstd-compressed dumps and a binary export; icdu reads neither, nor a gzip-compressed dump, and
+says how to feed it one (`zstd -dc FILE | icdu -f -`, `zcat FILE | icdu -f -`,
+`ncdu -f FILE -o - | icdu -f -`).
+
 A dump is parsed while it is read: memory use is that of the resulting tree, whatever the size
 of the file, and directories can be nested to any depth. Fields icdu does not know are skipped.
 A file that is not a dump (truncated, wrong types, anything after the end) is refused with the
