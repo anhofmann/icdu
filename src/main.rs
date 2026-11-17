@@ -7,6 +7,7 @@ mod dump;
 mod glob;
 mod matcher;
 mod model;
+mod natsort;
 mod scan;
 mod signals;
 mod ui;
@@ -52,7 +53,8 @@ KEYS:
     h/</Backspace   go up         PgUp/PgDn,C-d/u page
     /               search names (Tab: whole tree / this directory)
     ] / [           next / previous match of the last search
-    s               toggle sort   T               largest files
+    s / n / C / M   sort by size / name / items / mtime; again reverses
+    t               directories first             T   largest files
     r               rescan this directory          a   apparent/disk
     d               delete (confirm; full scan)
     o               open          i               entry details
@@ -106,8 +108,7 @@ fn main() {
     if let Some(src) = &args.import {
         let tree = unwrap_or_die(load_import(src, args.extended), src);
         let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
-        app.show_item_count = args.show_item_count;
-        app.show_mtime = args.show_mtime;
+        apply_view_options(&mut app, &args);
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
         run_ui(&mut app, args.slow_ui);
@@ -119,8 +120,7 @@ fn main() {
         // --- `-0` / `-1`: scan first, with little or no feedback, then browse. ---
         let tree = scan_to_completion(tree, root, opts.clone(), mode);
         let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
-        app.show_item_count = args.show_item_count;
-        app.show_mtime = args.show_mtime;
+        apply_view_options(&mut app, &args);
         // The scan is over, but `r` can still read a directory again.
         app.set_scan_opts(opts);
         run_ui(&mut app, args.slow_ui);
@@ -129,11 +129,22 @@ fn main() {
     // --- Interactive scan mode: browse while the scan runs. ---
     let scan = scan::start(root, opts.clone());
     let mut app = App::new(tree, args.disk_usage, args.read_only > 0, true);
-    app.show_item_count = args.show_item_count;
-    app.show_mtime = args.show_mtime;
+    apply_view_options(&mut app, &args);
     app.attach_scan(scan, opts);
 
     run_ui(&mut app, args.slow_ui);
+}
+
+/// What the command line says about how the list looks: its columns and its order.
+fn apply_view_options(app: &mut App, args: &Args) {
+    app.show_item_count = args.show_item_count;
+    app.show_mtime = args.show_mtime;
+    if let Some((column, descending)) = args.sort {
+        app.sort.column = column;
+        app.sort.descending = descending;
+    }
+    app.sort.dirs_first = args.dirs_first;
+    app.sort.natural = args.natsort;
 }
 
 fn unwrap_or_die<T>(res: std::io::Result<T>, ctx: &str) -> T {
@@ -517,7 +528,9 @@ fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<Stri
 fn page_rows(mode: InputMode, terminal_height: u16) -> usize {
     match mode {
         InputMode::Find => ui::find_rows(terminal_height),
-        InputMode::Normal => (terminal_height.saturating_sub(5) as usize).max(1),
+        InputMode::Normal | InputMode::Confirm => {
+            (terminal_height.saturating_sub(5) as usize).max(1)
+        }
     }
 }
 
@@ -589,7 +602,10 @@ fn decode_key(
         KeyCode::Char('h') | KeyCode::Char('<') | KeyCode::Backspace | KeyCode::Left => {
             KeyAction::Leave
         }
-        KeyCode::Char('s') => KeyAction::ToggleSort,
+        KeyCode::Char('s') => KeyAction::SortBySize,
+        KeyCode::Char('C') => KeyAction::SortByItems,
+        KeyCode::Char('M') => KeyAction::SortByMtime,
+        KeyCode::Char('t') => KeyAction::ToggleDirsFirst,
         KeyCode::Char('a') => KeyAction::ToggleUsage,
         KeyCode::Char('c') => KeyAction::ToggleItemCount,
         KeyCode::Char('m') => KeyAction::ToggleMtime,
@@ -606,13 +622,15 @@ fn decode_key(
         KeyCode::Char(']') => KeyAction::NextMatch,
         KeyCode::Char('[') => KeyAction::PrevMatch,
         KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::Confirm,
-        KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::Cancel,
+        // "No" where a question is open, and ncdu's "sort by name" in the list.
+        KeyCode::Char('n') if mode == InputMode::Confirm => KeyAction::Cancel,
+        KeyCode::Char('n') => KeyAction::SortByName,
+        KeyCode::Char('N') => KeyAction::Cancel,
         KeyCode::Char('?') => KeyAction::Help,
-        // ncdu keys whose ncdu function is not implemented yet (hidden entries, directories
-        // first, the graph column), and the old search key. Each used to do something else
+        // ncdu keys whose ncdu function is not implemented yet (hidden entries, the graph
+        // column), and the old search key. Each used to do something else
         // here, so say where that went instead of doing nothing.
         KeyCode::Char('e') => KeyAction::Moved("export is now on E"),
-        KeyCode::Char('t') => KeyAction::Moved("largest files are now on T"),
         KeyCode::Char('g') => KeyAction::Moved("jump to top is now on Home"),
         KeyCode::Char('f') => KeyAction::Moved("search is now on /"),
         _ => return None,
@@ -763,7 +781,10 @@ mod tests {
             (ch('<'), none, Some(Leave)),
             (KeyCode::Backspace, none, Some(Leave)),
             (KeyCode::Left, none, Some(Leave)),
-            (ch('s'), none, Some(ToggleSort)),
+            (ch('s'), none, Some(SortBySize)),
+            (ch('C'), none, Some(SortByItems)),
+            (ch('M'), none, Some(SortByMtime)),
+            (ch('t'), none, Some(ToggleDirsFirst)),
             (ch('a'), none, Some(ToggleUsage)),
             (ch('c'), none, Some(ToggleItemCount)),
             (ch('m'), none, Some(ToggleMtime)),
@@ -781,12 +802,11 @@ mod tests {
             (ch('['), none, Some(PrevMatch)),
             (ch('y'), none, Some(Confirm)),
             (ch('Y'), none, Some(Confirm)),
-            (ch('n'), none, Some(Cancel)),
+            (ch('n'), none, Some(SortByName)),
             (ch('N'), none, Some(Cancel)),
             (ch('?'), none, Some(Help)),
             // Keys that used to do something else.
             (ch('e'), none, Some(Moved("export is now on E"))),
-            (ch('t'), none, Some(Moved("largest files are now on T"))),
             (ch('g'), none, Some(Moved("jump to top is now on Home"))),
             (ch('f'), none, Some(Moved("search is now on /"))),
             // Unbound.
@@ -915,6 +935,25 @@ mod tests {
         // Shift is how capitals are typed, not a modifier in this sense.
         assert_eq!(dec('G', KeyModifiers::SHIFT), Some(Bottom));
         assert_eq!(dec('E', KeyModifiers::SHIFT), Some(Export));
+    }
+
+    /// `n` is ncdu's "sort by name" in the list and "no" while a question is open. `y` and
+    /// `N` mean the same everywhere.
+    #[test]
+    fn decode_key_reads_n_as_no_only_in_a_dialog() {
+        let none = KeyModifiers::NONE;
+        let key = |c, mode| decode_key(KeyCode::Char(c), none, mode, 10);
+        assert_eq!(key('n', InputMode::Normal), Some(KeyAction::SortByName));
+        assert_eq!(key('n', InputMode::Confirm), Some(KeyAction::Cancel));
+        for mode in [InputMode::Normal, InputMode::Confirm] {
+            assert_eq!(key('N', mode), Some(KeyAction::Cancel));
+            assert_eq!(key('y', mode), Some(KeyAction::Confirm));
+            assert_eq!(key('Y', mode), Some(KeyAction::Confirm));
+        }
+        // Every other key means in a dialog what it means in the list; the dialog decides
+        // what to do with it.
+        assert_eq!(key('s', InputMode::Confirm), Some(KeyAction::SortBySize));
+        assert_eq!(key('q', InputMode::Confirm), Some(KeyAction::Quit));
     }
 
     /// In the search, a modified letter never reaches the query. Ctrl-U, Ctrl-W and Ctrl-H

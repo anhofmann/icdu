@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 
+use crate::app::SortColumn;
 use crate::scan;
 
 /// The settings a command line asks for.
@@ -29,6 +30,13 @@ pub struct Args {
     pub exclude_kernfs: bool,
     /// `-L`: count a symlink to a file as that file.
     pub follow_symlinks: bool,
+    /// `--sort`: the column the list starts sorted by, and whether it runs downwards.
+    /// Without it the list is sorted by the size it shows, largest first.
+    pub sort: Option<(SortColumn, bool)>,
+    /// `--group-directories-first`.
+    pub dirs_first: bool,
+    /// Names in natural order (`file2` before `file10`); `--disable-natsort` turns it off.
+    pub natsort: bool,
     /// How many times `-r` was given. Once disables deleting.
     pub read_only: u8,
     /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
@@ -62,6 +70,9 @@ impl Default for Args {
             exclude_caches: false,
             exclude_kernfs: false,
             follow_symlinks: false,
+            sort: None,
+            dirs_first: false,
+            natsort: true,
             read_only: 0,
             show_item_count: false,
             excludes: Vec::new(),
@@ -139,6 +150,9 @@ enum Action {
     Caches(bool),
     Kernfs(bool),
     FollowSymlinks(bool),
+    Sort,
+    DirsFirst(bool),
+    Natsort(bool),
 }
 
 /// One flag: how it is spelled, whether it takes a value, and what `--help` says about it.
@@ -280,6 +294,47 @@ pub const FLAGS: &[Flag] = &[
         "disable the delete feature",
         Action::ReadOnly,
     ),
+    flag(
+        &[],
+        &["sort"],
+        Some("COLUMN"),
+        "disk-usage, name, apparent-size, itemcount, mtime",
+        Action::Sort,
+    ),
+    Flag {
+        negation: Some("no-group-directories-first"),
+        ..flag(
+            &[],
+            &["group-directories-first"],
+            None,
+            "list directories before files, or not (default)",
+            Action::DirsFirst(true),
+        )
+    },
+    Flag {
+        negation: Some("group-directories-first"),
+        ..flag(
+            &[],
+            &["no-group-directories-first"],
+            None,
+            "",
+            Action::DirsFirst(false),
+        )
+    },
+    Flag {
+        negation: Some("enable-natsort"),
+        ..flag(
+            &[],
+            &["disable-natsort"],
+            None,
+            "order names byte by byte: file10 before file2",
+            Action::Natsort(false),
+        )
+    },
+    Flag {
+        negation: Some("disable-natsort"),
+        ..flag(&[], &["enable-natsort"], None, "", Action::Natsort(true))
+    },
     Flag {
         negation: Some("hide-itemcount"),
         ..flag(
@@ -381,6 +436,30 @@ pub const FLAGS: &[Flag] = &[
         Action::Version,
     ),
 ];
+
+/// The value of `--sort`: one of ncdu's column names, with `-asc` or `-desc` after it if the
+/// direction is to differ from the column's own (names from a to z, the rest downwards).
+fn parse_sort(value: &str) -> Result<(SortColumn, bool), String> {
+    let (name, direction) = match value {
+        v if v.ends_with("-desc") => (&v[..v.len() - 5], Some(true)),
+        v if v.ends_with("-asc") => (&v[..v.len() - 4], Some(false)),
+        v => (v, None),
+    };
+    let column = match name {
+        "disk-usage" => SortColumn::DiskUsage,
+        "apparent-size" => SortColumn::ApparentSize,
+        "name" => SortColumn::Name,
+        "itemcount" => SortColumn::Items,
+        "mtime" => SortColumn::Mtime,
+        _ => {
+            return Err(format!(
+                "unknown --sort column: {value} (disk-usage, name, apparent-size, itemcount \
+                 or mtime, optionally followed by -asc or -desc)"
+            ))
+        }
+    };
+    Ok((column, direction.unwrap_or(column.descends_by_default())))
+}
 
 /// Parse the command line (without the program name).
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
@@ -509,6 +588,9 @@ fn apply(
         Action::Caches(exclude) => args.exclude_caches = exclude,
         Action::Kernfs(exclude) => args.exclude_kernfs = exclude,
         Action::FollowSymlinks(follow) => args.follow_symlinks = follow,
+        Action::Sort => args.sort = Some(parse_sort(&value)?),
+        Action::DirsFirst(first) => args.dirs_first = first,
+        Action::Natsort(natural) => args.natsort = natural,
     }
     Ok(None)
 }
@@ -932,6 +1014,67 @@ mod tests {
                 },
             ),
             (&["-L", "--no-follow-symlinks"], d()),
+            (
+                &["--sort", "name"],
+                Args {
+                    sort: Some((SortColumn::Name, false)),
+                    ..d()
+                },
+            ),
+            (
+                &["--sort=name-desc"],
+                Args {
+                    sort: Some((SortColumn::Name, true)),
+                    ..d()
+                },
+            ),
+            (
+                &["--sort", "disk-usage"],
+                Args {
+                    sort: Some((SortColumn::DiskUsage, true)),
+                    ..d()
+                },
+            ),
+            (
+                &["--sort", "apparent-size-asc"],
+                Args {
+                    sort: Some((SortColumn::ApparentSize, false)),
+                    ..d()
+                },
+            ),
+            (
+                &["--sort", "itemcount", "--sort", "mtime-asc"],
+                Args {
+                    sort: Some((SortColumn::Mtime, false)),
+                    ..d()
+                },
+            ),
+            (
+                &["--sort=itemcount-desc"],
+                Args {
+                    sort: Some((SortColumn::Items, true)),
+                    ..d()
+                },
+            ),
+            (
+                &["--group-directories-first"],
+                Args {
+                    dirs_first: true,
+                    ..d()
+                },
+            ),
+            (
+                &["--group-directories-first", "--no-group-directories-first"],
+                d(),
+            ),
+            (
+                &["--disable-natsort"],
+                Args {
+                    natsort: false,
+                    ..d()
+                },
+            ),
+            (&["--disable-natsort", "--enable-natsort"], d()),
             (
                 &["--no-follow-symlinks", "-xL"],
                 Args {

@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    fmt_mtime, indicator, scroll_offset, App, Find, HelpView, Modal, SortKey, TopFiles, FIND_CAP,
+    fmt_mtime, indicator, scroll_offset, size_column, App, Find, HelpView, Modal, Sort, SortColumn,
+    TopFiles, FIND_CAP,
 };
 use crate::matcher::Matcher;
 use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
@@ -693,6 +694,23 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// The order of the list in a few characters, for the footer: the column, an arrow for the
+/// direction (`↓` is largest, latest or z first), and `dirs,` in front if directories lead.
+/// A size column is just `size` while it is the size on screen.
+fn sort_label(sort: Sort, disk_usage: bool) -> String {
+    let column = match sort.column {
+        column if column == size_column(disk_usage) => "size",
+        SortColumn::DiskUsage => "disk",
+        SortColumn::ApparentSize => "apparent",
+        SortColumn::Name => "name",
+        SortColumn::Items => "items",
+        SortColumn::Mtime => "mtime",
+    };
+    let dirs = if sort.dirs_first { "dirs," } else { "" };
+    let arrow = if sort.descending { '↓' } else { '↑' };
+    format!("{dirs}{column}{arrow}")
+}
+
 /// What the running scans have done and have left to do, for the footer:
 /// `scanning  12.3 MiB/s  1,234 dirs  56,789 files  321 dirs left`. The last figure is not a
 /// percentage (the total is unknown until the scan is over), but it shrinks to nothing, which
@@ -815,12 +833,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             fmt_count(app.tree.total_files as usize)
         ),
     };
-    let sort = match app.sort {
-        SortKey::Size => "size",
-        SortKey::Name => "name",
-    };
-    let help =
-        format!(" ? help  / search  d delete  s sort:{sort}  a usage  q quit   │   {status}");
+    let sort = sort_label(app.sort, app.disk_usage);
+    let help = format!(" ? help  / search  d delete  sort:{sort}  a usage  q quit   │   {status}");
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             help,
@@ -859,7 +873,9 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("h / < / Backspace / ←", "go up"),
     ("Home / End, G", "jump to top / bottom"),
     ("PgUp / PgDn, C-d / C-u", "page up / down"),
-    ("s", "toggle sort (size ↔ name)"),
+    ("s / n / C / M", "sort by size / name / items / mtime"),
+    ("    again", "turn the order around"),
+    ("t", "directories first, or not"),
     ("/", "search by name; Enter goes there"),
     ("    Tab", "search this directory only"),
     ("    C-u / C-w", "clear the query / delete a word"),
@@ -1161,9 +1177,10 @@ mod tests {
         bar_scale, confirm_export_text, dir_label, display_width, find_empty_message, find_rows,
         find_title, fmt_count, fmt_items, followed_note, footer_split, hard_link_note, help_layout,
         help_scroll_hint, item_cell, left_to_read, list_title, listing_state, mtime_cell,
-        scan_progress, size_cell, truncate_left, HelpLayout, Listing, HELP_COLUMN_WIDTH,
-        HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
+        scan_progress, size_cell, sort_label, truncate_left, HelpLayout, Listing,
+        HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
     };
+    use crate::app::{Sort, SortColumn};
     use crate::model::{Excluded, NodeKind, Tree};
 
     /// How long one key press plus one frame takes in a directory with a million entries.
@@ -1239,7 +1256,7 @@ mod tests {
 
         // A change of the sort key is the one thing that sorts on a key press.
         let start = Instant::now();
-        app.on_key(KeyAction::ToggleSort);
+        app.on_key(KeyAction::SortByName);
         frame(&mut app);
         println!("sort by name:       {:>8.2?}", start.elapsed());
     }
@@ -1558,6 +1575,50 @@ mod tests {
                 assert!(fmt_items(m).len() <= ITEMS_WIDTH, "{m} → {}", fmt_items(m));
             }
         }
+    }
+
+    /// The footer names the column the way the user sees it, and shows the direction.
+    #[test]
+    fn sort_label_names_column_direction_and_grouping() {
+        let sort = |column, descending, dirs_first| Sort {
+            column,
+            descending,
+            dirs_first,
+            natural: true,
+        };
+        assert_eq!(
+            sort_label(sort(SortColumn::DiskUsage, true, false), true),
+            "size↓"
+        );
+        assert_eq!(
+            sort_label(sort(SortColumn::DiskUsage, false, false), true),
+            "size↑"
+        );
+        assert_eq!(
+            sort_label(sort(SortColumn::ApparentSize, true, false), false),
+            "size↓"
+        );
+        // A size that is not the one on screen is called by its name.
+        assert_eq!(
+            sort_label(sort(SortColumn::ApparentSize, true, false), true),
+            "apparent↓"
+        );
+        assert_eq!(
+            sort_label(sort(SortColumn::DiskUsage, true, false), false),
+            "disk↓"
+        );
+        assert_eq!(
+            sort_label(sort(SortColumn::Name, false, false), true),
+            "name↑"
+        );
+        assert_eq!(
+            sort_label(sort(SortColumn::Items, true, true), true),
+            "dirs,items↓"
+        );
+        assert_eq!(
+            sort_label(sort(SortColumn::Mtime, false, true), true),
+            "dirs,mtime↑"
+        );
     }
 
     /// The time column: a file's own time, a directory's latest, or the word that there is

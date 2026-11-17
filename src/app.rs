@@ -4,7 +4,7 @@
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
 use std::cell::{Cell, RefCell};
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::io::BufWriter;
 use std::os::unix::fs::MetadataExt;
@@ -19,15 +19,57 @@ use crate::delete::{Plan, Report};
 use crate::dump::Exporter;
 use crate::matcher::Matcher;
 use crate::model::{Excluded, Ext, NodeIdx, NodeKind, Tree};
+use crate::natsort::{natural_cmp, prefix, prefix_order};
 use crate::scan::{
     check_identity, start_at, Events, Opts, Scan, ScanControl, NOT_THE_SCANNED_DIR, SCAN_ID_STRIDE,
 };
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum SortKey {
-    Size,
+/// What the rows of a directory can be ordered by: ncdu's sort columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortColumn {
+    DiskUsage,
+    ApparentSize,
     Name,
+    /// The number of entries below a directory.
+    Items,
+    /// The latest modification time in an entry. Only known in extended mode (`-e`).
+    Mtime,
 }
+
+impl SortColumn {
+    /// The direction a column starts in, as in ncdu: names from a to z, everything else the
+    /// largest (or the latest) first.
+    pub fn descends_by_default(self) -> bool {
+        self != SortColumn::Name
+    }
+
+    fn is_size(self) -> bool {
+        matches!(self, SortColumn::DiskUsage | SortColumn::ApparentSize)
+    }
+}
+
+/// The order of the rows of a directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Sort {
+    pub column: SortColumn,
+    pub descending: bool,
+    /// Directories before everything else, whichever way the column runs (`t`).
+    pub dirs_first: bool,
+    /// Names in natural order (`file2` before `file10`) instead of byte by byte.
+    pub natural: bool,
+}
+
+/// The column that orders by the size the list shows.
+pub fn size_column(disk_usage: bool) -> SortColumn {
+    if disk_usage {
+        SortColumn::DiskUsage
+    } else {
+        SortColumn::ApparentSize
+    }
+}
+
+/// What the keys that need modification times say when there are none.
+const NEEDS_EXTENDED: &str = "modification times are recorded only with -e (extended mode)";
 
 /// One row of the top-files popup: a file, its path relative to the directory the popup was
 /// opened from, and its size in the metric active when the popup was opened.
@@ -63,7 +105,7 @@ fn resort_due(elapsed: Duration, took: Duration) -> bool {
 struct RowOrder {
     // What the order was computed for.
     cur: NodeIdx,
-    sort: SortKey,
+    sort: Sort,
     disk_usage: bool,
     /// `Tree::generation` at that moment: equal means nothing has changed since.
     generation: u64,
@@ -426,6 +468,8 @@ impl Find {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
     Normal,
+    /// A yes/no question is open: `n` is "no" there, not a sort key.
+    Confirm,
     /// The search popup is open: letters go to its query.
     Find,
 }
@@ -510,7 +554,7 @@ pub struct App {
     pub cur: NodeIdx,
     /// Currently highlighted child node (by identity), if any.
     pub selected: Option<NodeIdx>,
-    pub sort: SortKey,
+    pub sort: Sort,
     /// Show on-disk usage (`st_blocks`) vs. apparent size (`st_size`).
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
@@ -595,7 +639,12 @@ impl App {
         App {
             cur: tree.root,
             selected: None,
-            sort: SortKey::Size,
+            sort: Sort {
+                column: size_column(disk_usage),
+                descending: true,
+                dirs_first: false,
+                natural: true,
+            },
             disk_usage,
             show_item_count: false,
             show_mtime: false,
@@ -1101,9 +1150,14 @@ impl App {
         let rows: Rc<[NodeIdx]> = self
             .order_children(self.tree.nodes[self.cur].children.clone())
             .into();
-        let max_size = match self.sort {
-            SortKey::Size => rows.first().map_or(0, |&first| self.size_of(first)),
-            SortKey::Name => rows.iter().map(|&k| self.size_of(k)).max().unwrap_or(0),
+        // Sorted by the size on screen, largest first, the first row is the largest.
+        let largest_first = self.sort.column == size_column(self.disk_usage)
+            && self.sort.descending
+            && !self.sort.dirs_first;
+        let max_size = if largest_first {
+            rows.first().map_or(0, |&first| self.size_of(first))
+        } else {
+            rows.iter().map(|&k| self.size_of(k)).max().unwrap_or(0)
         };
         RowOrder {
             cur: self.cur,
@@ -1118,30 +1172,104 @@ impl App {
         }
     }
 
-    /// Sort children the way every view presents them (largest first, or by name), so
-    /// traversals like the next-error jump match what the user sees on screen.
+    /// Sort children the way every view presents them (see [`Sort`]), so traversals like the
+    /// next-error jump match what the user sees on screen.
+    ///
+    /// Entries that are equal in the column are in name order, from a to z whichever way the
+    /// column runs.
     fn order_children(&self, mut kids: Vec<NodeIdx>) -> Vec<NodeIdx> {
-        let name = |k: NodeIdx| self.tree.nodes[k].name.as_str();
-        match self.sort {
-            SortKey::Size => {
-                // The sizes are fetched once, next to each other, instead of from two nodes
-                // somewhere in memory for every comparison.
-                let mut keyed: Vec<(u64, NodeIdx)> =
-                    kids.iter().map(|&k| (self.size_of(k), k)).collect();
-                keyed.sort_unstable_by(|&(size_a, a), &(size_b, b)| {
-                    size_b
-                        .cmp(&size_a)
-                        .then_with(|| name(a).cmp(name(b)))
-                        .then_with(|| a.cmp(&b))
+        let sort = self.sort;
+        let nodes = &self.tree.nodes;
+        let by_name = |a: NodeIdx, b: NodeIdx| {
+            let (x, y) = (nodes[a].name.as_str(), nodes[b].name.as_str());
+            let order = if sort.natural {
+                natural_cmp(x, y)
+            } else {
+                x.cmp(y)
+            };
+            order.then_with(|| a.cmp(&b))
+        };
+        let directed = |order: Ordering| {
+            if sort.descending {
+                order.reverse()
+            } else {
+                order
+            }
+        };
+        // Directories first, if asked for, whichever way the column runs: they are sorted
+        // on their own and put in front.
+        let (mut first, mut rest): (Vec<NodeIdx>, Vec<NodeIdx>) = if sort.dirs_first {
+            kids.drain(..).partition(|&k| nodes[k].is_dir())
+        } else {
+            (Vec::new(), std::mem::take(&mut kids))
+        };
+        let by_names = sort.column == SortColumn::Name;
+        for part in [&mut first, &mut rest] {
+            // What the column compares is fetched once and laid next to each other, instead
+            // of read from two nodes somewhere in memory for every comparison. Turned upside
+            // down for a descending order, so that the comparison itself stays plain.
+            let key = |k: NodeIdx| -> u64 {
+                let value = match sort.column {
+                    SortColumn::DiskUsage => nodes[k].disk,
+                    SortColumn::ApparentSize => nodes[k].apparent,
+                    SortColumn::Items => u64::from(nodes[k].items),
+                    // Without a time an entry counts as older than any.
+                    SortColumn::Mtime => {
+                        let latest = self.tree.latest_mtime(k);
+                        latest.map_or(0, |time| time.saturating_add(1))
+                    }
+                    SortColumn::Name => return 0,
+                };
+                if sort.descending {
+                    !value
+                } else {
+                    value
+                }
+            };
+            // Sizes rarely tie, so for them the names are left where they are: that keeps the
+            // usual sort as small and as fast as it can be.
+            if sort.column.is_size() {
+                let mut keyed: Vec<(u64, NodeIdx)> = part.iter().map(|&k| (key(k), k)).collect();
+                keyed.sort_unstable_by(|&(key_a, a), &(key_b, b)| {
+                    key_a.cmp(&key_b).then_with(|| by_name(a, b))
                 });
-                kids.clear();
-                kids.extend(keyed.into_iter().map(|(_, k)| k));
+                part.clear();
+                part.extend(keyed.into_iter().map(|(_, k)| k));
+                continue;
             }
-            SortKey::Name => {
-                kids.sort_unstable_by(|&a, &b| name(a).cmp(name(b)).then_with(|| a.cmp(&b)))
-            }
+            let mut keyed: Vec<(u64, u64, NodeIdx)> = part
+                .iter()
+                .map(|&k| (key(k), prefix(&nodes[k].name), k))
+                .collect();
+            // Where names decide (the name column, and columns in which many entries are
+            // equal), the start of each name lies there too: it settles most comparisons.
+            keyed.sort_unstable_by(|&(key_a, start_a, a), &(key_b, start_b, b)| {
+                key_a.cmp(&key_b).then_with(|| {
+                    let names = prefix_order(start_a, start_b, sort.natural)
+                        .unwrap_or_else(|| by_name(a, b));
+                    if by_names {
+                        directed(names)
+                    } else {
+                        names
+                    }
+                })
+            });
+            part.clear();
+            part.extend(keyed.into_iter().map(|(_, _, k)| k));
         }
-        kids
+        first.append(&mut rest);
+        first
+    }
+
+    /// Order by `column` (`s`, `n`, `C`, `M`). Asked for the column that is active already,
+    /// it turns the order around, as in ncdu.
+    fn sort_by(&mut self, column: SortColumn) {
+        if self.sort.column == column {
+            self.sort.descending = !self.sort.descending;
+        } else {
+            self.sort.column = column;
+            self.sort.descending = column.descends_by_default();
+        }
     }
 
     /// Every entry with a read error, in the order the lists show them (depth-first, the
@@ -1456,10 +1584,10 @@ impl App {
 
     /// How the event loop should decode the next key.
     pub fn input_mode(&self) -> InputMode {
-        if matches!(self.modal, Modal::Find(_)) {
-            InputMode::Find
-        } else {
-            InputMode::Normal
+        match self.modal {
+            Modal::Find(_) => InputMode::Find,
+            Modal::ConfirmDelete(_) | Modal::ConfirmExport => InputMode::Confirm,
+            _ => InputMode::Normal,
         }
     }
 
@@ -1827,21 +1955,31 @@ impl App {
             KeyAction::Bottom => self.selected = kids.last().copied(),
             KeyAction::Enter => self.descend(),
             KeyAction::Leave => self.ascend(),
-            KeyAction::ToggleSort => {
-                self.sort = match self.sort {
-                    SortKey::Size => SortKey::Name,
-                    SortKey::Name => SortKey::Size,
-                };
+            KeyAction::SortBySize => self.sort_by(size_column(self.disk_usage)),
+            KeyAction::SortByName => self.sort_by(SortColumn::Name),
+            KeyAction::SortByItems => self.sort_by(SortColumn::Items),
+            KeyAction::SortByMtime => {
+                if self.tree.is_extended() {
+                    self.sort_by(SortColumn::Mtime);
+                } else {
+                    self.status = Some(NEEDS_EXTENDED.into());
+                }
             }
-            KeyAction::ToggleUsage => self.disk_usage = !self.disk_usage,
+            KeyAction::ToggleDirsFirst => self.sort.dirs_first = !self.sort.dirs_first,
+            KeyAction::ToggleUsage => {
+                self.disk_usage = !self.disk_usage;
+                // Sorted by one size, the list goes on being sorted by the size it shows.
+                if self.sort.column.is_size() {
+                    self.sort.column = size_column(self.disk_usage);
+                }
+            }
             KeyAction::ToggleItemCount => self.show_item_count = !self.show_item_count,
             KeyAction::ToggleMtime => {
                 if self.tree.is_extended() {
                     self.show_mtime = !self.show_mtime;
                 } else {
                     // ncdu ignores the key here. Saying why is more use.
-                    self.status =
-                        Some("modification times are recorded only with -e (extended mode)".into());
+                    self.status = Some(NEEDS_EXTENDED.into());
                 }
             }
             KeyAction::Help => self.modal = Modal::Help(HelpView::default()),
@@ -2198,7 +2336,16 @@ pub enum KeyAction {
     Bottom,
     Enter,
     Leave,
-    ToggleSort,
+    /// `s`: order by the size on screen; again reverses.
+    SortBySize,
+    /// `n`: order by name; again reverses.
+    SortByName,
+    /// `C`: order by the number of items; again reverses.
+    SortByItems,
+    /// `M`: order by modification time (extended mode); again reverses.
+    SortByMtime,
+    /// `t`: directories before files, or not.
+    ToggleDirsFirst,
     ToggleUsage,
     /// Show or hide the item count column.
     ToggleItemCount,
@@ -2531,6 +2678,344 @@ mod tests {
             .collect()
     }
 
+    /// An app over one directory with these entries: name, kind, apparent size, disk usage.
+    fn app_of(entries: &[(&str, NodeKind, u64, u64)]) -> App {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for &(name, kind, apparent, disk) in entries {
+            t.import_child(
+                t.root,
+                name.into(),
+                kind,
+                apparent,
+                disk,
+                1,
+                1,
+                false,
+                false,
+                Excluded::No,
+                false,
+            );
+        }
+        App::new(t, true, false, false)
+    }
+
+    /// `s` and `n` as in ncdu: each selects its column, in the column's own direction, and
+    /// pressed again turns the order around.
+    #[test]
+    fn sort_keys_select_a_column_and_reverse_it_on_repeat() {
+        let mut app = app_with_entries();
+        let start = Sort {
+            column: SortColumn::DiskUsage,
+            descending: true,
+            dirs_first: false,
+            natural: true,
+        };
+        assert_eq!(app.sort, start, "the size on screen, largest first");
+        assert_eq!(row_names(&app), ["Beta", "banner", "alpha", "gamma"]);
+        app.on_key(KeyAction::SortBySize);
+        assert_eq!(row_names(&app), ["gamma", "alpha", "banner", "Beta"]);
+        // Names start from a to z.
+        app.on_key(KeyAction::SortByName);
+        assert_eq!(row_names(&app), ["Beta", "alpha", "banner", "gamma"]);
+        app.on_key(KeyAction::SortByName);
+        assert_eq!(row_names(&app), ["gamma", "banner", "alpha", "Beta"]);
+        // Coming back to a column starts it in its own direction again.
+        app.on_key(KeyAction::SortBySize);
+        assert_eq!(app.sort, start);
+        app.on_key(KeyAction::SortByName);
+        assert_eq!(row_names(&app), ["Beta", "alpha", "banner", "gamma"]);
+    }
+
+    /// `C` orders by the number of entries below each directory. Files have none.
+    #[test]
+    fn sort_by_item_count() {
+        let mut app = app_of(&[
+            ("few", NodeKind::Dir, 900, 900),
+            ("many", NodeKind::Dir, 1, 1),
+            ("file-b", NodeKind::File, 50, 50),
+            ("file-a", NodeKind::File, 60, 60),
+        ]);
+        let add = |app: &mut App, dir: &str, count: usize| {
+            let parent = idx_named(app, dir);
+            for i in 0..count {
+                app.tree.import_child(
+                    parent,
+                    format!("{dir}-{i}").into(),
+                    NodeKind::File,
+                    1,
+                    1,
+                    1,
+                    1,
+                    false,
+                    false,
+                    Excluded::No,
+                    false,
+                );
+            }
+        };
+        add(&mut app, "few", 2);
+        add(&mut app, "many", 7);
+        app.on_key(KeyAction::SortByItems);
+        assert_eq!(app.sort.column, SortColumn::Items);
+        // The two files are equal here: in name order.
+        assert_eq!(row_names(&app), ["many", "few", "file-a", "file-b"]);
+        app.on_key(KeyAction::SortByItems);
+        // Turned around, and what is equal still runs from a to z.
+        assert_eq!(row_names(&app), ["file-a", "file-b", "few", "many"]);
+    }
+
+    /// `M` orders by the latest modification time, in extended mode. An entry without a
+    /// time counts as older than any. Without the mode the key says what is missing.
+    #[test]
+    fn sort_by_modification_time() {
+        let mut app = app_of(&[
+            ("old", NodeKind::File, 1, 1),
+            ("new", NodeKind::File, 1, 1),
+            ("unknown", NodeKind::File, 1, 1),
+            ("dir", NodeKind::Dir, 1, 1),
+        ]);
+        app.on_key(KeyAction::SortByMtime);
+        assert_eq!(app.sort.column, SortColumn::DiskUsage, "not in this mode");
+        assert!(app.status.as_deref().unwrap().contains("-e"));
+
+        app.tree.set_extended();
+        let at = |mtime: u64| Ext {
+            mtime,
+            has: Ext::MTIME,
+            ..Ext::default()
+        };
+        app.tree.set_ext(idx_named(&app, "old"), at(100));
+        app.tree.set_ext(idx_named(&app, "new"), at(900));
+        app.tree.set_ext(idx_named(&app, "dir"), at(50));
+        // The directory is as new as the newest thing in it.
+        let inside = app.tree.import_child(
+            idx_named(&app, "dir"),
+            "inside".into(),
+            NodeKind::File,
+            1,
+            1,
+            1,
+            1,
+            false,
+            false,
+            Excluded::No,
+            false,
+        );
+        app.tree.set_ext(inside, at(500));
+
+        app.on_key(KeyAction::SortByMtime);
+        assert_eq!(row_names(&app), ["new", "dir", "old", "unknown"]);
+        app.on_key(KeyAction::SortByMtime);
+        assert_eq!(row_names(&app), ["unknown", "old", "dir", "new"]);
+    }
+
+    /// `t` puts directories before everything else, in every column and whichever way it
+    /// runs.
+    #[test]
+    fn directories_first_in_any_order() {
+        let mut app = app_of(&[
+            ("big-file", NodeKind::File, 90, 90),
+            ("small-dir", NodeKind::Dir, 10, 10),
+            ("mid-file", NodeKind::File, 50, 50),
+            ("large-dir", NodeKind::Dir, 70, 70),
+        ]);
+        assert_eq!(
+            row_names(&app),
+            ["big-file", "large-dir", "mid-file", "small-dir"]
+        );
+        app.on_key(KeyAction::ToggleDirsFirst);
+        assert_eq!(
+            row_names(&app),
+            ["large-dir", "small-dir", "big-file", "mid-file"]
+        );
+        app.on_key(KeyAction::SortBySize);
+        assert_eq!(
+            row_names(&app),
+            ["small-dir", "large-dir", "mid-file", "big-file"],
+            "smallest first, directories still lead"
+        );
+        app.on_key(KeyAction::SortByName);
+        assert_eq!(
+            row_names(&app),
+            ["large-dir", "small-dir", "big-file", "mid-file"]
+        );
+        app.on_key(KeyAction::SortByName);
+        assert_eq!(
+            row_names(&app),
+            ["small-dir", "large-dir", "mid-file", "big-file"]
+        );
+        // The bar is still scaled by the largest row, which is no longer the first.
+        assert_eq!(app.max_row_size(), 90);
+        app.on_key(KeyAction::ToggleDirsFirst);
+        assert_eq!(
+            row_names(&app),
+            ["small-dir", "mid-file", "large-dir", "big-file"]
+        );
+    }
+
+    /// Names are in natural order unless that is turned off (`--disable-natsort`).
+    #[test]
+    fn names_sort_in_natural_order_by_default() {
+        let mut app = app_of(&[
+            ("file10", NodeKind::File, 1, 1),
+            ("file2", NodeKind::File, 1, 1),
+            ("File3", NodeKind::File, 1, 1),
+            ("file1", NodeKind::File, 1, 1),
+        ]);
+        app.on_key(KeyAction::SortByName);
+        assert_eq!(row_names(&app), ["File3", "file1", "file2", "file10"]);
+        app.sort.natural = false;
+        assert_eq!(row_names(&app), ["File3", "file1", "file10", "file2"]);
+        // Also where names only break a tie: all four are the same size.
+        app.on_key(KeyAction::SortBySize);
+        assert_eq!(row_names(&app), ["File3", "file1", "file10", "file2"]);
+        app.sort.natural = true;
+        assert_eq!(row_names(&app), ["File3", "file1", "file2", "file10"]);
+    }
+
+    /// Sorted by size, the list follows `a` to the size it then shows, as in ncdu. Sorted by
+    /// anything else it stays as it is. A column asked for with `--sort` holds until then.
+    #[test]
+    fn the_size_column_follows_the_size_on_screen() {
+        let entries = [
+            ("sparse", NodeKind::File, 900, 10),
+            ("dense", NodeKind::File, 100, 500),
+        ];
+        let mut app = app_of(&entries);
+        assert_eq!(row_names(&app), ["dense", "sparse"], "by disk usage");
+        app.on_key(KeyAction::ToggleUsage);
+        assert_eq!(app.sort.column, SortColumn::ApparentSize);
+        assert_eq!(row_names(&app), ["sparse", "dense"]);
+        app.on_key(KeyAction::SortBySize);
+        assert_eq!(
+            row_names(&app),
+            ["dense", "sparse"],
+            "apparent, smallest first"
+        );
+
+        app.on_key(KeyAction::SortByName);
+        app.on_key(KeyAction::ToggleUsage);
+        assert_eq!(app.sort.column, SortColumn::Name);
+
+        // `--sort apparent-size` while disk usage is shown: ordered by the one, scaled by
+        // the other.
+        let mut app = app_of(&entries);
+        app.sort.column = SortColumn::ApparentSize;
+        assert_eq!(row_names(&app), ["sparse", "dense"]);
+        assert_eq!(app.max_row_size(), 500);
+        app.on_key(KeyAction::SortBySize);
+        assert_eq!(
+            app.sort.column,
+            SortColumn::DiskUsage,
+            "`s` is the size on screen"
+        );
+        assert_eq!(row_names(&app), ["dense", "sparse"]);
+    }
+
+    /// A question is open while a confirm dialog is: the event loop then reads `n` as "no".
+    #[test]
+    fn a_confirm_dialog_is_its_own_input_mode() {
+        let mut app = app_with_entries();
+        assert!(app.input_mode() == InputMode::Normal);
+        app.modal = Modal::ConfirmDelete(idx_named(&app, "alpha"));
+        assert!(app.input_mode() == InputMode::Confirm);
+        app.modal = Modal::ConfirmExport;
+        assert!(app.input_mode() == InputMode::Confirm);
+        app.modal = Modal::None;
+        assert!(app.input_mode() == InputMode::Normal);
+    }
+
+    /// How long one directory with a million entries takes to put in order, by each column,
+    /// next to what the plainest possible sort of the same data takes. Run by hand:
+    /// `cargo test --release sort_measurement -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn sort_measurement() {
+        const ENTRIES: usize = 1_000_000;
+        let best = |run: &mut dyn FnMut()| {
+            (0..5)
+                .map(|_| {
+                    let start = Instant::now();
+                    run();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        for (what, name) in [
+            (
+                "numbered names",
+                (|i| format!("IMG_{i:07}.jpg")) as fn(usize) -> String,
+            ),
+            ("hashed names", |i| {
+                format!("{:016x}.o", (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            }),
+        ] {
+            let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+            for i in 0..ENTRIES {
+                // Sizes in no particular order, and in a shuffled order of names.
+                let shuffled = i.wrapping_mul(7_368_787) % ENTRIES;
+                let size = (shuffled as u64).wrapping_mul(2_654_435_761) % 1_000_000_007;
+                t.import_child(
+                    0,
+                    name(shuffled).into(),
+                    NodeKind::File,
+                    size,
+                    size,
+                    1,
+                    1,
+                    false,
+                    false,
+                    Excluded::No,
+                    false,
+                );
+            }
+            let mut app = App::new(t, true, false, false);
+            let kids = app.tree.nodes[0].children.clone();
+            println!("{what}:");
+            let time = |label: &str, app: &App| {
+                let took = best(&mut || {
+                    std::hint::black_box(app.order_children(kids.clone()));
+                });
+                println!("  {label:<34}{took:>10.2?}");
+            };
+            time("size, largest first", &app);
+            app.sort.dirs_first = true;
+            time("size, directories first", &app);
+            app.sort.dirs_first = false;
+            app.sort.column = SortColumn::Items;
+            time("items (all equal: by name)", &app);
+            app.sort.column = SortColumn::Name;
+            app.sort.descending = false;
+            time("name, natural order", &app);
+            app.sort.natural = false;
+            time("name, byte order", &app);
+
+            // For comparison: the same data, sorted the way it was before there were columns.
+            let nodes = &app.tree.nodes;
+            let took = best(&mut || {
+                let mut keyed: Vec<(u64, NodeIdx)> =
+                    kids.iter().map(|&k| (nodes[k].disk, k)).collect();
+                keyed.sort_unstable_by(|&(size_a, a), &(size_b, b)| {
+                    size_b
+                        .cmp(&size_a)
+                        .then_with(|| nodes[a].name.cmp(&nodes[b].name))
+                        .then_with(|| a.cmp(&b))
+                });
+                std::hint::black_box(keyed);
+            });
+            println!("  {:<34}{took:>10.2?}", "(reference: size, as before)");
+            let took = best(&mut || {
+                let mut by_name = kids.clone();
+                by_name.sort_unstable_by(|&a, &b| {
+                    nodes[a].name.cmp(&nodes[b].name).then_with(|| a.cmp(&b))
+                });
+                std::hint::black_box(by_name);
+            });
+            println!("  {:<34}{took:>10.2?}", "(reference: name, as before)");
+        }
+    }
+
     /// A batch for the root with one file, as a running scan would deliver it.
     fn file_batch(name: &str, size: u64) -> Batch {
         Batch {
@@ -2569,9 +3054,9 @@ mod tests {
         );
 
         // A sort change.
-        app.on_key(KeyAction::ToggleSort);
+        app.on_key(KeyAction::SortByName);
         assert_eq!(row_names(&app), vec!["Beta", "alpha", "banner", "gamma"]);
-        app.on_key(KeyAction::ToggleSort);
+        app.on_key(KeyAction::SortBySize);
 
         // A deletion.
         let banner = idx_named(&app, "banner");
@@ -2670,7 +3155,7 @@ mod tests {
 
         // So does anything the user asks for: a sort change, a jump.
         app.tree.apply(file_batch("zz-last", 1));
-        app.on_key(KeyAction::ToggleSort);
+        app.on_key(KeyAction::SortByName);
         assert_eq!(row_names(&app), vec!["newcomer", "small", "zz-last"]);
     }
 
@@ -2720,7 +3205,7 @@ mod tests {
     fn largest_row_size_is_known_without_a_scan_of_the_rows() {
         let mut app = app_with_entries();
         assert_eq!(app.max_row_size(), 30);
-        app.on_key(KeyAction::ToggleSort); // by name: the largest is no longer first
+        app.on_key(KeyAction::SortByName); // by name: the largest is no longer first
         assert_eq!(app.max_row_size(), 30);
         app.tree.delete_subtree(idx_named(&app, "Beta"));
         assert_eq!(app.max_row_size(), 20);
@@ -3011,7 +3496,7 @@ mod tests {
             assert_eq!(top_selected(&app), want, "after {key:?}");
         }
         // A key that means nothing here changes nothing.
-        app.on_key(KeyAction::ToggleSort);
+        app.on_key(KeyAction::SortByName);
         assert_eq!(top_selected(&app), 29);
     }
 
@@ -4089,9 +4574,13 @@ mod tests {
             app.on_key(key);
             assert_eq!(scroll(&app), Some(want), "after {key:?}");
         }
-        app.on_key(KeyAction::ToggleSort);
+        app.on_key(KeyAction::SortByName);
         assert_eq!(scroll(&app), None, "any other key closes it");
-        assert!(matches!(app.sort, SortKey::Size), "and does nothing else");
+        assert_eq!(
+            app.sort.column,
+            SortColumn::DiskUsage,
+            "and does nothing else"
+        );
 
         // Everything fits: every key closes, as the popup says.
         for key in [KeyAction::Down, KeyAction::PageDown(5), KeyAction::Help] {

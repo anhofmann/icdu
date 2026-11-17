@@ -50,7 +50,8 @@ Up to version 0.4.1 this program was called rcdu. Coming from it:
   available: asked for one of them, the script installs it under its old name.
 - Some keys changed to match ncdu: `Esc` no longer quits, `/` is the only search key (the
   filter is part of the search now), export is on `E`, the largest files on `T`, and `r` and `b`
-  act on the directory you are viewing. The full list is under [Keys](#keys).
+  act on the directory you are viewing. `s` sorts by size and `n` by name (`s` used to switch
+  between the two), and names are in natural order. The full list is under [Keys](#keys).
 - Exports written from the UI are named `icdu-dump.json`, and dumps carry `icdu` as the program
   name. Dumps written by rcdu load as before.
 - `--exclude` patterns also see the path, as in ncdu: one with a `/` in it now has an effect,
@@ -80,6 +81,11 @@ OPTIONS:
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
+        --sort COLUMN        disk-usage, name, apparent-size, itemcount, mtime
+        --group-directories-first, --no-group-directories-first
+                             list directories before files, or not (default)
+        --disable-natsort, --enable-natsort
+                             order names byte by byte: file10 before file2
         --show-itemcount, --hide-itemcount
                              show or hide the item count column (default: hide)
     -o, --output FILE        scan without UI, write ncdu JSON (- is stdout)
@@ -127,7 +133,11 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `h` / `<` / `Backspace` / `←` | go up |
 | `Home` / `End`, `G` | jump to top / bottom |
 | `PgUp` / `PgDn`, `Ctrl-d` / `Ctrl-u` | page up / down |
-| `s` | toggle sort (size ↔ name) |
+| `s` | sort by size (the one on screen); again reverses the order |
+| `n` | sort by name; again reverses |
+| `C` | sort by the number of items; again reverses |
+| `M` | sort by modification time (needs `-e`); again reverses |
+| `t` | directories first, or not |
 | `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
 | `]` / `[` | go to the next / previous match of the last search |
 | `a` | toggle apparent size ↔ on-disk usage |
@@ -217,6 +227,22 @@ millions of entries; the title shows the match count and progress. While a scan 
 running, new matches appear as they are discovered, and entries you delete or rescan away
 drop out of the list. A very broad query lists its 10,000 largest matches and says how many
 there are in all: `123,456 matches in the whole tree, showing the largest 10,000`.
+
+### Sorting
+
+The list is sorted by the size it shows, largest first. `s`, `n`, `C` and `M` select the column
+to sort by (size, name, item count, modification time), as in ncdu, and the key of the
+active column turns the order around. Names start from a to z, everything else with the
+largest or latest. `t` puts directories before everything else, whichever way the column
+runs. The footer shows the current order, for example `sort:dirs,name↑`.
+
+Entries that are equal in the column are in name order. Names are in natural order: a run of
+digits counts as the number it spells, so `file2` comes before `file10`.
+`--disable-natsort` makes that plain byte order.
+
+`--sort COLUMN` sets the order the list starts with: `disk-usage`, `apparent-size`, `name`,
+`itemcount` or `mtime`, optionally with `-asc` or `-desc` at the end (`--sort name-desc`).
+`--group-directories-first` starts with directories first.
 
 ### Largest files
 
