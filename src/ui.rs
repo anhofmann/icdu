@@ -86,7 +86,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
         Modal::ConfirmExport => render_confirm_export(f, app),
         Modal::TopFiles(tf) => render_top_files(f, app, tf),
-        Modal::Info(idx) => render_info(f, app, *idx),
+        Modal::Info(rows) => render_info(f, rows),
         Modal::Find(find) => render_find(f, app, find),
         Modal::None => {}
     }
@@ -94,8 +94,7 @@ pub fn render(f: &mut Frame, app: &App) {
 
 /// The info popup: tree data plus a fresh on-disk stat of the selected entry, label/value
 /// rows. Read-only; any key closes it.
-fn render_info(f: &mut Frame, app: &App, idx: usize) {
-    let rows = app.info_pairs(idx);
+fn render_info(f: &mut Frame, rows: &[(String, String)]) {
     let mut lines: Vec<Line> = rows
         .iter()
         .map(|(k, v)| {

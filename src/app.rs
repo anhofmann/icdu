@@ -4,6 +4,8 @@
 //! the same entry even as live size updates reshuffle the sort order during a scan.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -342,8 +344,9 @@ pub enum Modal {
     ConfirmExport,
     /// The largest files under the directory the popup was opened from.
     TopFiles(Box<TopFiles>),
-    /// Details of the selected entry (tree data plus a fresh on-disk stat).
-    Info(NodeIdx),
+    /// Details of the selected entry: label and value rows, tree data plus an on-disk stat
+    /// taken when the popup was opened.
+    Info(Vec<(String, String)>),
     /// Search by name, in the whole tree or below the viewed directory.
     Find(Box<Find>),
 }
@@ -1056,38 +1059,52 @@ impl App {
     /// The largest regular files under `from`, largest first, with paths relative to it.
     /// Computed on demand (a subtree walk) so it costs nothing during the scan; entries are a
     /// snapshot of the current sizes, which is exactly what the popup shows.
+    ///
+    /// The walk keeps only the `limit` largest files seen so far, in a heap with the smallest
+    /// of them on top, and builds paths for those alone at the end. Collecting a path for
+    /// every file and sorting them all took seconds on a tree of millions.
     pub fn top_files(&self, from: NodeIdx, limit: usize) -> Vec<TopEntry> {
-        let mut out: Vec<TopEntry> = Vec::new();
-        let mut stack = vec![(from, String::new())];
-        while let Some((dir, prefix)) = stack.pop() {
+        // Ordered by size, then by age in the tree (the earlier entry wins a tie).
+        let mut best: BinaryHeap<Reverse<(u64, Reverse<NodeIdx>)>> =
+            BinaryHeap::with_capacity(limit + 1);
+        let mut stack = vec![from];
+        while let Some(dir) = stack.pop() {
             for &c in &self.tree.nodes[dir].children {
-                let n = &self.tree.nodes[c];
-                let path = if prefix.is_empty() {
-                    n.name.to_string()
-                } else {
-                    format!("{prefix}/{}", n.name)
-                };
-                match n.kind {
-                    NodeKind::Dir => stack.push((c, path)),
-                    NodeKind::File => out.push(TopEntry {
-                        idx: c,
-                        path,
-                        size: self.size_of(c),
-                    }),
+                match self.tree.nodes[c].kind {
+                    NodeKind::Dir => stack.push(c),
+                    NodeKind::File => {
+                        let candidate = Reverse((self.size_of(c), Reverse(c)));
+                        if best.len() < limit {
+                            best.push(candidate);
+                        } else if best.peek().is_some_and(|smallest| candidate < *smallest) {
+                            // `Reverse` turns the order around: less means larger.
+                            best.pop();
+                            best.push(candidate);
+                        }
+                    }
                     // Symlinks and special files are not "biggest file" material.
                     _ => {}
                 }
             }
         }
+        let mut out: Vec<TopEntry> = best
+            .into_iter()
+            .map(|Reverse((size, Reverse(idx)))| TopEntry {
+                idx,
+                path: self.tree.rel_path_from(idx, from),
+                size,
+            })
+            .collect();
         out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
-        out.truncate(limit);
         out
     }
 
-    /// Open the info popup for the selected entry.
+    /// Open the info popup for the selected entry. Its rows are worked out here, once: they
+    /// include an `lstat` of the entry, which must not be repeated for every frame while the
+    /// popup is open (on a stalled network mount each one can hang).
     fn open_info(&mut self) {
         if let Some(sel) = self.selected {
-            self.modal = Modal::Info(sel);
+            self.modal = Modal::Info(self.info_pairs(sel));
         }
     }
 
@@ -2064,6 +2081,87 @@ mod tests {
         assert_eq!(app.top_files(app.tree.root, 1).len(), 1, "limit applies");
     }
 
+    /// Out of many files only the largest are kept, whatever order they are met in, and a
+    /// limit of zero yields nothing.
+    #[test]
+    fn top_files_keeps_the_largest_of_many() {
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let mut dirs = vec![t.root];
+        for d in 0..7u64 {
+            let parent = dirs[(d as usize) / 2];
+            dirs.push(t.import_child(
+                parent,
+                format!("d{d}").into(),
+                NodeKind::Dir,
+                0,
+                0,
+                1,
+                d + 2,
+                false,
+                false,
+                Excluded::No,
+                false,
+            ));
+        }
+        // 400 files with sizes in no particular order, spread over the directories.
+        let size_of = |i: u64| (i * 7919) % 1009;
+        for i in 0..400u64 {
+            let dir = dirs[(i as usize * 31) % dirs.len()];
+            file_under(&mut t, dir, &format!("f{i:03}"), size_of(i));
+        }
+        let app = App::new(t, true, false, false);
+
+        let top = app.top_files(app.tree.root, 25);
+        let mut expected: Vec<u64> = (0..400).map(size_of).collect();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(
+            top.iter().map(|e| e.size).collect::<Vec<_>>(),
+            expected[..25],
+            "the 25 largest, largest first"
+        );
+        for entry in &top {
+            assert_eq!(app.size_of(entry.idx), entry.size);
+            assert!(entry
+                .path
+                .ends_with(app.tree.nodes[entry.idx].name.as_str()));
+        }
+        assert!(app.top_files(app.tree.root, 0).is_empty());
+        assert_eq!(
+            app.top_files(app.tree.root, 1000).len(),
+            400,
+            "fewer than the limit"
+        );
+
+        // Below a subdirectory, only its files count, with paths relative to it.
+        let sub = app.top_files(dirs[1], 1000);
+        assert!(!sub.is_empty() && sub.len() < 400);
+        assert!(sub.iter().all(|e| app.tree.is_within(e.idx, dirs[1])));
+        assert!(sub.iter().all(|e| !e.path.starts_with("d0/")));
+    }
+
+    /// The info popup looks at the disk once, when it opens. What it shows afterwards is
+    /// what it found then, however many frames are drawn and whatever happens to the file.
+    #[test]
+    fn info_popup_reads_the_disk_once() {
+        let root = real_dir("info_once");
+        std::fs::write(root.join("file"), b"content").unwrap();
+        let mut app = scanned_app(&root, &[]);
+        app.selected = Some(node_at(&app, &root.join("file")));
+        app.on_key(KeyAction::Info);
+        let rows = match &app.modal {
+            Modal::Info(rows) => rows.clone(),
+            _ => panic!("the info popup did not open"),
+        };
+        assert!(rows.iter().any(|(label, _)| label == "inode"), "{rows:?}");
+
+        std::fs::remove_file(root.join("file")).unwrap();
+        match &app.modal {
+            Modal::Info(still) => assert_eq!(*still, rows, "nothing is read again"),
+            _ => panic!("the info popup closed"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     fn row_names(app: &App) -> Vec<String> {
         app.sorted_children()
             .iter()
@@ -2414,6 +2512,68 @@ mod tests {
         app.cur = gamma;
         app.settle_selection();
         assert_eq!(app.selected, None);
+    }
+
+    /// How long the operations that walk the whole tree take on ten million entries. Not a
+    /// pass/fail test, and it needs about 2 GB of memory:
+    ///
+    /// ```sh
+    /// cargo test --release slow_operations_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn slow_operations_measurement() {
+        const DIRS: usize = 10_000;
+        const FILES: usize = 1_000;
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        let mut last_dir = 0;
+        for d in 0..DIRS {
+            let dir = t.import_child(
+                t.root,
+                format!("dir-{d:05}").into(),
+                NodeKind::Dir,
+                4096,
+                4096,
+                1,
+                d as u64 + 2,
+                false,
+                false,
+                Excluded::No,
+                // One unreadable directory, at the far end in display order.
+                d == DIRS - 1,
+            );
+            last_dir = dir;
+            for f in 0..FILES {
+                let size = ((d * FILES + f) as u64).wrapping_mul(2_654_435_761) % 1_000_003;
+                file_under(&mut t, dir, &format!("file-{f:04}.dat"), size);
+            }
+        }
+        println!("tree: {} entries", t.nodes.len());
+        let mut app = App::new(t, true, false, false);
+        app.on_key(KeyAction::Down);
+        let time = |what: &str, f: &mut dyn FnMut()| {
+            let start = Instant::now();
+            f();
+            println!("{what:<44} {:>10.2?}", start.elapsed());
+        };
+
+        time("largest files below the root", &mut || {
+            assert_eq!(app.top_files(app.tree.root, 100).len(), 100);
+        });
+        time("jump to the next read error", &mut || {
+            app.on_key(KeyAction::NextError);
+            assert_eq!(app.selected, Some(last_dir));
+        });
+        app.tree.nodes[last_dir].read_error = false;
+        time("... when there is none", &mut || {
+            app.on_key(KeyAction::NextError);
+        });
+        time("export of the whole tree", &mut || {
+            let file = std::fs::File::create("/dev/null").unwrap();
+            let mut out = BufWriter::new(file);
+            crate::dump::export(&app.tree, &mut out).unwrap();
+            out.flush().unwrap();
+        });
     }
 
     /// The row highlighted in the open top-files popup.
