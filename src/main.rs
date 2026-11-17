@@ -209,6 +209,7 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
         extended: args.extended,
         exclude_caches: args.exclude_caches,
         exclude_kernfs: args.exclude_kernfs,
+        follow_symlinks: args.follow_symlinks,
     };
     (tree, root, opts)
 }

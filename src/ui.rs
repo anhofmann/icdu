@@ -603,7 +603,12 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
         let pct = size as f64 / parent_total as f64 * 100.0;
         let frac = size as f64 / max_child as f64;
 
-        let ind = indicator(n.kind, n.shared, n.excluded != Excluded::No, n.read_error);
+        // A symlink that is counted as its target (`-L`) still looks like a link.
+        let kind = match app.tree.followed_link(k) {
+            Some(_) => NodeKind::Link,
+            None => n.kind,
+        };
+        let ind = indicator(kind, n.shared, n.excluded != Excluded::No, n.read_error);
         let name_style = if n.read_error || n.excluded != Excluded::No {
             Style::default().fg(Color::DarkGray)
         } else if n.shared {
@@ -611,7 +616,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC)
         } else {
-            match n.kind {
+            match kind {
                 NodeKind::Dir => Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
@@ -994,6 +999,9 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
             },
             fmt_size(app.size_of(idx)).trim_start()
         )
+    } else if app.tree.followed_link(idx).is_some() {
+        // Counted as its target (`-L`): no size here, it is not what gets freed.
+        "symlink".to_string()
     } else {
         format!("file ({})", fmt_size(app.size_of(idx)).trim_start())
     };
@@ -1007,6 +1015,9 @@ fn render_confirm(f: &mut Frame, app: &App, idx: usize) {
         Line::from(format!("  This removes the {what} from disk.")),
     ];
     if let Some(note) = hard_link_note(app.confirm_hard_links, n.is_dir()) {
+        lines.push(Line::from(format!("  {note}")));
+    }
+    if let Some(note) = followed_note(app.confirm_followed, n.is_dir()) {
         lines.push(Line::from(format!("  {note}")));
     }
     lines.extend([
@@ -1052,6 +1063,29 @@ fn hard_link_note(hard_links: u32, is_dir: bool) -> Option<String> {
         )),
         (n, true) => Some(format!(
             "{} files in it have other hard links: their {space} the last ones are gone.",
+            fmt_count(n as usize)
+        )),
+    }
+}
+
+/// What the delete dialog says about symlinks that were counted as the files they point to
+/// (`-L`): the size on screen is the target's, and a delete removes the link. `None` when
+/// there is nothing to say.
+fn followed_note(followed: u32, is_dir: bool) -> Option<String> {
+    let stays = "only the link is removed, the file it points to stays";
+    match (followed, is_dir) {
+        (0, _) => None,
+        (_, false) => Some(
+            "It is shown with the size of the file it points to (-L). That file stays, and \
+             no space is freed."
+                .to_string(),
+        ),
+        (1, true) => Some(format!(
+            "1 symlink in it is counted with the size of its target (-L): {stays}."
+        )),
+        (n, true) => Some(format!(
+            "{} symlinks in it are counted with the size of their targets (-L): only the \
+             links are removed, the files they point to stay.",
             fmt_count(n as usize)
         )),
     }
@@ -1125,7 +1159,7 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 mod tests {
     use super::{
         bar_scale, confirm_export_text, dir_label, display_width, find_empty_message, find_rows,
-        find_title, fmt_count, fmt_items, footer_split, hard_link_note, help_layout,
+        find_title, fmt_count, fmt_items, followed_note, footer_split, hard_link_note, help_layout,
         help_scroll_hint, item_cell, left_to_read, list_title, listing_state, mtime_cell,
         scan_progress, size_cell, truncate_left, HelpLayout, Listing, HELP_COLUMN_WIDTH,
         HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
@@ -1227,6 +1261,7 @@ mod tests {
             excluded,
             error: None,
             dir_id: (excluded == Excluded::No).then_some(id),
+            followed: None,
         };
         let mut t = Tree::new("/r".into(), 0, 0, 1, 1);
         assert_eq!(
@@ -1423,6 +1458,24 @@ mod tests {
         assert!(help_scroll_hint(100, 100, 999).chars().count() <= width);
         let tall = HELP_KEYS.len() as u16 + 7;
         assert_eq!(help_layout(80, tall, HELP_KEYS.len()).max_scroll, 0);
+    }
+
+    /// The delete dialog says what happens to symlinks that are shown with their target's
+    /// size, and says nothing when there are none.
+    #[test]
+    fn followed_note_says_that_only_links_are_removed() {
+        assert_eq!(followed_note(0, false), None);
+        assert_eq!(followed_note(0, true), None);
+        let file = followed_note(1, false).unwrap();
+        assert!(
+            file.contains("the file it points to") && file.contains("stays"),
+            "{file}"
+        );
+        let one = followed_note(1, true).unwrap();
+        assert!(one.starts_with("1 symlink in it is"), "{one}");
+        let many = followed_note(1_500, true).unwrap();
+        assert!(many.starts_with("1,500 symlinks in it are"), "{many}");
+        assert!(many.contains("the files they point to stay"), "{many}");
     }
 
     /// The delete dialog warns that deleting a hard link may free nothing.

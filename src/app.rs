@@ -562,6 +562,8 @@ pub struct App {
     /// How many hard-linked files the entry in the delete dialog is or contains, counted
     /// when the dialog opens (a walk of the subtree, too slow to repeat every frame).
     pub confirm_hard_links: u32,
+    /// And how many symlinks that were counted as their targets (`-L`).
+    pub confirm_followed: u32,
     /// First row of the directory listing on screen; see [`scroll_offset`]. Drawing updates
     /// it, because only drawing knows how many rows fit.
     pub list_offset: Cell<usize>,
@@ -616,6 +618,7 @@ impl App {
             shell_request: None,
             export_dir: None,
             confirm_hard_links: 0,
+            confirm_followed: 0,
             list_offset: Cell::new(0),
             row_order: RefCell::new(None),
             waiting_for: None,
@@ -1330,11 +1333,13 @@ impl App {
     pub fn info_pairs(&self, idx: NodeIdx) -> Vec<(String, String)> {
         use crate::ui::fmt_size;
         let n = &self.tree.nodes[idx];
-        let kind_name = match n.kind {
-            NodeKind::Dir => "directory",
-            NodeKind::File => "file",
-            NodeKind::Link => "symlink",
-            NodeKind::Other => "special",
+        let kind_name = match (n.kind, self.tree.followed_link(idx)) {
+            (NodeKind::File, Some(_)) => "symlink, counted as the file it points to (-L)",
+            (_, Some(_)) => "symlink, counted as the special file it points to (-L)",
+            (NodeKind::Dir, None) => "directory",
+            (NodeKind::File, None) => "file",
+            (NodeKind::Link, None) => "symlink",
+            (NodeKind::Other, None) => "special",
         };
         let mut rows = vec![
             ("path".to_string(), self.tree.path_of(idx)),
@@ -2012,6 +2017,7 @@ impl App {
             }
         }
         self.confirm_hard_links = self.tree.hard_links_in(sel);
+        self.confirm_followed = self.tree.followed_links_in(sel);
         self.modal = Modal::ConfirmDelete(sel);
     }
 
@@ -2542,6 +2548,7 @@ mod tests {
                 excluded: Excluded::No,
                 error: None,
                 dir_id: None,
+                followed: None,
             }],
             error: None,
             more: false,
@@ -2828,6 +2835,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id,
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         app.settle_selection();
@@ -3169,6 +3177,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id: Some(id),
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         app.controls.push(ScanControl::idle());
@@ -3755,6 +3764,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id,
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         app.tree.apply(Batch {
@@ -3924,6 +3934,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id: Some(id),
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         app.tree.apply(Batch {
@@ -4550,6 +4561,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id: None,
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), false, false, true);
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -4588,6 +4600,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id,
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         app.tree.apply(Batch {
@@ -4688,6 +4701,7 @@ mod tests {
             extended: false,
             exclude_caches: false,
             exclude_kernfs: false,
+            follow_symlinks: false,
         }
     }
 
@@ -5404,6 +5418,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id,
+            followed: None,
         };
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         app.tree.apply(Batch {

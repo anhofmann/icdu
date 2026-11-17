@@ -27,6 +27,8 @@ pub struct Args {
     pub exclude_caches: bool,
     /// `--exclude-kernfs`: leave out Linux pseudo filesystems such as `/proc` and `/sys`.
     pub exclude_kernfs: bool,
+    /// `-L`: count a symlink to a file as that file.
+    pub follow_symlinks: bool,
     /// How many times `-r` was given. Once disables deleting.
     pub read_only: u8,
     /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
@@ -59,6 +61,7 @@ impl Default for Args {
             one_file_system: false,
             exclude_caches: false,
             exclude_kernfs: false,
+            follow_symlinks: false,
             read_only: 0,
             show_item_count: false,
             excludes: Vec::new(),
@@ -135,6 +138,7 @@ enum Action {
     Mtime(bool),
     Caches(bool),
     Kernfs(bool),
+    FollowSymlinks(bool),
 }
 
 /// One flag: how it is spelled, whether it takes a value, and what `--help` says about it.
@@ -234,6 +238,26 @@ pub const FLAGS: &[Flag] = &[
     Flag {
         negation: Some("exclude-kernfs"),
         ..flag(&[], &["include-kernfs"], None, "", Action::Kernfs(false))
+    },
+    Flag {
+        negation: Some("no-follow-symlinks"),
+        ..flag(
+            &['L'],
+            &["follow-symlinks"],
+            None,
+            "count a symlink to a file as that file",
+            Action::FollowSymlinks(true),
+        )
+    },
+    Flag {
+        negation: Some("follow-symlinks"),
+        ..flag(
+            &[],
+            &["no-follow-symlinks"],
+            None,
+            "",
+            Action::FollowSymlinks(false),
+        )
     },
     flag(
         &[],
@@ -484,6 +508,7 @@ fn apply(
         Action::Mtime(show) => args.show_mtime = show,
         Action::Caches(exclude) => args.exclude_caches = exclude,
         Action::Kernfs(exclude) => args.exclude_kernfs = exclude,
+        Action::FollowSymlinks(follow) => args.follow_symlinks = follow,
     }
     Ok(None)
 }
@@ -892,6 +917,29 @@ mod tests {
                 },
             ),
             (&["--exclude-kernfs", "--include-kernfs"], d()),
+            (
+                &["-L"],
+                Args {
+                    follow_symlinks: true,
+                    ..d()
+                },
+            ),
+            (
+                &["--follow-symlinks"],
+                Args {
+                    follow_symlinks: true,
+                    ..d()
+                },
+            ),
+            (&["-L", "--no-follow-symlinks"], d()),
+            (
+                &["--no-follow-symlinks", "-xL"],
+                Args {
+                    follow_symlinks: true,
+                    one_file_system: true,
+                    ..d()
+                },
+            ),
             (
                 &["--include-caches", "--exclude-caches"],
                 Args {

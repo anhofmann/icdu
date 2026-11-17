@@ -60,6 +60,10 @@ pub struct NewNode {
     pub error: Option<Box<str>>,
     /// For directories we will recurse into: the id future batches use as `parent_id`.
     pub dir_id: Option<u64>,
+    /// With `-L`, for a symlink that is counted as the file it points to: the device and
+    /// inode of the link itself. Everything else in the entry is then the target's. Boxed,
+    /// because nearly no entry has one.
+    pub followed: Option<Box<(u64, u64)>>,
 }
 
 /// Entries of one directory, on their way to the tree. A directory usually arrives as one
@@ -429,6 +433,9 @@ pub struct Opts {
     pub exclude_caches: bool,
     /// Leave out Linux pseudo filesystems (ncdu `--exclude-kernfs`). No effect elsewhere.
     pub exclude_kernfs: bool,
+    /// Count a symlink to a file as that file (ncdu `-L`). Links to directories are never
+    /// followed.
+    pub follow_symlinks: bool,
 }
 
 /// State shared by workers only (NOT the UI), so it holds the event `Sender`.
@@ -452,6 +459,8 @@ struct Shared {
     /// The devices of the kernel filesystems mounted when the scan started, if those are to
     /// be left out; empty otherwise.
     kernfs: HashSet<u64>,
+    /// Count symlinks to files as their targets.
+    follow_symlinks: bool,
     /// A rescan's starting directory: its job id and what it must still be when it is read.
     start_check: Option<(u64, Identity)>,
     /// The id of the directory the scan starts at.
@@ -573,6 +582,7 @@ fn start_limited(
         newer_than: opts.newer_than,
         extended: opts.extended,
         exclude_caches: opts.exclude_caches,
+        follow_symlinks: opts.follow_symlinks,
         kernfs: if opts.exclude_kernfs {
             mounted_kernfs()
         } else {
@@ -706,6 +716,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                     excluded: Excluded::No,
                     error: Some(e.to_string().into()),
                     dir_id: None,
+                    followed: None,
                 });
                 if shared.extended {
                     // Nothing is known about an entry that could not be examined.
@@ -713,6 +724,30 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                 }
                 continue;
             }
+        };
+
+        // Patterns see the entry's path as well as its name, as in ncdu.
+        let by_pattern = shared
+            .excludes
+            .iter()
+            .any(|p| p.excludes(dir_bytes, file_name.as_bytes(), &mut scratch));
+
+        // With `-L` a symlink to anything but a directory is counted as what it points to: the
+        // entry gets the target's type, sizes, device and inode, as in ncdu. What stays of the
+        // link is its name, and its own identity, which a delete has to check. A link to a
+        // directory, a broken link and a loop stay what they are, and what a pattern excludes
+        // is not looked at any further.
+        let mut followed = None;
+        let meta = if shared.follow_symlinks && !by_pattern && meta.file_type().is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(target) if !target.is_dir() => {
+                    followed = Some(Box::new((meta.dev(), meta.ino())));
+                    target
+                }
+                _ => meta,
+            }
+        } else {
+            meta
         };
 
         let ft = meta.file_type();
@@ -737,17 +772,13 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
 
         // Determine exclusion / whether to recurse.
         let mut excluded = Excluded::No;
-        // Patterns see the entry's path as well as its name, as in ncdu.
-        if shared
-            .excludes
-            .iter()
-            .any(|p| p.excludes(dir_bytes, file_name.as_bytes(), &mut scratch))
-        {
+        // A file on another filesystem can only turn up through a followed link.
+        let may_leave = matches!(kind, NodeKind::Dir) || followed.is_some();
+        if by_pattern {
             excluded = Excluded::Pattern;
         } else if age_excluded(mtime, shared) {
             excluded = Excluded::Age;
-        } else if shared.one_file_system && matches!(kind, NodeKind::Dir) && dev != shared.root_dev
-        {
+        } else if shared.one_file_system && may_leave && dev != shared.root_dev {
             excluded = Excluded::OtherFs;
         } else if matches!(kind, NodeKind::Dir) && shared.kernfs.contains(&dev) {
             excluded = Excluded::Kernfs;
@@ -777,6 +808,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
             excluded,
             error: None,
             dir_id,
+            followed,
         });
         if shared.extended {
             exts.push(ext_of(&meta));
@@ -957,6 +989,7 @@ mod tests {
             extended: false,
             exclude_caches: false,
             exclude_kernfs: false,
+            follow_symlinks: false,
         }
     }
 
@@ -2293,6 +2326,162 @@ not a line of the table
         // Everything listed is directly in /proc: nothing below it was read.
         assert!(tree.nodes[1..].iter().all(|n| n.parent == Some(tree.root)));
         assert!(tree.subtree_complete(tree.root));
+    }
+
+    /// `-L`: a symlink to a file is counted as that file, with the file's type, sizes, device
+    /// and inode, and each such link counts on its own. A link to a directory, a broken link
+    /// and a loop stay links. These are the results of ncdu 1.18 for the same tree.
+    #[test]
+    fn follow_symlinks_counts_the_files_that_links_point_to() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("icdu_follow_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::create_dir_all(base.join("links")).unwrap();
+        fs::write(base.join("big"), vec![0u8; 100_000]).unwrap();
+        fs::write(base.join("sub/small"), b"abc").unwrap();
+        fs::write(base.join("hl1"), b"hl").unwrap();
+        fs::hard_link(base.join("hl1"), base.join("hl2")).unwrap();
+        for (target, name) in [
+            ("../big", "to-big"),
+            ("to-big", "chain"),
+            ("../sub", "to-dir"),
+            ("nowhere", "broken"),
+            ("loop-b", "loop-a"),
+            ("loop-a", "loop-b"),
+            ("../hl1", "to-hardlinked"),
+            ("/dev/null", "to-device"),
+        ] {
+            symlink(target, base.join("links").join(name)).unwrap();
+        }
+        let scan = |follow_symlinks: bool, one_file_system: bool| {
+            let meta = fs::symlink_metadata(&base).unwrap();
+            let mut o = opts(2, meta.dev());
+            o.follow_symlinks = follow_symlinks;
+            o.one_file_system = one_file_system;
+            let mut tree = Tree::new(
+                base.to_string_lossy().into(),
+                meta.len(),
+                meta.blocks() * 512,
+                meta.dev(),
+                meta.ino(),
+            );
+            for batch in start(base.clone(), o).events.iter() {
+                tree.apply(batch);
+            }
+            tree
+        };
+        let named = |tree: &Tree, name: &str| tree.nodes.iter().position(|n| n.name == name);
+        let link_itself = |name: &str| fs::symlink_metadata(base.join("links").join(name)).unwrap();
+        let identity = |meta: &fs::Metadata| (meta.dev(), meta.ino());
+        let big = fs::metadata(base.join("big")).unwrap();
+
+        let followed = scan(true, false);
+        // Straight and through another link: the entry is the file.
+        for name in ["to-big", "chain"] {
+            let i = named(&followed, name).unwrap();
+            let n = &followed.nodes[i];
+            assert_eq!(n.kind, NodeKind::File, "{name}");
+            assert_eq!(
+                (n.apparent, n.disk),
+                (100_000, big.blocks() * 512),
+                "{name}"
+            );
+            assert_eq!((n.dev, n.ino), identity(&big), "{name}");
+            assert!(!n.hlink && !n.shared, "{name}: counted on its own");
+            // What a delete has to find there is the link.
+            assert_eq!(
+                followed.followed_link(i),
+                Some(identity(&link_itself(name))),
+                "{name}"
+            );
+        }
+        // Not followed: a directory, nothing, a loop.
+        for name in ["to-dir", "broken", "loop-a", "loop-b"] {
+            let i = named(&followed, name).unwrap();
+            let n = &followed.nodes[i];
+            assert_eq!(n.kind, NodeKind::Link, "{name}");
+            assert_eq!(n.apparent, link_itself(name).len(), "{name}");
+            assert_eq!((n.dev, n.ino), identity(&link_itself(name)), "{name}");
+            assert_eq!(followed.followed_link(i), None, "{name}");
+        }
+        let smalls = followed.nodes.iter().filter(|n| n.name == "small").count();
+        assert_eq!(smalls, 1, "the linked directory was not entered");
+        // A link to a file with several names is one more name of that inode: of the three,
+        // one is counted.
+        let names = ["hl1", "hl2", "to-hardlinked"].map(|name| named(&followed, name).unwrap());
+        assert!(names.iter().all(|&i| followed.nodes[i].hlink));
+        let counted = names.iter().filter(|&&i| !followed.nodes[i].shared);
+        assert_eq!(counted.count(), 1);
+        assert_eq!(followed.nlink(names[2]), Some(2));
+        // A special file: the entry is that, and on its device.
+        let device = named(&followed, "to-device").unwrap();
+        let null = fs::metadata("/dev/null").unwrap();
+        assert_eq!(followed.nodes[device].kind, NodeKind::Other);
+        assert_eq!(followed.nodes[device].dev, null.dev());
+        assert_eq!(followed.nodes[device].excluded, Excluded::No);
+
+        // Without the option every one of them is the link, and nothing is noted.
+        let plain = scan(false, false);
+        for name in [
+            "to-big",
+            "chain",
+            "to-dir",
+            "broken",
+            "to-hardlinked",
+            "to-device",
+        ] {
+            let i = named(&plain, name).unwrap();
+            assert_eq!(plain.nodes[i].kind, NodeKind::Link, "{name}");
+            assert_eq!(plain.nodes[i].apparent, link_itself(name).len(), "{name}");
+            assert_eq!(plain.followed_link(i), None, "{name}");
+        }
+        // The difference in the total: twice the big file instead of the two links to it.
+        // The hard-linked file is counted once either way, and /dev/null is empty; of those
+        // two only the links' own sizes go.
+        let total = |tree: &Tree| tree.nodes[tree.root].apparent;
+        let gone: u64 = ["to-big", "chain", "to-hardlinked", "to-device"]
+            .iter()
+            .map(|name| link_itself(name).len())
+            .sum();
+        assert_eq!(total(&followed), total(&plain) + 2 * 100_000 - gone);
+
+        // With `-x` a file that a link leads to on another filesystem is left out, like a
+        // directory there. The others are on this one.
+        if null.dev() != big.dev() {
+            let one_fs = scan(true, true);
+            let device = named(&one_fs, "to-device").unwrap();
+            assert_eq!(one_fs.nodes[device].excluded, Excluded::OtherFs);
+            let to_big = named(&one_fs, "to-big").unwrap();
+            assert_eq!(one_fs.nodes[to_big].excluded, Excluded::No);
+            assert_eq!(one_fs.nodes[to_big].apparent, 100_000);
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// What a pattern excludes is not looked at, so a link among it is not followed either.
+    #[test]
+    fn an_excluded_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("icdu_follow_excl_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("big"), vec![0u8; 50_000]).unwrap();
+        symlink("big", base.join("skipped")).unwrap();
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let mut o = opts(2, meta.dev());
+        o.follow_symlinks = true;
+        o.excludes = vec!["skipped".to_string()];
+        let mut tree = Tree::new(base.to_string_lossy().into(), 0, 0, meta.dev(), meta.ino());
+        for batch in start(base.clone(), o).events.iter() {
+            tree.apply(batch);
+        }
+        let i = tree.nodes.iter().position(|n| n.name == "skipped").unwrap();
+        assert_eq!(tree.nodes[i].kind, NodeKind::Link);
+        assert_eq!(tree.nodes[i].excluded, Excluded::Pattern);
+        assert_eq!(tree.followed_link(i), None);
+        assert_eq!(tree.nodes[tree.root].apparent, 50_000);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// An entry that is gone is not an error; everything else is.

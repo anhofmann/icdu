@@ -112,11 +112,17 @@ impl Plan {
         let target = tree.fs_path_of(idx)?;
         let entry = |i: NodeIdx| {
             let n = &tree.nodes[i];
+            // A symlink that was counted as its target (`-L`): what is on disk under this
+            // name, and what gets removed, is the link.
+            let (kind, dev, ino) = match tree.followed_link(i) {
+                Some((dev, ino)) => (NodeKind::Link, dev, ino),
+                None => (n.kind, n.dev, n.ino),
+            };
             Entry {
                 name: n.name.clone(),
-                kind: n.kind,
-                dev: n.dev,
-                ino: n.ino,
+                kind,
+                dev,
+                ino,
                 descend: n.is_dir() && n.scanned && !n.read_error && n.excluded == Excluded::No,
                 // The scanner records an entry it could not `lstat` without device and inode.
                 verifiable: !(n.read_error && !n.is_dir() && n.dev == 0 && n.ino == 0),
@@ -280,6 +286,10 @@ mod tests {
 
     /// Scan `root` to completion with the real scanner.
     fn scan_tree(root: &Path, excludes: &[&str]) -> Tree {
+        scan_tree_with(root, excludes, false)
+    }
+
+    fn scan_tree_with(root: &Path, excludes: &[&str], follow_symlinks: bool) -> Tree {
         let meta = fs::symlink_metadata(root).unwrap();
         let opts = Opts {
             threads: 2,
@@ -291,6 +301,7 @@ mod tests {
             extended: false,
             exclude_caches: false,
             exclude_kernfs: false,
+            follow_symlinks,
         };
         let mut tree = Tree::new(
             root.to_string_lossy().into(),
@@ -332,6 +343,56 @@ mod tests {
             b"keep me",
             "the symlink's target is untouched"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// With `-L` a symlink to a file is in the tree as that file, with its size. Deleting
+    /// the entry removes the link, and never the file it points to: on its own, and as part
+    /// of a directory.
+    #[test]
+    fn a_followed_symlink_is_removed_as_the_link_it_is() {
+        let root = scratch("followed");
+        fs::create_dir_all(root.join("victim")).unwrap();
+        fs::write(root.join("outside"), b"keep me").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("alone")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("victim/link")).unwrap();
+
+        let tree = scan_tree_with(&root, &[], true);
+        let alone = tree.nodes.iter().position(|n| n.name == "alone").unwrap();
+        // The entry is the file as far as the tree is concerned.
+        assert_eq!(tree.nodes[alone].kind, NodeKind::File);
+        assert_eq!(tree.nodes[alone].apparent, 7);
+        assert!(tree.followed_link(alone).is_some());
+
+        let report = plan_for(&tree, "alone").execute();
+        assert!(report.complete, "{report:?}");
+        assert_eq!((report.removed, report.failed), (1, 0));
+        assert!(fs::symlink_metadata(root.join("alone")).is_err(), "gone");
+
+        let report = plan_for(&tree, "victim").execute();
+        assert!(report.complete, "{report:?}");
+        assert_eq!((report.removed, report.failed), (2, 0));
+        assert!(!root.join("victim").exists());
+
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"keep me");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// If the name no longer is that symlink (here: a real file took its place), it stays,
+    /// like every entry that changed since the scan.
+    #[test]
+    fn a_followed_symlink_that_was_replaced_stays() {
+        let root = scratch("followed_changed");
+        fs::write(root.join("outside"), b"keep me").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("link")).unwrap();
+        let tree = scan_tree_with(&root, &[], true);
+
+        fs::remove_file(root.join("link")).unwrap();
+        fs::write(root.join("link"), b"new and precious").unwrap();
+        let report = plan_for(&tree, "link").execute();
+        assert!(!report.complete);
+        assert_eq!((report.removed, report.failed), (0, 1));
+        assert_eq!(fs::read(root.join("link")).unwrap(), b"new and precious");
         fs::remove_dir_all(&root).unwrap();
     }
 

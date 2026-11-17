@@ -28,7 +28,7 @@ use crate::scan::Batch;
 
 pub type NodeIdx = usize;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Dir,
     File,
@@ -183,6 +183,10 @@ pub struct Tree {
     /// memory only for files with more than one link. Imported trees do not use it (their
     /// duplicates are marked by the import, and nothing in them is deleted or rescanned).
     links: HashMap<(u64, u64), LinkSet>,
+    /// With `-L`: the symlinks that are counted as the files they point to, with the device
+    /// and inode of the link itself. The node has the target's type, sizes, device and
+    /// inode; a delete needs to know what is really there. Empty without `-L`.
+    followed: HashMap<NodeIdx, (u64, u64)>,
     /// Extended information (`-e`): one row per node, parallel to `nodes`. `None` unless the
     /// mode is on, so that it costs nothing otherwise and `Node` stays as small as it is.
     ext: Option<Vec<ExtRow>>,
@@ -230,6 +234,7 @@ impl Tree {
             nlinks: HashMap::new(),
             errors_below: HashMap::new(),
             links: HashMap::new(),
+            followed: HashMap::new(),
             ext: None,
             generation: 0,
             total_dirs: 1,
@@ -312,6 +317,9 @@ impl Tree {
             }
             if nn.hlink {
                 self.set_nlink(idx, nn.nlink);
+            }
+            if let Some(link) = nn.followed {
+                self.followed.insert(idx, *link);
             }
             let read_error = nn.error.is_some();
             if let Some(error) = nn.error {
@@ -409,6 +417,33 @@ impl Tree {
             }
             cur = n.parent;
         }
+    }
+
+    /// For a symlink that is counted as the file it points to (`-L`): the device and inode of
+    /// the link itself. The node's own are the target's.
+    pub fn followed_link(&self, idx: NodeIdx) -> Option<(u64, u64)> {
+        // Nearly always empty, and then there is nothing to hash.
+        if self.followed.is_empty() {
+            return None;
+        }
+        self.followed.get(&idx).copied()
+    }
+
+    /// How many such links there are at and below `idx`. Walks the subtree, so it is for a
+    /// user's action (the delete dialog), not for a frame.
+    pub fn followed_links_in(&self, idx: NodeIdx) -> u32 {
+        if self.followed.is_empty() {
+            return 0;
+        }
+        let mut count = 0u32;
+        let mut stack = vec![idx];
+        while let Some(n) = stack.pop() {
+            if self.followed.contains_key(&n) {
+                count = count.saturating_add(1);
+            }
+            stack.extend_from_slice(&self.nodes[n].children);
+        }
+        count
     }
 
     /// Turn on extended mode (`-e`): from now on the tree keeps owner, group, mode and
@@ -1030,6 +1065,7 @@ mod tests {
             excluded: Excluded::No,
             error: None,
             dir_id: Some(id),
+            followed: None,
         }
     }
 
@@ -1339,6 +1375,7 @@ mod tests {
         NewNode {
             kind: NodeKind::File,
             dir_id: None,
+            followed: None,
             ..dir(name, ino)
         }
     }
@@ -1627,6 +1664,7 @@ mod tests {
         let excluded = NewNode {
             excluded: Excluded::Pattern,
             dir_id: None,
+            followed: None,
             ..dir("ex", 9)
         };
         t.apply(Batch {
@@ -2189,6 +2227,7 @@ mod tests {
         let excluded_dir = NewNode {
             excluded: Excluded::Pattern,
             dir_id: None,
+            followed: None,
             ..dir("node_modules", 2)
         };
         let excluded_file = NewNode {

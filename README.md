@@ -75,6 +75,8 @@ OPTIONS:
                              leave out directories that have a CACHEDIR.TAG
         --exclude-kernfs, --include-kernfs
                              leave out Linux pseudo filesystems (/proc, /sys)
+    -L, --follow-symlinks, --no-follow-symlinks
+                             count a symlink to a file as that file
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
@@ -335,6 +337,13 @@ leaves the rest on disk. Any other key disarms the prompt.
   size moves to one of them instead of dropping out of the totals. The delete dialog says when
   the selection contains hard-linked files: their space is only freed once the last link is
   gone.
+- **Symlinks** are counted as the links they are, and never followed. With `-L` a symlink to
+  a file is counted as that file instead: the entry has the file's size, type and owner, and
+  every such link counts on its own, as in ncdu (a file with two links to it is there three
+  times). Links to directories are not followed, and a broken link stays a link. The entry
+  still shows as a link (`@`), and `d` removes the link and never the file behind it; the
+  delete dialog says so. With `-x`, a file that a link leads to on another filesystem is left
+  out.
 - `--exclude PATTERN` takes a shell pattern (`*`, `?`, `[...]` with ranges, `[!...]` and
   `[[:alpha:]]`, `\` before a character to take it literally) and matches it the way ncdu does:
   against an entry's whole path, and against every tail of that path that starts after a `/`.
