@@ -1373,7 +1373,7 @@ impl App {
             Excluded::Pattern => {
                 rows.push((
                     "excluded".to_string(),
-                    "matched --exclude pattern".to_string(),
+                    "by an --exclude pattern or --exclude-caches".to_string(),
                 ));
             }
             Excluded::OtherFs => {
@@ -4686,6 +4686,7 @@ mod tests {
             older_than: None,
             newer_than: None,
             extended: false,
+            exclude_caches: false,
         }
     }
 

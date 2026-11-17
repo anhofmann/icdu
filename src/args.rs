@@ -23,6 +23,8 @@ pub struct Args {
     pub threads: usize,
     pub disk_usage: bool,
     pub one_file_system: bool,
+    /// `--exclude-caches`: leave out directories tagged with a `CACHEDIR.TAG`.
+    pub exclude_caches: bool,
     /// How many times `-r` was given. Once disables deleting.
     pub read_only: u8,
     /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
@@ -53,6 +55,7 @@ impl Default for Args {
             threads: scan::default_threads(),
             disk_usage: true,
             one_file_system: false,
+            exclude_caches: false,
             read_only: 0,
             show_item_count: false,
             excludes: Vec::new(),
@@ -127,6 +130,7 @@ enum Action {
     SlowUi(bool),
     Extended(bool),
     Mtime(bool),
+    Caches(bool),
 }
 
 /// One flag: how it is spelled, whether it takes a value, and what `--help` says about it.
@@ -199,6 +203,20 @@ pub const FLAGS: &[Flag] = &[
         "read exclude patterns from FILE (one per line)",
         Action::ExcludeFrom,
     ),
+    Flag {
+        negation: Some("include-caches"),
+        ..flag(
+            &[],
+            &["exclude-caches"],
+            None,
+            "leave out directories that have a CACHEDIR.TAG",
+            Action::Caches(true),
+        )
+    },
+    Flag {
+        negation: Some("exclude-caches"),
+        ..flag(&[], &["include-caches"], None, "", Action::Caches(false))
+    },
     flag(
         &[],
         &["older-than"],
@@ -446,6 +464,7 @@ fn apply(
         Action::SlowUi(slow) => args.slow_ui = slow,
         Action::Extended(on) => args.extended = on,
         Action::Mtime(show) => args.show_mtime = show,
+        Action::Caches(exclude) => args.exclude_caches = exclude,
     }
     Ok(None)
 }
@@ -838,6 +857,21 @@ mod tests {
                 },
             ),
             (&["--show-mtime", "--hide-mtime"], d()),
+            (
+                &["--exclude-caches"],
+                Args {
+                    exclude_caches: true,
+                    ..d()
+                },
+            ),
+            (&["--exclude-caches", "--include-caches"], d()),
+            (
+                &["--include-caches", "--exclude-caches"],
+                Args {
+                    exclude_caches: true,
+                    ..d()
+                },
+            ),
         ];
         for (line, want) in table {
             assert_eq!(args(line), want, "{line:?}");

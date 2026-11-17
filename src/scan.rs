@@ -425,6 +425,8 @@ pub struct Opts {
     pub newer_than: Option<i64>,
     /// Record owner, group, mode and modification time of every entry (ncdu `-e`).
     pub extended: bool,
+    /// Leave out directories tagged as caches (ncdu `--exclude-caches`).
+    pub exclude_caches: bool,
 }
 
 /// State shared by workers only (NOT the UI), so it holds the event `Sender`.
@@ -443,6 +445,8 @@ struct Shared {
     newer_than: Option<i64>,
     /// Send extended information with every batch.
     extended: bool,
+    /// Do not enter directories that have a valid `CACHEDIR.TAG`.
+    exclude_caches: bool,
     /// A rescan's starting directory: its job id and what it must still be when it is read.
     start_check: Option<(u64, Identity)>,
     /// The id of the directory the scan starts at.
@@ -563,6 +567,7 @@ fn start_limited(
         older_than: opts.older_than,
         newer_than: opts.newer_than,
         extended: opts.extended,
+        exclude_caches: opts.exclude_caches,
         start_check: identity.map(|identity| (id_base, identity)),
         start_id: id_base,
     });
@@ -734,6 +739,10 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         } else if shared.one_file_system && matches!(kind, NodeKind::Dir) && dev != shared.root_dev
         {
             excluded = Excluded::OtherFs;
+        } else if shared.exclude_caches && matches!(kind, NodeKind::Dir) && has_cachedir_tag(&path)
+        {
+            // The dump format has no reason of its own for this; ncdu writes `pattern` too.
+            excluded = Excluded::Pattern;
         }
 
         let recurse = matches!(kind, NodeKind::Dir) && excluded == Excluded::No;
@@ -779,6 +788,27 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     // The last (usually the only) batch says that the directory has been read.
     send(nodes, exts, listing.error, false);
     enqueue(frontier, child_jobs);
+}
+
+/// How a `CACHEDIR.TAG` has to begin to mark its directory as a cache, by the Cache Directory
+/// Tagging Specification (<https://bford.info/cachedir/>).
+const CACHEDIR_TAG_SIGNATURE: &[u8; 43] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// True if `dir` holds a `CACHEDIR.TAG` that begins with the signature.
+///
+/// Like ncdu this follows a symlink of that name. Unlike ncdu it opens nothing but a regular
+/// file: opening a fifo called `CACHEDIR.TAG` would stop the scan until someone writes to it.
+fn has_cachedir_tag(dir: &Path) -> bool {
+    use std::io::Read;
+    let tag = dir.join("CACHEDIR.TAG");
+    if !std::fs::metadata(&tag).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut start = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    std::fs::File::open(&tag)
+        .and_then(|mut file| file.read_exact(&mut start))
+        .is_ok()
+        && start == *CACHEDIR_TAG_SIGNATURE
 }
 
 /// The extended information (`-e`) in what `lstat` returned.
@@ -845,6 +875,7 @@ mod tests {
             older_than: None,
             newer_than: None,
             extended: false,
+            exclude_caches: false,
         }
     }
 
@@ -1977,6 +2008,106 @@ mod tests {
         let mut out = Vec::new();
         crate::dump::export(&plain, &mut out).unwrap();
         assert!(!String::from_utf8(out).unwrap().contains("\"mtime\""));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `--exclude-caches`: a directory with a valid `CACHEDIR.TAG` is listed, marked as
+    /// excluded, not entered and not counted. The cases and their results are what ncdu 1.18
+    /// does with the same tree.
+    #[test]
+    fn cache_directories_are_left_out_on_request() {
+        let base = std::env::temp_dir().join(format!("icdu_caches_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let signature = "Signature: 8a477f597d28d172789f06886806bc55";
+        let tags: &[(&str, &str, &str)] = &[
+            // The usual form: the signature, then a comment.
+            (
+                "valid",
+                "CACHEDIR.TAG",
+                "Signature: 8a477f597d28d172789f06886806bc55\n# cache\n",
+            ),
+            // Exactly the signature and nothing after it.
+            ("exact", "CACHEDIR.TAG", signature),
+            ("nested/inner", "CACHEDIR.TAG", signature),
+            // Not tags: another signature, one byte short, another name.
+            (
+                "invalid",
+                "CACHEDIR.TAG",
+                "Signature: 00000000000000000000000000000000\n",
+            ),
+            ("short", "CACHEDIR.TAG", &signature[..42]),
+            ("lower", "cachedir.tag", signature),
+        ];
+        for (dir, name, content) in tags {
+            fs::create_dir_all(base.join(dir)).unwrap();
+            fs::write(base.join(dir).join(name), content).unwrap();
+            fs::write(base.join(dir).join("data"), vec![b'x'; 5000]).unwrap();
+        }
+        // A tag that is a symlink to a real one counts, one that is a directory does not.
+        fs::create_dir_all(base.join("symlinked")).unwrap();
+        std::os::unix::fs::symlink("../valid/CACHEDIR.TAG", base.join("symlinked/CACHEDIR.TAG"))
+            .unwrap();
+        fs::create_dir_all(base.join("dirtag/CACHEDIR.TAG")).unwrap();
+        fs::create_dir_all(base.join("valid/deep")).unwrap();
+        fs::write(base.join("valid/deep/f"), b"y").unwrap();
+
+        let scan = |root: &Path, exclude_caches: bool| {
+            let meta = fs::symlink_metadata(root).unwrap();
+            let mut o = opts(2, meta.dev());
+            o.exclude_caches = exclude_caches;
+            let mut tree = Tree::new(
+                root.to_string_lossy().into(),
+                meta.len(),
+                meta.blocks() * 512,
+                meta.dev(),
+                meta.ino(),
+            );
+            for batch in start(root.to_path_buf(), o).events.iter() {
+                tree.apply(batch);
+            }
+            tree
+        };
+        let excluded = |tree: &Tree| {
+            let mut names: Vec<String> = (0..tree.nodes.len())
+                .filter(|&i| tree.nodes[i].excluded != Excluded::No)
+                .map(|i| tree.rel_path_from(i, tree.root))
+                .collect();
+            names.sort();
+            names
+        };
+
+        let with = scan(&base, true);
+        assert_eq!(
+            excluded(&with),
+            ["exact", "nested/inner", "symlinked", "valid"]
+        );
+        let named = |tree: &Tree, name: &str| tree.nodes.iter().position(|n| n.name == name);
+        let valid = named(&with, "valid").unwrap();
+        assert_eq!(with.nodes[valid].excluded, Excluded::Pattern);
+        assert!(with.nodes[valid].children.is_empty(), "not entered");
+        assert_eq!(named(&with, "deep"), None);
+        assert!(
+            with.subtree_complete(with.root),
+            "and nothing is left to read"
+        );
+
+        // Without the option the same tree is read in full, and is larger by what the four
+        // directories hold.
+        let without = scan(&base, false);
+        assert_eq!(excluded(&without), [] as [&str; 0]);
+        assert!(named(&without, "deep").is_some());
+        let apparent = |tree: &Tree| tree.nodes[tree.root].apparent;
+        assert!(
+            apparent(&without) >= apparent(&with) + 4 * 5000,
+            "{} vs {}",
+            apparent(&without),
+            apparent(&with)
+        );
+
+        // The directory the scan starts at is read even if it is tagged itself.
+        let inside = scan(&base.join("valid"), true);
+        assert_eq!(excluded(&inside), [] as [&str; 0]);
+        assert!(named(&inside, "deep").is_some());
         fs::remove_dir_all(&base).unwrap();
     }
 

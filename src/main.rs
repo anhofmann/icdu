@@ -207,6 +207,7 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
         older_than: args.older_than.map(|d| now - d as i64),
         newer_than: args.newer_than.map(|d| now - d as i64),
         extended: args.extended,
+        exclude_caches: args.exclude_caches,
     };
     (tree, root, opts)
 }
