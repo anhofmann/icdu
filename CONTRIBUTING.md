@@ -100,8 +100,23 @@ For the maintainer. A release is a tag; a workflow does the rest.
 
 The release workflow then checks that the tag is the version in `Cargo.toml` and that the
 changelog has a section for it, runs the four gates on the tagged commit, builds the binaries
-with `tools/dist/build.sh`, and publishes them with that section of the changelog as the notes.
-If a check fails, nothing is published: fix it, and move the tag.
+with `tools/dist/build.sh`, and publishes archives and Debian packages with that section of
+the changelog as the notes. If a check fails, nothing is published: fix it, and move the tag.
+
+### The crate on crates.io
+
+The first version has to be published by hand, because crates.io can only be told to trust a
+workflow for a crate that exists:
+
+1. `cargo login` with a token from crates.io, then, on the tagged commit,
+   `cargo publish --dry-run` and `cargo publish`.
+2. On crates.io, in the crate's settings under "Trusted Publishing", add this repository
+   with the workflow `release.yml`.
+3. In this repository, under Settings → Secrets and variables → Actions → Variables, set
+   `PUBLISH_CRATE` to `true`.
+
+From then on the release workflow publishes the crate after the GitHub release, with a token
+crates.io issues for that one run. The token from step 1 can be revoked.
 
 ## Security problems
 

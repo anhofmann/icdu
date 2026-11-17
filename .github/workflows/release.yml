@@ -91,3 +91,27 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "icdu $GITHUB_REF_NAME" \
             --notes-file notes.md
+
+  # The crate on crates.io, by trusted publishing: crates.io trusts this workflow of this
+  # repository and hands it a token for one upload. No secret is kept here.
+  #
+  # crates.io can only be told to trust a workflow for a crate that exists. So the first
+  # version is published by hand (CONTRIBUTING.md, "Making a release"). After that, set the
+  # repository variable PUBLISH_CRATE to "true", and every release publishes the crate.
+  crate:
+    needs: release
+    if: vars.PUBLISH_CRATE == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
