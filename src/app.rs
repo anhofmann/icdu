@@ -499,6 +499,8 @@ pub enum Modal {
     ConfirmDelete(NodeIdx),
     /// Confirm an export while directories are still unread: the dump will be partial.
     ConfirmExport,
+    /// `--confirm-quit`: confirm leaving.
+    ConfirmQuit,
     /// The largest files under the directory the popup was opened from.
     TopFiles(Box<TopFiles>),
     /// Details of the selected entry: label and value rows, tree data plus an on-disk stat
@@ -566,6 +568,16 @@ pub struct App {
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
     pub show_item_count: bool,
+    /// `--disable-shell`, `-rr`: nothing is run: no shell (`b`) and no opener (`o`).
+    pub no_shell: bool,
+    /// `--disable-refresh`: no rescan (`r`).
+    pub no_refresh: bool,
+    /// `-rr`: the export key (`E`) is off as well, because it writes a file.
+    pub no_export: bool,
+    /// `--confirm-quit`: `q` asks before it quits.
+    pub confirm_quit: bool,
+    /// `d` asks before it deletes. `--no-confirm-delete` turns that off.
+    pub confirm_delete: bool,
     /// Draw in colour (`--color`). Off, only reverse video, bold and dim set things apart.
     pub color: bool,
     /// List hidden entries too (`e`, `--show-hidden`): those whose name starts with a dot,
@@ -665,6 +677,11 @@ impl App {
             },
             disk_usage,
             show_item_count: false,
+            no_shell: false,
+            no_refresh: false,
+            no_export: false,
+            confirm_quit: false,
+            confirm_delete: true,
             color: true,
             show_hidden: true,
             show_graph: true,
@@ -890,7 +907,14 @@ impl App {
     /// back into the same node. Browsing stays live the whole time; totals of surrounding
     /// directories stay correct throughout.
     fn request_refresh(&mut self) {
-        if self.refused_for_import("rescan") || self.refused_for_export("rescan") {
+        if self.refused_for_import("rescan") {
+            return;
+        }
+        if self.no_refresh {
+            self.status = Some("rescanning is disabled (--disable-refresh)".into());
+            return;
+        }
+        if self.refused_for_export("rescan") {
             return;
         }
         let sel = self.cur;
@@ -1015,6 +1039,10 @@ impl App {
     /// While directories are still unread, the dump would be partial yet look like the result
     /// of a finished scan to whoever reads it, so that case is confirmed first.
     fn request_export(&mut self) {
+        if self.no_export {
+            self.status = Some("exporting is disabled (-rr): it would write a file".into());
+            return;
+        }
         if self.exporting.is_some() {
             self.status = Some("an export is already being written".into());
             return;
@@ -1403,6 +1431,10 @@ impl App {
         if self.refused_for_import("the shell") {
             return;
         }
+        if self.no_shell {
+            self.status = Some("the shell is disabled (-rr or --disable-shell)".into());
+            return;
+        }
         match self.tree.fs_path_of(self.cur) {
             Some(path) => self.shell_request = Some(path),
             None => self.status = Some(GONE.into()),
@@ -1631,7 +1663,9 @@ impl App {
     pub fn input_mode(&self) -> InputMode {
         match self.modal {
             Modal::Find(_) => InputMode::Find,
-            Modal::ConfirmDelete(_) | Modal::ConfirmExport => InputMode::Confirm,
+            Modal::ConfirmDelete(_) | Modal::ConfirmExport | Modal::ConfirmQuit => {
+                InputMode::Confirm
+            }
             _ => InputMode::Normal,
         }
     }
@@ -1826,6 +1860,14 @@ impl App {
                 }
                 return;
             }
+            Modal::ConfirmQuit => {
+                // `y` quits. Every other key is "no", as in ncdu: the point of the question
+                // is that a slip of the finger does not end a long scan.
+                if action == KeyAction::Confirm {
+                    self.quit_now();
+                }
+                return;
+            }
             Modal::ConfirmExport => {
                 match action {
                     KeyAction::Confirm => self.export_now(),
@@ -2004,10 +2046,10 @@ impl App {
                                 .into(),
                         );
                     }
+                } else if self.confirm_quit {
+                    self.modal = Modal::ConfirmQuit;
                 } else {
-                    // A dump that is half written is of no use: finish it first.
-                    self.poll_export(None);
-                    self.quit = true;
+                    self.quit_now();
                 }
             }
             KeyAction::Down => self.move_selection(&kids, 1),
@@ -2151,6 +2193,11 @@ impl App {
         if self.refused_for_import("open") {
             return;
         }
+        // The opener is a program that gets run, like the shell.
+        if self.no_shell {
+            self.status = Some("opening is disabled (-rr or --disable-shell)".into());
+            return;
+        }
         let Some(sel) = self.selected else { return };
         if self.deleting_idx() == Some(sel) {
             self.status = Some("can't open: this entry is being deleted".into());
@@ -2200,12 +2247,19 @@ impl App {
         }
     }
 
+    /// Leave, after finishing what must not be left half done.
+    fn quit_now(&mut self) {
+        // A dump that is half written is of no use: finish it first.
+        self.poll_export(None);
+        self.quit = true;
+    }
+
     fn request_delete(&mut self) {
         if self.refused_for_import("delete") {
             return;
         }
         if self.read_only {
-            self.status = Some("read-only mode (-r): deletion disabled".into());
+            self.status = Some("deleting is disabled (-r or --disable-delete)".into());
             return;
         }
         if self.refused_for_export("delete") {
@@ -2247,7 +2301,13 @@ impl App {
         }
         self.confirm_hard_links = self.tree.hard_links_in(sel);
         self.confirm_followed = self.tree.followed_links_in(sel);
-        self.modal = Modal::ConfirmDelete(sel);
+        if self.confirm_delete {
+            self.modal = Modal::ConfirmDelete(sel);
+        } else {
+            // `--no-confirm-delete`. Everything that guards a deletion has been checked
+            // above; only the question is left out.
+            self.perform_delete(sel);
+        }
     }
 
     fn perform_delete(&mut self, idx: NodeIdx) {
@@ -3293,6 +3353,149 @@ mod tests {
         app.on_key(KeyAction::Enter);
         assert_eq!(app.selected, Some(idx_named(&app, ".env")));
         assert!(app.show_hidden);
+    }
+
+    /// An app over a real directory with one file and one subdirectory, scanned.
+    fn app_on_disk(tag: &str) -> (App, PathBuf) {
+        let base = std::env::temp_dir().join(format!("icdu_switch_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("file"), b"0123456789").unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let mut app = scanned_app(&base, &[]);
+        app.selected = Some(idx_named(&app, "file"));
+        (app, base)
+    }
+
+    /// Each switch turns off exactly its feature, and the key then says why nothing happens.
+    #[test]
+    fn each_switch_disables_its_feature_and_says_so() {
+        // Deleting (`-r`, `--disable-delete`).
+        let (mut app, base) = app_on_disk("delete");
+        app.read_only = true;
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.status.as_deref().unwrap().contains("--disable-delete"));
+        assert!(base.join("file").exists());
+        // The others still work.
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request(), Some(base.clone()));
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, Some(app.tree.root));
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // The shell and the opener (`--disable-shell`).
+        let (mut app, base) = app_on_disk("shell");
+        app.no_shell = true;
+        app.on_key(KeyAction::Shell);
+        assert_eq!(app.take_shell_request(), None);
+        assert!(app.status.as_deref().unwrap().contains("--disable-shell"));
+        app.on_key(KeyAction::Open);
+        assert!(app.status.as_deref().unwrap().contains("--disable-shell"));
+        assert!(app.pending_open.is_empty(), "nothing was started");
+        // Deleting is still offered.
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::ConfirmDelete(_)));
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // Rescanning (`--disable-refresh`).
+        let (mut app, base) = app_on_disk("refresh");
+        app.no_refresh = true;
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None);
+        assert!(app.status.as_deref().unwrap().contains("--disable-refresh"));
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // The export key (`-rr`).
+        let (mut app, base) = app_on_disk("export");
+        app.no_export = true;
+        app.on_key(KeyAction::Export);
+        assert!(!app.is_exporting());
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.status.as_deref().unwrap().contains("-rr"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `-rr` as the command line sets it: no key is left that writes to the filesystem or
+    /// runs something.
+    #[test]
+    fn read_only_twice_leaves_nothing_that_writes_or_runs() {
+        let (mut app, base) = app_on_disk("rr");
+        app.read_only = true;
+        app.no_shell = true;
+        app.no_export = true;
+        let before: Vec<_> = std::fs::read_dir(&base).unwrap().flatten().collect();
+        for key in [
+            KeyAction::Delete,
+            KeyAction::Shell,
+            KeyAction::Open,
+            KeyAction::Export,
+        ] {
+            app.status = None;
+            app.on_key(key);
+            assert!(matches!(app.modal, Modal::None), "{key:?}");
+            assert!(
+                app.status.as_deref().unwrap().contains("disabled"),
+                "{key:?}"
+            );
+        }
+        assert_eq!(app.take_shell_request(), None);
+        assert!(!app.is_deleting() && !app.is_exporting() && app.pending_open.is_empty());
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), before.len());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `--confirm-quit`: `q` asks, `y` quits, and any other key stays. Without the flag `q`
+    /// quits at once.
+    #[test]
+    fn confirm_quit_asks_first() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::Quit);
+        assert!(app.quit, "no question by default");
+
+        let mut app = app_with_entries();
+        app.confirm_quit = true;
+        app.on_key(KeyAction::Quit);
+        assert!(!app.quit);
+        assert!(matches!(app.modal, Modal::ConfirmQuit));
+        assert!(app.input_mode() == InputMode::Confirm);
+        // "No", and a second `q`, close the question and nothing else.
+        for stay in [KeyAction::Cancel, KeyAction::Quit, KeyAction::Down] {
+            app.modal = Modal::ConfirmQuit;
+            let selected = app.selected;
+            app.on_key(stay);
+            assert!(!app.quit, "{stay:?}");
+            assert!(matches!(app.modal, Modal::None), "{stay:?}");
+            assert_eq!(app.selected, selected, "{stay:?} did nothing else");
+        }
+        app.on_key(KeyAction::Quit);
+        app.on_key(KeyAction::Confirm);
+        assert!(app.quit);
+    }
+
+    /// `--no-confirm-delete`: `d` deletes without the question, behind the same gates.
+    #[test]
+    fn delete_without_confirmation() {
+        let (mut app, base) = app_on_disk("noconfirm");
+        app.confirm_delete = false;
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no dialog");
+        assert!(app.is_deleting());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.is_deleting() && Instant::now() < deadline {
+            app.poll_delete();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!base.join("file").exists());
+        assert!(base.join("sub").exists());
+
+        // The gates are the same as with the question: read-only still refuses.
+        app.selected = Some(idx_named(&app, "sub"));
+        app.read_only = true;
+        app.on_key(KeyAction::Delete);
+        assert!(!app.is_deleting());
+        assert!(base.join("sub").exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// A batch for the root with one file, as a running scan would deliver it.

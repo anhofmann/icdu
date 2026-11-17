@@ -156,6 +156,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Modal::Help(view) => render_help(f, view),
         Modal::ConfirmDelete(idx) => render_confirm(f, app, *idx),
         Modal::ConfirmExport => render_confirm_export(f, app),
+        Modal::ConfirmQuit => render_confirm_quit(f, app),
         Modal::TopFiles(tf) => render_top_files(f, app, tf),
         Modal::Info(rows) => render_info(f, rows),
         Modal::Find(find) => render_find(f, app, find),
@@ -927,7 +928,13 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         ),
     };
     let sort = sort_label(app.sort, app.disk_usage);
-    let help = format!(" ? help  / search  d delete  sort:{sort}  a usage  q quit   │   {status}");
+    // Only what can be done is offered.
+    let delete = if app.read_only || app.imported {
+        ""
+    } else {
+        "d delete  "
+    };
+    let help = format!(" ? help  / search  {delete}sort:{sort}  a usage  q quit   │   {status}");
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             help,
@@ -1226,6 +1233,61 @@ fn confirm_export_text(unread: usize) -> [String; 3] {
 
 /// Asked before exporting while directories are still unread: the dump would otherwise look
 /// like the result of a finished scan.
+/// What the quit dialog (`--confirm-quit`) says, for the number of directories a running
+/// scan has not read yet: that is what quitting would throw away.
+fn confirm_quit_text(unread: usize) -> String {
+    match unread {
+        0 => "  Leave icdu?".to_string(),
+        1 => "  Leave icdu? The scan is still running: 1 directory has not been read yet."
+            .to_string(),
+        n => format!(
+            "  Leave icdu? The scan is still running: {} directories have not been read yet.",
+            fmt_count(n)
+        ),
+    }
+}
+
+fn render_confirm_quit(f: &mut Frame, app: &App) {
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Quit?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(confirm_quit_text(app.tree.unread_dirs() as usize)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  y",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" quit    "),
+            Span::styled(
+                "any other key",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" stay"),
+        ]),
+    ];
+    let width = 76.min(f.area().width.saturating_sub(4)).max(24);
+    let height = wrapped_height(&lines, width - 2) + 2;
+    let area = popup(f.area(), width, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Confirm quit "),
+        ),
+        area,
+    );
+}
+
 fn render_confirm_export(f: &mut Frame, app: &App) {
     let [headline, first, second] = confirm_export_text(app.tree.unread_dirs() as usize);
     let lines = vec![
@@ -1269,12 +1331,12 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar, bar_scale, confirm_export_text, dir_label, display_width, find_empty_message,
-        find_rows, find_title, fmt_count, fmt_items, fmt_size_in, followed_note, footer_split,
-        hard_link_note, help_layout, help_scroll_hint, hidden_title, item_cell, left_to_read,
-        list_title, listing_state, mtime_cell, scan_progress, size_cell, sort_label, truncate_left,
-        GraphStyle, HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH,
-        ITEMS_WIDTH, MTIME_WIDTH,
+        bar, bar_scale, confirm_export_text, confirm_quit_text, dir_label, display_width,
+        find_empty_message, find_rows, find_title, fmt_count, fmt_items, fmt_size_in,
+        followed_note, footer_split, hard_link_note, help_layout, help_scroll_hint, hidden_title,
+        item_cell, left_to_read, list_title, listing_state, mtime_cell, scan_progress, size_cell,
+        sort_label, truncate_left, GraphStyle, HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS,
+        HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH, MTIME_WIDTH,
     };
     use crate::app::{Sort, SortColumn};
     use crate::model::{Excluded, NodeKind, Tree};
@@ -1606,6 +1668,14 @@ mod tests {
             " reading… · 2 hidden "
         );
         assert_eq!(hidden_title(title(Listing::Complete, 0), 0, 0), " (empty) ");
+    }
+
+    /// The quit question says what quitting would throw away, if anything.
+    #[test]
+    fn confirm_quit_text_mentions_a_running_scan() {
+        assert_eq!(confirm_quit_text(0), "  Leave icdu?");
+        assert!(confirm_quit_text(1).contains("1 directory has not been read yet"));
+        assert!(confirm_quit_text(12_345).contains("12,345 directories have not"));
     }
 
     /// No row may be larger than what a full bar stands for.

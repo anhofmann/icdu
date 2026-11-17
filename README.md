@@ -82,7 +82,17 @@ OPTIONS:
                              count a symlink to a file as that file
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
-    -r, --read-only          disable the delete feature
+    -r, --read-only          no deleting; given twice: no shell or export either
+        --disable-delete, --enable-delete
+                             turn the delete key off, or on (default)
+        --disable-shell, --enable-shell
+                             turn shell and opener off, or on (default)
+        --disable-refresh, --enable-refresh
+                             turn rescanning off, or on (default)
+        --confirm-quit, --no-confirm-quit
+                             ask before quitting, or not (default)
+        --confirm-delete, --no-confirm-delete
+                             ask before deleting (default), or not
         --si, --no-si        sizes in powers of 1000 (kB, MB), or of 1024
         --color SCHEME       off, dark or dark-bg (off if NO_COLOR is set)
         --show-hidden, --hide-hidden
@@ -393,6 +403,7 @@ the list shows what is really there.
 Further guards:
 
 - **Read-only** (`-r`) disables deletion entirely, and so does browsing an imported dump (`-f`).
+  See [Switching features off](#switching-features-off).
 - A directory **cannot be deleted until its whole subtree has finished scanning**. Because the
   scan is live, a directory's size and contents may still be growing; icdu refuses to delete one
   until every descendant has been read, so you never delete something whose true extent isn't yet
@@ -406,6 +417,25 @@ it), and one deletion runs at a time.
 Quitting (`q` / `Ctrl-C`) **while a deletion is running** does not abort it silently: the first
 press warns, and a second press force-quits — which interrupts the removal wherever it is and
 leaves the rest on disk. Any other key disarms the prompt.
+
+### Switching features off
+
+What icdu may do to the filesystem can be limited from the command line, as in ncdu:
+
+| Flag | Turns off |
+|---|---|
+| `-r`, `--disable-delete` | deleting (`d`) |
+| `--disable-shell` | everything that runs a program: the shell (`b`) and the opener (`o`) |
+| `--disable-refresh` | rescanning (`r`) |
+| `-rr` | deleting, shell and opener, and the export key (`E`), which writes a file: nothing is left that changes the filesystem or runs something |
+
+A key that is switched off says so. Each switch has an `--enable-…` counterpart, and the later
+of two wins. Browsing an imported dump (`-f`) has delete, shell, opener and rescan off whatever
+the flags say.
+
+`--confirm-quit` makes `q` ask before leaving, which helps against a slip of the finger in the
+middle of a long scan. `--no-confirm-delete` makes `d` delete without its question; everything
+else that guards a deletion stays.
 
 ### Hard links, exclusions, filesystems
 

@@ -112,8 +112,8 @@ fn main() {
     // --- Import mode: load a dump, browse it, no scanning. ---
     if let Some(src) = &args.import {
         let tree = unwrap_or_die(load_import(src, args.extended), src);
-        let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
-        apply_view_options(&mut app, &args);
+        let mut app = App::new(tree, args.disk_usage, !args.can_delete, false);
+        apply_options(&mut app, &args);
         // A dump is not the local filesystem: nothing may act on its paths.
         app.imported = true;
         run_ui(&mut app, args.slow_ui);
@@ -124,8 +124,8 @@ fn main() {
     if mode != Feedback::Browser {
         // --- `-0` / `-1`: scan first, with little or no feedback, then browse. ---
         let tree = scan_to_completion(tree, root, opts.clone(), mode);
-        let mut app = App::new(tree, args.disk_usage, args.read_only > 0, false);
-        apply_view_options(&mut app, &args);
+        let mut app = App::new(tree, args.disk_usage, !args.can_delete, false);
+        apply_options(&mut app, &args);
         // The scan is over, but `r` can still read a directory again.
         app.set_scan_opts(opts);
         run_ui(&mut app, args.slow_ui);
@@ -133,15 +133,20 @@ fn main() {
 
     // --- Interactive scan mode: browse while the scan runs. ---
     let scan = scan::start(root, opts.clone());
-    let mut app = App::new(tree, args.disk_usage, args.read_only > 0, true);
-    apply_view_options(&mut app, &args);
+    let mut app = App::new(tree, args.disk_usage, !args.can_delete, true);
+    apply_options(&mut app, &args);
     app.attach_scan(scan, opts);
 
     run_ui(&mut app, args.slow_ui);
 }
 
-/// What the command line says about how the list looks: its columns and its order.
-fn apply_view_options(app: &mut App, args: &Args) {
+/// What the command line says about the browser: what it may do, and how the list looks.
+fn apply_options(app: &mut App, args: &Args) {
+    app.no_shell = !args.can_shell;
+    app.no_refresh = !args.can_refresh;
+    app.no_export = !args.can_export;
+    app.confirm_quit = args.confirm_quit;
+    app.confirm_delete = args.confirm_delete;
     // Colours are on unless NO_COLOR says otherwise (https://no-color.org) or --color does.
     // Asked for by name, they win over NO_COLOR, which the terminal library obeys by itself.
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());

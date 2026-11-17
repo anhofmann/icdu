@@ -53,6 +53,18 @@ pub struct Args {
     pub natsort: bool,
     /// How many times `-r` was given. Once disables deleting.
     pub read_only: u8,
+    /// The delete key works. `-r` and `--disable-delete` turn it off.
+    pub can_delete: bool,
+    /// The shell and the opener work. `-rr` and `--disable-shell` turn them off.
+    pub can_shell: bool,
+    /// Rescanning works. `--disable-refresh` turns it off.
+    pub can_refresh: bool,
+    /// The export key works. A second `-r` turns it off: it writes a file.
+    pub can_export: bool,
+    /// `--confirm-quit`: ask before quitting.
+    pub confirm_quit: bool,
+    /// Ask before deleting. `--no-confirm-delete` turns it off.
+    pub confirm_delete: bool,
     /// `--show-itemcount` / `--hide-itemcount`: initial state of the item count column.
     pub show_item_count: bool,
     pub excludes: Vec<String>,
@@ -94,6 +106,12 @@ impl Default for Args {
             dirs_first: false,
             natsort: true,
             read_only: 0,
+            can_delete: true,
+            can_shell: true,
+            can_refresh: true,
+            can_export: true,
+            confirm_quit: false,
+            confirm_delete: true,
             show_item_count: false,
             excludes: Vec::new(),
             older_than: None,
@@ -160,6 +178,11 @@ enum Action {
     OlderThan,
     NewerThan,
     ReadOnly,
+    Delete(bool),
+    Shell(bool),
+    Refresh(bool),
+    ConfirmQuit(bool),
+    ConfirmDelete(bool),
     ItemCount(bool),
     Output,
     Input,
@@ -340,9 +363,91 @@ pub const FLAGS: &[Flag] = &[
         &['r'],
         &["read-only"],
         None,
-        "disable the delete feature",
+        "no deleting; given twice: no shell or export either",
         Action::ReadOnly,
     ),
+    Flag {
+        negation: Some("enable-delete"),
+        ..flag(
+            &[],
+            &["disable-delete"],
+            None,
+            "turn the delete key off, or on (default)",
+            Action::Delete(false),
+        )
+    },
+    Flag {
+        negation: Some("disable-delete"),
+        ..flag(&[], &["enable-delete"], None, "", Action::Delete(true))
+    },
+    Flag {
+        negation: Some("enable-shell"),
+        ..flag(
+            &[],
+            &["disable-shell"],
+            None,
+            "turn shell and opener off, or on (default)",
+            Action::Shell(false),
+        )
+    },
+    Flag {
+        negation: Some("disable-shell"),
+        ..flag(&[], &["enable-shell"], None, "", Action::Shell(true))
+    },
+    Flag {
+        negation: Some("enable-refresh"),
+        ..flag(
+            &[],
+            &["disable-refresh"],
+            None,
+            "turn rescanning off, or on (default)",
+            Action::Refresh(false),
+        )
+    },
+    Flag {
+        negation: Some("disable-refresh"),
+        ..flag(&[], &["enable-refresh"], None, "", Action::Refresh(true))
+    },
+    Flag {
+        negation: Some("no-confirm-quit"),
+        ..flag(
+            &[],
+            &["confirm-quit"],
+            None,
+            "ask before quitting, or not (default)",
+            Action::ConfirmQuit(true),
+        )
+    },
+    Flag {
+        negation: Some("confirm-quit"),
+        ..flag(
+            &[],
+            &["no-confirm-quit"],
+            None,
+            "",
+            Action::ConfirmQuit(false),
+        )
+    },
+    Flag {
+        negation: Some("no-confirm-delete"),
+        ..flag(
+            &[],
+            &["confirm-delete"],
+            None,
+            "ask before deleting (default), or not",
+            Action::ConfirmDelete(true),
+        )
+    },
+    Flag {
+        negation: Some("confirm-delete"),
+        ..flag(
+            &[],
+            &["no-confirm-delete"],
+            None,
+            "",
+            Action::ConfirmDelete(false),
+        )
+    },
     Flag {
         negation: Some("no-si"),
         ..flag(
@@ -755,7 +860,20 @@ fn apply(
         }
         Action::OlderThan => args.older_than = Some(parse_duration(&value)?),
         Action::NewerThan => args.newer_than = Some(parse_duration(&value)?),
-        Action::ReadOnly => args.read_only = args.read_only.saturating_add(1),
+        // Once: no deleting. Twice: nothing that writes to the filesystem or runs something.
+        Action::ReadOnly => {
+            args.read_only = args.read_only.saturating_add(1);
+            args.can_delete = false;
+            if args.read_only >= 2 {
+                args.can_shell = false;
+                args.can_export = false;
+            }
+        }
+        Action::Delete(on) => args.can_delete = on,
+        Action::Shell(on) => args.can_shell = on,
+        Action::Refresh(on) => args.can_refresh = on,
+        Action::ConfirmQuit(ask) => args.confirm_quit = ask,
+        Action::ConfirmDelete(ask) => args.confirm_delete = ask,
         Action::ItemCount(show) => args.show_item_count = show,
         Action::Output => args.export = Some(value),
         Action::Input => args.import = Some(value),
@@ -1005,6 +1123,7 @@ mod tests {
                 &["-rx"],
                 Args {
                     read_only: 1,
+                    can_delete: false,
                     one_file_system: true,
                     ..d()
                 },
@@ -1048,6 +1167,7 @@ mod tests {
                 &["-r"],
                 Args {
                     read_only: 1,
+                    can_delete: false,
                     ..d()
                 },
             ),
@@ -1055,6 +1175,9 @@ mod tests {
                 &["-rr"],
                 Args {
                     read_only: 2,
+                    can_delete: false,
+                    can_shell: false,
+                    can_export: false,
                     ..d()
                 },
             ),
@@ -1062,6 +1185,9 @@ mod tests {
                 &["-r", "--read-only"],
                 Args {
                     read_only: 2,
+                    can_delete: false,
+                    can_shell: false,
+                    can_export: false,
                     ..d()
                 },
             ),
@@ -1113,6 +1239,7 @@ mod tests {
                     path: path("/tmp"),
                     show_item_count: true,
                     read_only: 1,
+                    can_delete: false,
                     one_file_system: true,
                     ..d()
                 },
@@ -1326,6 +1453,72 @@ mod tests {
                 },
             ),
             (&["-x", "--cross-file-system"], d()),
+            // The switches one by one, and set back.
+            (
+                &["--disable-delete"],
+                Args {
+                    can_delete: false,
+                    ..d()
+                },
+            ),
+            (&["--disable-delete", "--enable-delete"], d()),
+            (
+                &["--disable-shell"],
+                Args {
+                    can_shell: false,
+                    ..d()
+                },
+            ),
+            (&["--disable-shell", "--enable-shell"], d()),
+            (
+                &["--disable-refresh"],
+                Args {
+                    can_refresh: false,
+                    ..d()
+                },
+            ),
+            (&["--disable-refresh", "--enable-refresh"], d()),
+            // A later switch wins over `-r`, and `-r` over an earlier switch.
+            (
+                &["-r", "--enable-delete"],
+                Args {
+                    read_only: 1,
+                    ..d()
+                },
+            ),
+            (
+                &["--enable-delete", "-r"],
+                Args {
+                    read_only: 1,
+                    can_delete: false,
+                    ..d()
+                },
+            ),
+            (
+                &["-rr", "--enable-shell"],
+                Args {
+                    read_only: 2,
+                    can_delete: false,
+                    can_export: false,
+                    ..d()
+                },
+            ),
+            (
+                &["--confirm-quit"],
+                Args {
+                    confirm_quit: true,
+                    ..d()
+                },
+            ),
+            (&["--confirm-quit", "--no-confirm-quit"], d()),
+            (
+                &["--no-confirm-delete"],
+                Args {
+                    confirm_delete: false,
+                    ..d()
+                },
+            ),
+            (&["--no-confirm-delete", "--confirm-delete"], d()),
             (
                 &["--cross-file-system", "-x"],
                 Args {
