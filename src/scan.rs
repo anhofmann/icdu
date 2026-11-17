@@ -4,16 +4,15 @@
 //!  * **Streaming** — every directory we finish reading is published immediately as a
 //!    `Batch`, so the UI can render and aggregate partial results long before the whole
 //!    tree is walked.
-//!  * **SSD-friendly** — directory reads and `lstat` calls are the bottleneck, and they are
-//!    latency-bound rather than bandwidth-bound. We run many worker threads (defaulting to
-//!    `cores * 4`) so the kernel always has a deep queue of outstanding I/O. On flash this
-//!    overlaps thousands of tiny stat latencies; on a spinning disk it would thrash, which is
-//!    exactly the trade-off ncdu can't make because it is single-threaded.
+//!  * **Parallel** — directory reads and `lstat` calls are the bottleneck, and they are
+//!    mostly waiting for the storage. Many worker threads (four per core by default) keep
+//!    requests in flight at once. Flash storage and network filesystems answer many of them
+//!    at a time; a single spinning disk does not, and is better served by a small `-t`.
 //!
-//! Work is pulled from a shared **two-tier frontier**: a `hot` queue of jobs whose path lies
-//! under the directory the user is currently viewing, and a `cold` queue for everything else.
-//! Workers always drain `hot` first, so navigating into a directory makes its subtree finish
-//! scanning ahead of unrelated branches (see [`ScanControl::set_focus`]).
+//! Work is pulled from a shared frontier ([`Frontier`]) with three classes of queued
+//! directories: below a directory the user is waiting for, below the directory on screen,
+//! and the rest. Workers take from them in that order, so the part of the tree that is
+//! being looked at is finished ahead of the others (see [`ScanControl::set_priorities`]).
 //!
 //! Shutdown is tracked by a `pending` count (queued + in-flight jobs): when it reaches zero the
 //! frontier is marked `done` and all idle workers are woken to exit, which drops every event
@@ -518,8 +517,8 @@ pub fn check_identity(path: &Path, identity: Identity) -> Result<(), String> {
 
 type FrontierArc = Arc<(Mutex<Frontier>, Condvar)>;
 
-/// Default worker count. SSDs love a deep I/O queue, so we oversubscribe cores heavily;
-/// the work is almost entirely waiting on `readdir`/`lstat`, not CPU.
+/// Default worker count: four per core, at least 4 and at most 64. The work is almost
+/// entirely waiting on `readdir`/`lstat`, not CPU, so there are far more workers than cores.
 pub fn default_threads() -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())

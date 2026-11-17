@@ -37,7 +37,7 @@ fn version_line() -> String {
 
 fn print_help() {
     println!(
-        "icdu {} — interactive, SSD-optimized disk usage explorer (ncdu-compatible)
+        "icdu {} — disk usage you can browse and search while it scans (ncdu-compatible)
 
 USAGE:
     icdu [OPTIONS] [PATH]

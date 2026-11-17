@@ -1,28 +1,22 @@
 # icdu
 
-An [ncdu](https://dev.yorhel.nl/ncdu)-style interactive disk usage explorer, in Rust — with two
-differences that matter:
+A disk usage explorer for the terminal that you can use **while it is still scanning**, and
+that is compatible with [ncdu](https://dev.yorhel.nl/ncdu).
 
-1. **Interactive immediately.** It does *not* wait for the scan to finish. The UI opens at once
-   and you can browse, sort, and descend into directories while the scan is still running. Sizes
-   fill in and aggregate upward live.
-2. **Optimized for SSDs.** The scanner is a parallel work-stealing walker (default `cores × 4`
-   threads). Directory reads and `lstat` calls are latency-bound, not bandwidth-bound, so keeping
-   a deep queue of outstanding I/O lets flash storage overlap thousands of tiny stat latencies.
-   (This is the opposite of what you'd want on a spinning disk — and exactly the trade-off ncdu,
-   being single-threaded, can't make.)
-
-3. **Navigation steers the scan.** When you enter a directory, its subtree is *prioritized* —
-   the scanner finishes the branch you're looking at before unrelated ones, so the sizes you
-   care about fill in first. Moving around never holds the scan up, however much work is
-   queued.
-
-It is a **drop-in ncdu replacement**: the common ncdu flags work, and it reads and writes the
-ncdu JSON export format, so existing dumps and scripts keep working.
+- **Browse while it scans.** The list is on screen at once. Sizes fill in and add up as the
+  scan goes on, and the directory you enter is scanned next, so what you are looking at is
+  finished first. On a large filesystem there is no waiting in front of a progress display.
+- **Search the whole tree by name.** `/` finds entries anywhere below, largest first, as you
+  type, including what the scan has only just reached. Enter takes you there.
+- **Compatible with ncdu.** Its keys and command-line options work, its config files are
+  read, and its JSON dumps are read and written without loss.
 
 <p align="center">
-  <img src=".github/assets/screenshot.png" alt="icdu browsing a scanned directory" width="97%">
+  <img src=".github/assets/demo.svg" alt="icdu while a scan is running: the list fills in, a search finds a directory deep in the tree, and Enter jumps to it" width="97%">
 </p>
+
+<p align="center"><sub>Recorded on a sample tree with <code>tools/demo/record.sh</code>. The tree is small, so
+the scan was slowed down for the recording; everything on screen is what icdu drew.</sub></p>
 
 ## Install
 
@@ -635,7 +629,7 @@ RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
 
 | Module | Responsibility |
 |--------|----------------|
-| `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). Entries arrive in batches, a huge directory in several; excludes, one-filesystem. |
+| `scan.rs` | Parallel streaming scanner with a priority frontier (focused subtree first). Entries arrive in batches, a huge directory in several; excludes, one-filesystem. Reading directories is mostly waiting for the storage, so many threads read at once (four per core). That pays off on SSD and NVMe; on a spinning disk fewer are better, which is what `-t` is for. |
 | `model.rs` | The tree owned by the UI thread. Lean `Node` (`CompactString` names, derived own-size); grafts batches, propagates *counted* sizes up every ancestor, counts each hard-linked inode once, buffers out-of-order batches, tracks per-subtree "unscanned dirs" for the delete gate, and takes deleted subtrees out. |
 | `delete.rs` | Removal from disk, driven by the tree: a copy of the scanned subtree is walked on a worker thread, each entry checked against the scan (type, device, inode) before it is unlinked. Nothing the scan did not list is removed. |
 | `glob.rs` | The `--exclude` patterns: `fnmatch`-style, compiled once, matched against paths as ncdu does. |
@@ -657,7 +651,7 @@ buffered — verifying the concurrency and size-propagation logic.
 
 ## Status
 
-Implemented: live/progressive parallel scan, SSD-tuned threading, **navigation-prioritized
+Implemented: live/progressive parallel scan, **navigation-prioritized
 scanning**, sort, apparent/disk toggle, delete (background, with the still-scanning safety gate,
 `-r`, and a guarded Ctrl-C), hard-link dedup, `--exclude` / `-X`, `-x` one-file-system, ncdu JSON
 import/export, open (`o`, via the platform's default handler), help dialog, a memory-lean node
