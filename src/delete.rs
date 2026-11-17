@@ -289,6 +289,7 @@ mod tests {
             older_than: None,
             newer_than: None,
             extended: false,
+            exclude_caches: false,
         };
         let mut tree = Tree::new(
             root.to_string_lossy().into(),

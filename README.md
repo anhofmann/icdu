@@ -71,6 +71,8 @@ OPTIONS:
     -x, --one-file-system    do not cross filesystem boundaries
         --exclude PATTERN    exclude entries matching a glob (repeatable)
     -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
+        --exclude-caches, --include-caches
+                             leave out directories that have a CACHEDIR.TAG
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
@@ -338,6 +340,11 @@ leaves the rest on disk. Any other key disarms the prompt.
   `src`, and `/var/cache` exactly that directory. A `*` or `?` also matches a `/`: `build/*`
   excludes everything directly inside any `build` and leaves the directory itself.
   Excluded entries stay visible (marked `<`) but are not descended into and don't count.
+- `--exclude-caches` leaves out the directories that are tagged as caches: those with a
+  `CACHEDIR.TAG` file that begins with the signature of the
+  [Cache Directory Tagging Specification](https://bford.info/cachedir/), which cargo and many
+  other build tools and package managers write. They stay visible (marked `<`) and are neither
+  read nor counted. `--include-caches`, the default, turns it off again.
 - `-X FILE` reads one pattern per line. As in ncdu a line is taken as it stands: spaces belong
   to the pattern and a `#` does not start a comment. Empty lines are skipped.
 - `-x` keeps the scan on the root's filesystem; mount points on other devices are shown but not
