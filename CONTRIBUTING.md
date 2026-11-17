@@ -135,6 +135,22 @@ From then on the release workflow writes `Formula/icdu.rb` into the tap after ea
 Until then, or by hand: download `sha256sums.txt` of the release, run the script, and commit
 its output as `Formula/icdu.rb` in the tap.
 
+### The AUR package
+
+`tools/dist/aur-pkgbuild.sh VERSION sha256sums.txt` prints the PKGBUILD of `icdu-bin`, which
+installs the prebuilt static binary for x86_64 and aarch64 with the manual page and the
+licence. CI builds, checks (namcap) and installs it in an Arch Linux container on every
+change, from the archive that run built.
+
+Publishing needs an account on aur.archlinux.org with an SSH key, and is done by hand:
+
+```sh
+git clone ssh://aur@aur.archlinux.org/icdu-bin.git && cd icdu-bin
+/path/to/icdu/tools/dist/aur-pkgbuild.sh X.Y.Z sha256sums.txt > PKGBUILD
+makepkg --printsrcinfo > .SRCINFO      # on Arch Linux
+git add PKGBUILD .SRCINFO && git commit -m "icdu X.Y.Z" && git push
+```
+
 ## Security problems
 
 Not in a public issue, please: see `SECURITY.md`.

@@ -134,6 +134,43 @@ jobs:
           brew uninstall icdu
           test ! -e "$(brew --prefix)/bin/icdu"
 
+  # The AUR package icdu-bin: its PKGBUILD written for the archive this run built, then, in
+  # an Arch Linux container, built, checked with namcap, installed, used and removed.
+  aur:
+    name: AUR package
+    needs: dist
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: What the job needs besides the build tools
+        run: pacman -Syu --noconfirm --needed git namcap man-db
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+          path: release
+      - name: Build, check, install, use, remove
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          (cd release && sha256sum icdu-*.tar.gz > sha256sums.txt)
+          mkdir build
+          tools/dist/aur-pkgbuild.sh "$version" release/sha256sums.txt "file://$PWD/release" > build/PKGBUILD
+          cat build/PKGBUILD
+          # makepkg does not run as root.
+          useradd --create-home builder
+          chown -R builder build
+          cd build
+          su builder -c 'makepkg --printsrcinfo > .SRCINFO && cat .SRCINFO && makepkg --noconfirm'
+          # namcap reports and does not fail: an "E:" line is what fails here.
+          namcap PKGBUILD icdu-bin-*.pkg.tar.zst | tee namcap.txt
+          ! grep -q ' E: ' namcap.txt
+          pacman -U --noconfirm icdu-bin-*.pkg.tar.zst
+          test "$(icdu --version)" = "icdu $version"
+          man -w icdu
+          test -f /usr/share/licenses/icdu-bin/LICENSE
+          pacman -R --noconfirm icdu-bin
+          test ! -e /usr/bin/icdu
+
   # The oldest Rust that icdu promises to build with: `rust-version` in Cargo.toml.
   msrv:
     name: minimum Rust (${{ matrix.os }})
