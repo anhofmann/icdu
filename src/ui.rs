@@ -2,6 +2,9 @@
 //! bar, percentage of the parent, an optional item count, and a type indicator. Modal overlays (help, delete confirm)
 //! are drawn on top.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -17,19 +20,38 @@ use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
-/// Human-readable size: powers of 1024, like ncdu.
+/// Whether sizes are written in powers of 1000 (`--si`). Set once at startup: it is a
+/// preference for every size on screen, not something that differs from place to place.
+static SI: AtomicBool = AtomicBool::new(false);
+
+pub fn set_si(si: bool) {
+    SI.store(si, Ordering::Relaxed);
+}
+
+/// Human-readable size in ncdu's units: powers of 1024 (KiB, MiB), or with `--si` powers of
+/// 1000 (kB, MB).
 pub fn fmt_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["  B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    fmt_size_in(bytes, SI.load(Ordering::Relaxed))
+}
+
+fn fmt_size_in(bytes: u64, si: bool) -> String {
+    const BINARY: [&str; 7] = ["  B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    const DECIMAL: [&str; 7] = [" B", "kB", "MB", "GB", "TB", "PB", "EB"];
+    let (step, units) = if si {
+        (1000.0, DECIMAL)
+    } else {
+        (1024.0, BINARY)
+    };
     let mut v = bytes as f64;
     let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
+    while v >= step && u < units.len() - 1 {
+        v /= step;
         u += 1;
     }
     if u == 0 {
-        format!("{:>6} {}", bytes, UNITS[u])
+        format!("{:>6} {}", bytes, units[u])
     } else {
-        format!("{:>6.1} {}", v, UNITS[u])
+        format!("{:>6.1} {}", v, units[u])
     }
 }
 
@@ -138,6 +160,18 @@ pub fn render(f: &mut Frame, app: &App) {
         Modal::Info(rows) => render_info(f, rows),
         Modal::Find(find) => render_find(f, app, find),
         Modal::None => {}
+    }
+    if !app.color {
+        strip_colors(f.buffer_mut());
+    }
+}
+
+/// `--color off`: take the colours out of what was drawn. Reverse video, bold and dim are
+/// not colours and stay, so the highlighted row is still the highlighted row.
+fn strip_colors(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
     }
 }
 
@@ -1236,11 +1270,11 @@ fn render_confirm_export(f: &mut Frame, app: &App) {
 mod tests {
     use super::{
         bar, bar_scale, confirm_export_text, dir_label, display_width, find_empty_message,
-        find_rows, find_title, fmt_count, fmt_items, followed_note, footer_split, hard_link_note,
-        help_layout, help_scroll_hint, hidden_title, item_cell, left_to_read, list_title,
-        listing_state, mtime_cell, scan_progress, size_cell, sort_label, truncate_left, GraphStyle,
-        HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH, ITEMS_WIDTH,
-        MTIME_WIDTH,
+        find_rows, find_title, fmt_count, fmt_items, fmt_size_in, followed_note, footer_split,
+        hard_link_note, help_layout, help_scroll_hint, hidden_title, item_cell, left_to_read,
+        list_title, listing_state, mtime_cell, scan_progress, size_cell, sort_label, truncate_left,
+        GraphStyle, HelpLayout, Listing, HELP_COLUMN_WIDTH, HELP_FLAGS, HELP_KEYS, HELP_KEY_WIDTH,
+        ITEMS_WIDTH, MTIME_WIDTH,
     };
     use crate::app::{Sort, SortColumn};
     use crate::model::{Excluded, NodeKind, Tree};
@@ -1408,6 +1442,108 @@ mod tests {
             list_title(Listing::Unreadable, 3),
             " 3 items · could not be read completely "
         );
+    }
+
+    /// Sizes in ncdu's units: powers of 1024 with the binary names, and with `--si` powers
+    /// of 1000 with the decimal ones. Every size is as wide as every other of its kind.
+    #[test]
+    fn sizes_come_in_binary_or_decimal_units() {
+        let binary = |bytes| fmt_size_in(bytes, false);
+        let decimal = |bytes| fmt_size_in(bytes, true);
+        assert_eq!(binary(0), "     0   B");
+        assert_eq!(binary(1023), "  1023   B");
+        assert_eq!(binary(1024), "   1.0 KiB");
+        assert_eq!(binary(1536), "   1.5 KiB");
+        assert_eq!(binary(1 << 20), "   1.0 MiB");
+        assert_eq!(binary(5 << 30), "   5.0 GiB");
+        assert_eq!(binary(1 << 40), "   1.0 TiB");
+        assert_eq!(binary(1 << 50), "   1.0 PiB");
+        assert_eq!(binary(1 << 60), "   1.0 EiB");
+        assert_eq!(binary(u64::MAX), "  16.0 EiB");
+
+        assert_eq!(decimal(0), "     0  B");
+        assert_eq!(decimal(999), "   999  B");
+        assert_eq!(decimal(1000), "   1.0 kB");
+        assert_eq!(decimal(1024), "   1.0 kB");
+        assert_eq!(decimal(1500), "   1.5 kB");
+        assert_eq!(decimal(1_000_000), "   1.0 MB");
+        assert_eq!(decimal(5_000_000_000), "   5.0 GB");
+        assert_eq!(decimal(1_000_000_000_000), "   1.0 TB");
+        assert_eq!(decimal(1_000_000_000_000_000), "   1.0 PB");
+        assert_eq!(decimal(u64::MAX), "  18.4 EB");
+
+        for bytes in [
+            0,
+            1,
+            999,
+            1000,
+            1023,
+            1024,
+            123_456_789,
+            u64::MAX / 3,
+            u64::MAX,
+        ] {
+            assert_eq!(binary(bytes).chars().count(), 10, "{bytes}");
+            assert_eq!(decimal(bytes).chars().count(), 9, "{bytes}");
+        }
+    }
+
+    /// `--color off`: what is drawn has no colour in it, and is otherwise the same screen,
+    /// with the highlighted row still told apart by reverse video.
+    #[test]
+    fn color_off_draws_the_same_screen_without_colours() {
+        use crate::app::App;
+        use ratatui::style::{Color, Modifier};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut t = Tree::new_imported("/r".into(), 0, 0, 1, 1);
+        for (name, kind, excluded) in [
+            ("dir", NodeKind::Dir, Excluded::No),
+            ("file", NodeKind::File, Excluded::No),
+            ("link", NodeKind::Link, Excluded::No),
+            ("skipped", NodeKind::Dir, Excluded::Pattern),
+        ] {
+            t.import_child(
+                0,
+                name.into(),
+                kind,
+                1000,
+                1000,
+                1,
+                1,
+                false,
+                false,
+                excluded,
+                false,
+            );
+        }
+        let mut app = App::new(t, true, false, false);
+        app.settle_selection();
+        let draw = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal.draw(|f| super::render(f, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let in_colour = draw(&app);
+        assert!(in_colour.content.iter().any(|cell| cell.fg != Color::Reset));
+
+        app.color = false;
+        let plain = draw(&app);
+        assert!(plain
+            .content
+            .iter()
+            .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+        let text = |buffer: &ratatui::buffer::Buffer| -> String {
+            buffer.content.iter().map(|cell| cell.symbol()).collect()
+        };
+        assert_eq!(text(&plain), text(&in_colour));
+        assert!(text(&plain).contains("skipped"));
+        let highlighted = |buffer: &ratatui::buffer::Buffer| {
+            let reversed =
+                |cell: &&ratatui::buffer::Cell| cell.modifier.contains(Modifier::REVERSED);
+            buffer.content.iter().filter(reversed).count()
+        };
+        assert!(highlighted(&plain) > 0);
+        assert_eq!(highlighted(&plain), highlighted(&in_colour));
     }
 
     /// A size that is still growing is marked, in the same width as one that is final.

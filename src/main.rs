@@ -89,6 +89,9 @@ fn main() {
         }
     };
 
+    // Every size that is printed from here on is in the units asked for.
+    ui::set_si(args.si);
+
     // --- Export mode: produce a tree (by import or scan), write JSON, exit. No UI. ---
     if let Some(dest) = args.export.clone() {
         let tree = if let Some(src) = &args.import {
@@ -139,6 +142,13 @@ fn main() {
 
 /// What the command line says about how the list looks: its columns and its order.
 fn apply_view_options(app: &mut App, args: &Args) {
+    // Colours are on unless NO_COLOR says otherwise (https://no-color.org) or --color does.
+    // Asked for by name, they win over NO_COLOR, which the terminal library obeys by itself.
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    app.color = args.color.unwrap_or(!no_color);
+    if args.color == Some(true) {
+        ratatui::crossterm::style::force_color_output(true);
+    }
     app.show_item_count = args.show_item_count;
     app.show_mtime = args.show_mtime;
     app.show_hidden = args.show_hidden;

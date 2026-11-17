@@ -68,8 +68,10 @@ ARGS:
 
 OPTIONS:
     -t, --threads N          scanner threads (default: cores*4)
-    -a, --apparent-size      show apparent size instead of on-disk usage
-    -x, --one-file-system    do not cross filesystem boundaries
+    -a, --apparent-size, --disk-usage
+                             show apparent sizes, or disk usage (default)
+    -x, --one-file-system, --cross-file-system
+                             stay on one filesystem, or cross (default)
         --exclude PATTERN    exclude entries matching a glob (repeatable)
     -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
         --exclude-caches, --include-caches
@@ -81,6 +83,8 @@ OPTIONS:
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
+        --si, --no-si        sizes in powers of 1000 (kB, MB), or of 1024
+        --color SCHEME       off, dark or dark-bg (off if NO_COLOR is set)
         --show-hidden, --hide-hidden
                              list dot files and excluded entries, or not
         --show-graph, --hide-graph
@@ -118,7 +122,12 @@ every two seconds while scanning, which helps over a slow remote connection.
 
 Options are written as in ncdu: short flags can be bundled, and a value can be attached to its
 flag or follow it (`-xo-`, `-o file`, `--exclude=tmp`, `--exclude tmp`). `--` ends the options.
-Of two options that contradict each other the later one wins. A usage error exits with status 1.
+Of two options that contradict each other the later one wins, and every option that switches
+something has a counterpart that switches it back (`--apparent-size` / `--disk-usage`, `-x` /
+`--cross-file-system`, `-e` / `--no-extended` and so on). A usage error exits with status 1.
+
+`-t` sets the number of scanner threads. It defaults to four per core (at least 4, at most
+64); ncdu 2 uses one unless told otherwise.
 
 Examples:
 
@@ -275,6 +284,16 @@ below.
 ncdu 2 has one more column, for the size a directory shares with others through hard links
 (`u`, `--shared-column`). icdu does not have it yet. The flag is accepted and ignored, so that
 a command line written for ncdu runs, and the key says that the column is missing.
+
+### Units and colours
+
+Sizes are in powers of 1024 with the binary names (KiB, MiB, GiB). `--si` writes them in powers
+of 1000 (kB, MB, GB), everywhere: list, header, popups and the footer.
+
+Colours are on unless the environment variable `NO_COLOR` is set. `--color off` turns them
+off, and `--color dark` or `--color dark-bg` turns them on whatever `NO_COLOR` says. (Those are
+ncdu's two colour schemes; icdu has one and takes both names for it.) Without colours the
+highlighted row is still in reverse video, and directories are still bold.
 
 ### Hidden entries
 
@@ -453,7 +472,8 @@ hard-linked files survive an import and a re-export, and a hard link that was ex
 the one whose size is counted. Only format version 1 is read. ncdu 2.6 and later can also write
 zstd-compressed dumps and a binary export; icdu reads neither, nor a gzip-compressed dump, and
 says how to feed it one (`zstd -dc FILE | icdu -f -`, `zcat FILE | icdu -f -`,
-`ncdu -f FILE -o - | icdu -f -`).
+`ncdu -f FILE -o - | icdu -f -`). It writes neither as well: the flags for them (`-O`, `-c`,
+`--compress`, `--compress-level`, `--export-block-size`) are refused with that explanation.
 
 A dump is parsed while it is read: memory use is that of the resulting tree, whatever the size
 of the file, and directories can be nested to any depth. Fields icdu does not know are skipped.

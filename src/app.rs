@@ -566,6 +566,8 @@ pub struct App {
     pub disk_usage: bool,
     /// Show the item count column (`c`, `--show-itemcount`): entries below each directory.
     pub show_item_count: bool,
+    /// Draw in colour (`--color`). Off, only reverse video, bold and dim set things apart.
+    pub color: bool,
     /// List hidden entries too (`e`, `--show-hidden`): those whose name starts with a dot,
     /// and excluded ones. Hiding them changes what is listed, never a size.
     pub show_hidden: bool,
@@ -663,6 +665,7 @@ impl App {
             },
             disk_usage,
             show_item_count: false,
+            color: true,
             show_hidden: true,
             show_graph: true,
             show_percent: true,

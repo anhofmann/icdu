@@ -31,6 +31,11 @@ pub struct Args {
     pub exclude_kernfs: bool,
     /// `-L`: count a symlink to a file as that file.
     pub follow_symlinks: bool,
+    /// `--si`: sizes in powers of 1000 (kB, MB) instead of 1024 (KiB, MiB).
+    pub si: bool,
+    /// `--color`: `off` is `Some(false)`, `dark` and `dark-bg` are `Some(true)`. Without
+    /// the flag colours are on unless `NO_COLOR` is set.
+    pub color: Option<bool>,
     /// `--hide-hidden` starts without dot files and excluded entries in the list.
     pub show_hidden: bool,
     /// `--hide-graph` turns the size bar off.
@@ -79,6 +84,8 @@ impl Default for Args {
             exclude_caches: false,
             exclude_kernfs: false,
             follow_symlinks: false,
+            si: false,
+            color: None,
             show_hidden: true,
             show_graph: true,
             show_percent: true,
@@ -146,8 +153,8 @@ enum Action {
     Help,
     Version,
     Threads,
-    Apparent,
-    OneFileSystem,
+    Apparent(bool),
+    OneFileSystem(bool),
     Exclude,
     ExcludeFrom,
     OlderThan,
@@ -163,6 +170,10 @@ enum Action {
     Caches(bool),
     Kernfs(bool),
     FollowSymlinks(bool),
+    Si(bool),
+    Color,
+    /// A flag of ncdu's that icdu knows and deliberately does not have: the reason.
+    Unsupported(&'static str),
     Hidden(bool),
     Graph(bool),
     Percent(bool),
@@ -215,20 +226,40 @@ pub const FLAGS: &[Flag] = &[
         "scanner threads (default: cores*4)",
         Action::Threads,
     ),
-    flag(
-        &['a'],
-        &["apparent-size", "apparent"],
-        None,
-        "show apparent size instead of on-disk usage",
-        Action::Apparent,
-    ),
-    flag(
-        &['x'],
-        &["one-file-system"],
-        None,
-        "do not cross filesystem boundaries",
-        Action::OneFileSystem,
-    ),
+    Flag {
+        negation: Some("disk-usage"),
+        ..flag(
+            &['a'],
+            &["apparent-size", "apparent"],
+            None,
+            "show apparent sizes, or disk usage (default)",
+            Action::Apparent(true),
+        )
+    },
+    Flag {
+        negation: Some("apparent-size"),
+        ..flag(&[], &["disk-usage"], None, "", Action::Apparent(false))
+    },
+    Flag {
+        negation: Some("cross-file-system"),
+        ..flag(
+            &['x'],
+            &["one-file-system"],
+            None,
+            "stay on one filesystem, or cross (default)",
+            Action::OneFileSystem(true),
+        )
+    },
+    Flag {
+        negation: Some("one-file-system"),
+        ..flag(
+            &[],
+            &["cross-file-system"],
+            None,
+            "",
+            Action::OneFileSystem(false),
+        )
+    },
     flag(
         &[],
         &["exclude"],
@@ -311,6 +342,27 @@ pub const FLAGS: &[Flag] = &[
         None,
         "disable the delete feature",
         Action::ReadOnly,
+    ),
+    Flag {
+        negation: Some("no-si"),
+        ..flag(
+            &[],
+            &["si"],
+            None,
+            "sizes in powers of 1000 (kB, MB), or of 1024",
+            Action::Si(true),
+        )
+    },
+    Flag {
+        negation: Some("si"),
+        ..flag(&[], &["no-si"], None, "", Action::Si(false))
+    },
+    flag(
+        &[],
+        &["color"],
+        Some("SCHEME"),
+        "off, dark or dark-bg (off if NO_COLOR is set)",
+        Action::Color,
     ),
     Flag {
         negation: Some("hide-hidden"),
@@ -502,6 +554,43 @@ pub const FLAGS: &[Flag] = &[
         negation: Some("show-mtime"),
         ..flag(&[], &["hide-mtime"], None, "", Action::Mtime(false))
     },
+    // ncdu 2's binary export and its compression are outside of what icdu does. These are
+    // known, so that the answer is better than "unknown option", and not in the help.
+    flag(
+        &['O'],
+        &[],
+        Some("FILE"),
+        "",
+        Action::Unsupported("there is no binary export; -o FILE writes JSON"),
+    ),
+    flag(
+        &['c'],
+        &["compress"],
+        None,
+        "",
+        Action::Unsupported(COMPRESS),
+    ),
+    flag(
+        &[],
+        &["no-compress"],
+        None,
+        "",
+        Action::Unsupported(COMPRESS),
+    ),
+    flag(
+        &[],
+        &["compress-level"],
+        Some("NUM"),
+        "",
+        Action::Unsupported(COMPRESS),
+    ),
+    flag(
+        &[],
+        &["export-block-size"],
+        Some("KIB"),
+        "",
+        Action::Unsupported("it belongs to the binary export, which there is none of"),
+    ),
     flag(&['h'], &["help"], None, "show this help", Action::Help),
     flag(
         &['V', 'v'],
@@ -511,6 +600,10 @@ pub const FLAGS: &[Flag] = &[
         Action::Version,
     ),
 ];
+
+/// Why the compression flags of ncdu 2 are refused.
+const COMPRESS: &str = "dumps are written uncompressed; pipe one through zstd or gzip \
+                        (icdu -o- DIR | zstd > FILE)";
 
 /// The value of `--sort`: one of ncdu's column names, with `-asc` or `-desc` after it if the
 /// direction is to differ from the column's own (names from a to z, the rest downwards).
@@ -634,8 +727,18 @@ fn apply(
                 .map_err(|_| format!("{shown} must be a number, not '{value}'"))?
                 .max(1);
         }
-        Action::Apparent => args.disk_usage = false,
-        Action::OneFileSystem => args.one_file_system = true,
+        Action::Apparent(apparent) => args.disk_usage = !apparent,
+        Action::OneFileSystem(one) => args.one_file_system = one,
+        Action::Si(si) => args.si = si,
+        Action::Color => {
+            args.color = Some(match value.as_str() {
+                "off" => false,
+                // ncdu's two colour schemes. icdu has one.
+                "dark" | "dark-bg" => true,
+                _ => return Err(format!("unknown --color: {value} (off, dark or dark-bg)")),
+            })
+        }
+        Action::Unsupported(why) => return Err(format!("{shown} is not supported by icdu: {why}")),
         Action::Exclude => args.excludes.push(value),
         Action::ExcludeFrom => {
             let content = std::fs::read_to_string(&value).map_err(|e| format!("{value}: {e}"))?;
@@ -1190,6 +1293,46 @@ mod tests {
                 },
             ),
             (&["--hide-hidden", "--show-hidden"], d()),
+            (&["--si"], Args { si: true, ..d() }),
+            (&["--si", "--no-si"], d()),
+            (
+                &["--color", "off"],
+                Args {
+                    color: Some(false),
+                    ..d()
+                },
+            ),
+            (
+                &["--color=dark"],
+                Args {
+                    color: Some(true),
+                    ..d()
+                },
+            ),
+            (
+                &["--color=off", "--color", "dark-bg"],
+                Args {
+                    color: Some(true),
+                    ..d()
+                },
+            ),
+            // The counterparts switch a setting back, whichever comes last.
+            (&["-a", "--disk-usage"], d()),
+            (
+                &["--disk-usage", "--apparent-size"],
+                Args {
+                    disk_usage: false,
+                    ..d()
+                },
+            ),
+            (&["-x", "--cross-file-system"], d()),
+            (
+                &["--cross-file-system", "-x"],
+                Args {
+                    one_file_system: true,
+                    ..d()
+                },
+            ),
             (
                 &["--hide-percent", "--hide-graph"],
                 Args {
@@ -1348,6 +1491,34 @@ mod tests {
     fn errors_name_the_argument() {
         let table: &[(&[&str], &str)] = &[
             (&["--no-such"], "unknown option: --no-such"),
+            // Flags of ncdu's that icdu knows and does not have say so, and why.
+            (
+                &["-O", "dump.bin"],
+                "-O is not supported by icdu: there is no binary export; -o FILE writes JSON",
+            ),
+            (
+                &["-c"],
+                "-c is not supported by icdu: dumps are written uncompressed; pipe one \
+                 through zstd or gzip (icdu -o- DIR | zstd > FILE)",
+            ),
+            (
+                &["--compress-level=9"],
+                "--compress-level is not supported by icdu: dumps are written uncompressed; \
+                 pipe one through zstd or gzip (icdu -o- DIR | zstd > FILE)",
+            ),
+            (
+                &["--export-block-size", "64"],
+                "--export-block-size is not supported by icdu: it belongs to the binary \
+                 export, which there is none of",
+            ),
+            (
+                &["--color", "blue"],
+                "unknown --color: blue (off, dark or dark-bg)",
+            ),
+            (
+                &["--graph-style", "dots"],
+                "unknown --graph-style: dots (hash, half-block or eighth-block)",
+            ),
             (&["--no-such=1"], "unknown option: --no-such"),
             (&["-Z"], "unknown option: -Z"),
             (&["-xZ"], "unknown option -Z in -xZ"),
