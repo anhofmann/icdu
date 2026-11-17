@@ -13,7 +13,7 @@ keywords = ["ncdu", "disk-usage", "du", "tui", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 # The crate is the program and what its tests read. Not the notes for contributors, the
 # install script, the workflows or the tools for the README's recording.
-include = ["/src", "/fixtures", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
+include = ["/src", "/build.rs", "/fixtures", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 
 # Where `cargo binstall icdu` finds the release archives, and the binary inside one.
 [package.metadata.binstall]

@@ -2532,15 +2532,7 @@ fn opener_command(path: &Path) -> Command {
     cmd
 }
 
-#[cfg(target_os = "windows")]
-fn opener_command(path: &Path) -> Command {
-    // `start` treats its first quoted argument as the window title, so pass an empty one.
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "start", ""]).arg(path);
-    cmd
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(target_os = "macos"))]
 fn opener_command(path: &Path) -> Command {
     let mut cmd = Command::new("xdg-open");
     cmd.arg(path);
