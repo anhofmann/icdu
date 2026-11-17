@@ -177,7 +177,7 @@ icdu -f old.json -o new.json    # re-read and rewrite a dump (recomputes totals/
 | `i` | show details of the selected entry |
 | `E` | export the tree to an ncdu-format JSON file |
 | `x` | jump to the next read-error entry (`!` marker), wrapping around; the footer shows the reason |
-| `b` | spawn `$SHELL` in the current directory |
+| `b` | spawn a shell in the current directory |
 | `o` | open selected entry (default app; directories in the file manager) |
 | `?` | show the help dialog (it scrolls with `j` / `k` when the terminal is too small for it) |
 | `q` | quit |
@@ -219,10 +219,15 @@ the whole tree. A status message shares the line with this progress and does not
 
 ### Shelling out
 
-Press `b` to suspend the TUI and run `$SHELL` interactively in the directory you are viewing
+Press `b` to suspend the TUI and run a shell interactively in the directory you are viewing
 (as ncdu does) — find it here, fix it there, `exit` to come straight back into icdu. The scan keeps running in the
 background while you're away, up to a limit on what it queues for the display, and carries on
 when you return.
+
+Which shell is decided as in ncdu: the command in `NCDU_SHELL` if that is set (any command
+line, run by `/bin/sh -c`, for example `NCDU_SHELL='vifm .'`), otherwise `$SHELL`, otherwise
+`/bin/sh`. The shell gets `NCDU_LEVEL` in its environment, 1 or one more than icdu itself was
+started with, so a prompt can show that it runs inside icdu.
 
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
 Symlinks are never followed (counted as the link itself), matching ncdu's default.

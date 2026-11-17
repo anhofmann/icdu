@@ -527,19 +527,67 @@ fn run(
     }
 }
 
-/// Suspend the TUI, run `$SHELL` interactively in `dir`, and rebuild the UI when it exits.
+/// What the shell key runs.
+#[derive(Debug, PartialEq, Eq)]
+enum Shell {
+    /// `NCDU_SHELL`: a command line, given to `/bin/sh -c`. It may be any command with
+    /// arguments (`NCDU_SHELL='vifm .'`), as in ncdu.
+    Line(String),
+    /// `SHELL`, or `/bin/sh` if there is none: a program, started as it is.
+    Program(String),
+}
+
+/// Which shell to start, and the value of `NCDU_LEVEL` for it, from the three environment
+/// variables that decide it. As in ncdu: `NCDU_SHELL` before `SHELL` before `/bin/sh`, and a
+/// level one above the one icdu itself was started with, so that a prompt can show that the
+/// shell runs inside icdu (or ncdu), and how deep. A variable that is empty counts as unset.
+fn shell_to_run(
+    ncdu_shell: Option<&str>,
+    shell: Option<&str>,
+    level: Option<&str>,
+) -> (Shell, u32) {
+    let set = |value: Option<&str>| value.filter(|v| !v.is_empty()).map(str::to_string);
+    let run = match (set(ncdu_shell), set(shell)) {
+        (Some(line), _) => Shell::Line(line),
+        (None, Some(program)) => Shell::Program(program),
+        (None, None) => Shell::Program("/bin/sh".to_string()),
+    };
+    // Anything that is not a number counts as no level, like `atoi` in ncdu.
+    let outer = level
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    (run, outer.saturating_add(1))
+}
+
+/// Suspend the TUI, run a shell interactively in `dir`, and rebuild the UI when it exits.
 /// Returns a status line describing the outcome. This is the documented ratatui pattern for
 /// handing the terminal to a child process; the child gets the real tty, keystrokes and all.
 fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<String> {
-    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
-    let Some(shell) = shell else {
-        return Some("no SHELL set — cannot spawn a shell".into());
+    let var = |name: &str| std::env::var(name).ok();
+    let (shell, level) = shell_to_run(
+        var("NCDU_SHELL").as_deref(),
+        var("SHELL").as_deref(),
+        var("NCDU_LEVEL").as_deref(),
+    );
+    let mut command = match &shell {
+        Shell::Line(line) => {
+            let mut sh = Command::new("/bin/sh");
+            sh.arg("-c").arg(line);
+            sh
+        }
+        Shell::Program(program) => Command::new(program),
     };
+    command
+        .current_dir(dir)
+        .env("NCDU_LEVEL", level.to_string());
     restore_terminal();
-    let outcome = match Command::new(&shell).current_dir(dir).status() {
+    let outcome = match command.status() {
         Ok(status) if status.success() => format!("shell exited (was in {})", dir.display()),
         Ok(status) => format!("shell exited with {status}"),
-        Err(e) => format!("shell failed: {e}"),
+        Err(e) => match shell {
+            Shell::Line(_) => format!("shell failed: /bin/sh: {e}"),
+            Shell::Program(program) => format!("shell failed: {program}: {e}"),
+        },
     };
     *terminal = init_terminal();
     Some(outcome)
@@ -666,7 +714,10 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{decode_key, draw_due, page_rows, plain_path, progress_line, version_line};
+    use super::{
+        decode_key, draw_due, page_rows, plain_path, progress_line, shell_to_run, version_line,
+        Shell,
+    };
     use crate::app::{InputMode, KeyAction};
 
     #[test]
@@ -976,6 +1027,43 @@ mod tests {
         // what to do with it.
         assert_eq!(key('s', InputMode::Confirm), Some(KeyAction::SortBySize));
         assert_eq!(key('q', InputMode::Confirm), Some(KeyAction::Quit));
+    }
+
+    /// The shell key: `NCDU_SHELL` before `SHELL` before `/bin/sh`, and a level one deeper
+    /// than our own.
+    #[test]
+    fn shell_to_run_follows_ncdus_order() {
+        let program = |p: &str| Shell::Program(p.to_string());
+        let line = |l: &str| Shell::Line(l.to_string());
+        assert_eq!(shell_to_run(None, None, None), (program("/bin/sh"), 1));
+        assert_eq!(
+            shell_to_run(None, Some("/usr/bin/fish"), None),
+            (program("/usr/bin/fish"), 1)
+        );
+        // `NCDU_SHELL` is a command line, and wins.
+        assert_eq!(
+            shell_to_run(Some("vifm ."), Some("/usr/bin/fish"), None),
+            (line("vifm ."), 1)
+        );
+        assert_eq!(
+            shell_to_run(Some("echo hi; read x"), None, Some("1")),
+            (line("echo hi; read x"), 2)
+        );
+        // Empty is unset.
+        assert_eq!(
+            shell_to_run(Some(""), Some("/bin/zsh"), Some("")),
+            (program("/bin/zsh"), 1)
+        );
+        assert_eq!(
+            shell_to_run(Some(""), Some(""), None),
+            (program("/bin/sh"), 1)
+        );
+        // The level counts up from whatever number is there, and from nothing otherwise.
+        assert_eq!(shell_to_run(None, None, Some("2")).1, 3);
+        assert_eq!(shell_to_run(None, None, Some(" 7 ")).1, 8);
+        assert_eq!(shell_to_run(None, None, Some("deep")).1, 1);
+        assert_eq!(shell_to_run(None, None, Some("-3")).1, 1);
+        assert_eq!(shell_to_run(None, None, Some("4294967295")).1, u32::MAX);
     }
 
     /// In the search, a modified letter never reaches the query. Ctrl-U, Ctrl-W and Ctrl-H
