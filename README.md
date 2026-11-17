@@ -73,6 +73,8 @@ OPTIONS:
     -X, --exclude-from FILE  read exclude patterns from FILE (one per line)
         --exclude-caches, --include-caches
                              leave out directories that have a CACHEDIR.TAG
+        --exclude-kernfs, --include-kernfs
+                             leave out Linux pseudo filesystems (/proc, /sys)
         --older-than DUR     exclude entries older than DUR (e.g. 30d, 2w, 1y)
         --newer-than DUR     exclude entries newer than DUR
     -r, --read-only          disable the delete feature
@@ -345,6 +347,13 @@ leaves the rest on disk. Any other key disarms the prompt.
   [Cache Directory Tagging Specification](https://bford.info/cachedir/), which cargo and many
   other build tools and package managers write. They stay visible (marked `<`) and are neither
   read nor counted. `--include-caches`, the default, turns it off again.
+- `--exclude-kernfs` leaves out the Linux kernel's pseudo filesystems wherever they are
+  mounted: `proc`, `sysfs`, `cgroup`, `cgroup2`, `debugfs`, `tracefs`, `devpts`, `securityfs`,
+  `pstore`, `bpf`, `binfmt_misc` and `selinuxfs`, the same list as ncdu's. Their directories
+  are shown (`<kernel filesystem>`) but not entered, so `icdu --exclude-kernfs /` is not
+  thrown off by `/proc/kcore` or slowed down by `/sys`. Which devices those are is read from
+  `/proc/self/mountinfo` when the scan starts. On macOS the option is accepted and does
+  nothing. `--include-kernfs`, the default, turns it off again.
 - `-X FILE` reads one pattern per line. As in ncdu a line is taken as it stands: spaces belong
   to the pattern and a `#` does not start a comment. Empty lines are skipped.
 - `-x` keeps the scan on the root's filesystem; mount points on other devices are shown but not

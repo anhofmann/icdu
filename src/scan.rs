@@ -19,7 +19,7 @@
 //! frontier is marked `done` and all idle workers are woken to exit, which drops every event
 //! `Sender` and disconnects the channel — the UI's signal that the scan is complete.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -427,6 +427,8 @@ pub struct Opts {
     pub extended: bool,
     /// Leave out directories tagged as caches (ncdu `--exclude-caches`).
     pub exclude_caches: bool,
+    /// Leave out Linux pseudo filesystems (ncdu `--exclude-kernfs`). No effect elsewhere.
+    pub exclude_kernfs: bool,
 }
 
 /// State shared by workers only (NOT the UI), so it holds the event `Sender`.
@@ -447,6 +449,9 @@ struct Shared {
     extended: bool,
     /// Do not enter directories that have a valid `CACHEDIR.TAG`.
     exclude_caches: bool,
+    /// The devices of the kernel filesystems mounted when the scan started, if those are to
+    /// be left out; empty otherwise.
+    kernfs: HashSet<u64>,
     /// A rescan's starting directory: its job id and what it must still be when it is read.
     start_check: Option<(u64, Identity)>,
     /// The id of the directory the scan starts at.
@@ -568,6 +573,11 @@ fn start_limited(
         newer_than: opts.newer_than,
         extended: opts.extended,
         exclude_caches: opts.exclude_caches,
+        kernfs: if opts.exclude_kernfs {
+            mounted_kernfs()
+        } else {
+            HashSet::new()
+        },
         start_check: identity.map(|identity| (id_base, identity)),
         start_id: id_base,
     });
@@ -739,6 +749,8 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
         } else if shared.one_file_system && matches!(kind, NodeKind::Dir) && dev != shared.root_dev
         {
             excluded = Excluded::OtherFs;
+        } else if matches!(kind, NodeKind::Dir) && shared.kernfs.contains(&dev) {
+            excluded = Excluded::Kernfs;
         } else if shared.exclude_caches && matches!(kind, NodeKind::Dir) && has_cachedir_tag(&path)
         {
             // The dump format has no reason of its own for this; ncdu writes `pattern` too.
@@ -788,6 +800,76 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     // The last (usually the only) batch says that the directory has been read.
     send(nodes, exts, listing.error, false);
     enqueue(frontier, child_jobs);
+}
+
+/// The filesystems that are a view into the kernel and not storage: ncdu's list for
+/// `--exclude-kernfs`, by the names the kernel gives them in the mount table.
+#[cfg(any(target_os = "linux", test))]
+const KERNFS_TYPES: &[&str] = &[
+    "binfmt_misc",
+    "bpf",
+    "cgroup",
+    "cgroup2",
+    "debugfs",
+    "devpts",
+    "proc",
+    "pstore",
+    "securityfs",
+    "selinuxfs",
+    "sysfs",
+    "tracefs",
+];
+
+/// The device numbers of the kernel filesystems in a mount table of the form of
+/// `/proc/self/mountinfo`:
+///
+/// ```text
+/// 23 30 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+/// ```
+///
+/// The third field is the device (`major:minor`), and the filesystem type is the first
+/// field after the lone dash. Lines that do not look like that are passed over.
+///
+/// ncdu asks the kernel about every directory instead (`statfs`), which `std` cannot do.
+/// A directory is on one of these filesystems exactly if it has one of these devices, so the
+/// scanner, which knows every entry's device anyway, only has to look it up here.
+#[cfg(any(target_os = "linux", test))]
+fn kernfs_devices(mountinfo: &str) -> HashSet<u64> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (mount, filesystem) = line.split_once(" - ")?;
+            let fstype = filesystem.split(' ').next()?;
+            if !KERNFS_TYPES.contains(&fstype) {
+                return None;
+            }
+            let (major, minor) = mount.split(' ').nth(2)?.split_once(':')?;
+            Some(makedev(major.parse().ok()?, minor.parse().ok()?))
+        })
+        .collect()
+}
+
+/// A device number as `st_dev` has it on Linux, from its two parts.
+#[cfg(any(target_os = "linux", test))]
+fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xffff_f000) << 32)
+        | ((major & 0x0000_0fff) << 8)
+        | ((minor & 0xffff_ff00) << 12)
+        | (minor & 0x0000_00ff)
+}
+
+/// The devices of the kernel filesystems that are mounted right now. Empty where there is no
+/// mount table to read: on other systems than Linux, and without `/proc`.
+#[cfg(target_os = "linux")]
+fn mounted_kernfs() -> HashSet<u64> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|table| kernfs_devices(&table))
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mounted_kernfs() -> HashSet<u64> {
+    HashSet::new()
 }
 
 /// How a `CACHEDIR.TAG` has to begin to mark its directory as a cache, by the Cache Directory
@@ -860,8 +942,6 @@ fn age_excluded(mtime: i64, shared: &Shared) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::*;
     use crate::model::{NodeIdx, Tree};
     use std::fs;
@@ -876,6 +956,7 @@ mod tests {
             newer_than: None,
             extended: false,
             exclude_caches: false,
+            exclude_kernfs: false,
         }
     }
 
@@ -2114,6 +2195,104 @@ mod tests {
         assert_eq!(excluded(&inside), [] as [&str; 0]);
         assert!(named(&inside, "deep").is_some());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A mount table as the kernel prints it: the kernel filesystems are picked out by their
+    /// type, whatever they are mounted on, and their device is the third field.
+    #[test]
+    fn kernfs_devices_are_read_from_the_mount_table() {
+        let table = "\
+22 29 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw
+23 29 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+24 29 0:5 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=65842540k,mode=755
+25 24 0:23 / /dev/pts rw,nosuid,noexec,relatime shared:3 - devpts devpts rw,gid=5,mode=620
+29 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw,errors=remount-ro
+31 22 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:9 - cgroup2 cgroup2 rw
+33 22 0:27 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:11 - bpf bpf rw,mode=700
+34 23 0:28 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=29
+35 24 0:19 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:15 - mqueue mqueue rw
+36 22 0:7 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:16 - debugfs debugfs rw
+37 22 0:12 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:17 - tracefs tracefs rw
+40 29 0:300 / /mnt/a\\040-\\040b rw,relatime shared:20 master:1 - proc proc rw
+41 29 0:41 / /mnt/data rw,relatime shared:21 - zfs tank/data rw,xattr,posixacl
+42 34 0:42 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
+43 22 0:43 / /sys/fs/pstore rw,relatime - pstore pstore rw
+44 22 0:44 / /sys/kernel/security rw,relatime - securityfs securityfs rw
+45 22 0:45 / /sys/fs/selinux rw,relatime - selinuxfs selinuxfs rw
+46 22 0:46 / /sys/fs/cgroup/systemd rw,relatime - cgroup cgroup rw,name=systemd
+not a line of the table
+47 22 x:y / /broken rw - proc proc rw
+";
+        let minors = |devices: &HashSet<u64>| {
+            let mut minors: Vec<u64> = devices.iter().copied().collect();
+            minors.sort();
+            minors
+        };
+        // With major 0 and a minor below 256 the device number is the minor; 300 is the one
+        // that shows how a larger minor is spread.
+        assert_eq!(
+            minors(&kernfs_devices(table)),
+            [
+                7,
+                12,
+                21,
+                22,
+                23,
+                26,
+                27,
+                42,
+                43,
+                44,
+                45,
+                46,
+                makedev(0, 300)
+            ]
+        );
+        assert!(kernfs_devices("").is_empty());
+    }
+
+    /// Major and minor number make up `st_dev` the way the C library does it (the expected
+    /// values are those of Python's `os.makedev`).
+    #[test]
+    fn makedev_matches_the_c_library() {
+        assert_eq!(makedev(0, 22), 22);
+        assert_eq!(makedev(8, 2), 0x802);
+        assert_eq!(makedev(253, 1), 0xfd01);
+        assert_eq!(makedev(0, 300), 0x10002c);
+        assert_eq!(makedev(0x12345, 0x6789a), 0x0001_2000_6783_459a);
+    }
+
+    /// On Linux, with the option: `/proc` itself is read when it is what the scan was asked
+    /// for, and every directory in it is left out as a kernel filesystem, like ncdu does it.
+    /// Without the option they are entered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_filesystems_are_left_out_on_request() {
+        let proc_dir = Path::new("/proc");
+        let Ok(meta) = fs::metadata(proc_dir) else {
+            return; // no /proc here
+        };
+        // The device numbers computed from the mount table are those `stat` reports.
+        assert!(mounted_kernfs().contains(&meta.dev()), "{:?}", meta.dev());
+
+        let mut o = opts(2, meta.dev());
+        o.exclude_kernfs = true;
+        let mut tree = Tree::new("/proc".into(), 0, 0, meta.dev(), meta.ino());
+        for batch in start(proc_dir.to_path_buf(), o).events.iter() {
+            tree.apply(batch);
+        }
+        let dirs: Vec<NodeIdx> = (1..tree.nodes.len())
+            .filter(|&i| tree.nodes[i].is_dir())
+            .collect();
+        assert!(dirs.len() > 3, "/proc has directories: {}", dirs.len());
+        for &dir in &dirs {
+            let n = &tree.nodes[dir];
+            assert_eq!(n.excluded, Excluded::Kernfs, "{}", n.name);
+            assert!(n.children.is_empty(), "{} was entered", n.name);
+        }
+        // Everything listed is directly in /proc: nothing below it was read.
+        assert!(tree.nodes[1..].iter().all(|n| n.parent == Some(tree.root)));
+        assert!(tree.subtree_complete(tree.root));
     }
 
     /// An entry that is gone is not an error; everything else is.
