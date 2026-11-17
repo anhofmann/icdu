@@ -599,31 +599,22 @@ shell. The binaries are self-contained:
 - **macOS** builds link only `libSystem`/`libiconv`, which are part of every macOS install
   (Apple does not support fully static binaries; this is the portability ceiling on macOS).
 
-Build all three with the bundled script:
-
-```sh
-./build-portable.sh        # outputs dist/icdu-portable-{linux-x86_64,linux-aarch64,macos-<arch>}
-```
-
-Prebuilt binaries for every release (Linux x86_64/ARM64 static musl, macOS
-Apple Silicon/Intel, plus SHA-256 checksums) are attached to the
+Prebuilt binaries for every release (Linux x86_64 and ARM64, macOS Apple Silicon and Intel,
+plus SHA-256 checksums) are attached to the
 [GitHub Releases](https://github.com/anhofmann/icdu/releases) page.
 
-The Linux targets are cross-compiled straight from macOS using the toolchain's bundled
-`rust-lld` — **no Docker, no zig, no external linker required**.
-
-### Manual builds
+### Building them yourself
 
 ```sh
-# Native (this machine)
-cargo build --release
-
-# Linux static, cross-compiled from anywhere:
-LLD=$(find "$(rustc --print sysroot)" -name rust-lld | head -1)
-rustup target add x86_64-unknown-linux-musl
-RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes" \
-  cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release                               # for this machine
+tools/dist/build.sh x86_64-unknown-linux-musl       # static Linux binary, x86-64
+tools/dist/build.sh aarch64-unknown-linux-musl      # static Linux binary, ARM64
+tools/dist/build.sh aarch64-apple-darwin            # macOS; on a Mac only
 ```
+
+`tools/dist/build.sh` is what the release workflow runs. The Linux targets build on any host:
+they are linked with the `rust-lld` that comes with the Rust toolchain, so there is no cross
+compiler, no Docker and no C library to install.
 
 ## Design
 

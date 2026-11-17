@@ -30,6 +30,10 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+  # The release binaries, so that what a tag would build is built for every change.
+  dist:
+    uses: ./.github/workflows/dist.yml
+
   # The oldest Rust that icdu promises to build with: `rust-version` in Cargo.toml.
   msrv:
     name: minimum Rust (${{ matrix.os }})

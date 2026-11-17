@@ -20,7 +20,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && 
 cargo run -- <PATH>                          # interactive TUI
 cargo run -- <PATH> -o -                     # headless scan → ncdu JSON on stdout (no TTY needed)
 cargo run -- -f dump.json -o -               # import + re-export a dump
-./build-portable.sh                          # static musl Linux + native macOS binaries into dist/
+tools/dist/build.sh x86_64-unknown-linux-musl # a release binary, as CI and the release workflow build it
 ```
 
 The TUI needs a real terminal, so check behavior headlessly with `-o -` or through unit tests on `App`/`Tree`.

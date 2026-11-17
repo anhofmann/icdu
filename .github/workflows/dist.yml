@@ -1,0 +1,53 @@
+name: Dist
+
+# The release binaries for the four targets, built by the one recipe (tools/dist/build.sh).
+# CI calls this for every change, so a change that breaks a release build is seen then and
+# not when a tag is pushed. The release workflow calls it and publishes what it built.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `native`: the runner can execute what it built, so the binary is tried out.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl,  artifact: icdu-portable-linux-x86_64,  native: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, artifact: icdu-portable-linux-aarch64, native: false }
+          - { os: macos-latest,  target: aarch64-apple-darwin,       artifact: icdu-portable-macos-aarch64, native: true }
+          - { os: macos-latest,  target: x86_64-apple-darwin,        artifact: icdu-portable-macos-x86_64,  native: false }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: |
+          binary=$(tools/dist/build.sh "${{ matrix.target }}" | tail -n 1)
+          mkdir -p dist
+          cp "$binary" "dist/${{ matrix.artifact }}"
+          file "dist/${{ matrix.artifact }}"
+
+      - name: Try it out
+        if: matrix.native
+        run: |
+          "dist/${{ matrix.artifact }}" --version
+          mkdir -p tryout/sub && echo hello > tryout/sub/file
+          "dist/${{ matrix.artifact }}" --ignore-config -o - tryout | grep -q '"name":"file"'
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error

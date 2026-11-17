@@ -13,54 +13,7 @@ env:
 
 jobs:
   build:
-    name: build ${{ matrix.artifact }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl,  artifact: icdu-portable-linux-x86_64 }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, artifact: icdu-portable-linux-aarch64 }
-          - { os: macos-latest,  target: aarch64-apple-darwin,       artifact: icdu-portable-macos-aarch64 }
-          - { os: macos-latest,  target: x86_64-apple-darwin,        artifact: icdu-portable-macos-x86_64 }
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - name: Build portable binary
-        shell: bash
-        run: |
-          mkdir -p dist
-          if [[ "${{ matrix.target }}" == *-musl ]]; then
-            # Fully static musl builds via the toolchain's bundled rust-lld
-            # (same trick as build-portable.sh — no external cross toolchain).
-            LLD=$(find "$(rustc --print sysroot)" -name 'rust-lld' | head -1)
-            RUSTFLAGS="-C linker=$LLD -C linker-flavor=ld.lld -C link-self-contained=yes -C strip=symbols" \
-              cargo build --release --target "${{ matrix.target }}"
-          else
-            RUSTFLAGS="-C strip=symbols" \
-              cargo build --release --target "${{ matrix.target }}"
-          fi
-          cp "target/${{ matrix.target }}/release/icdu" "dist/${{ matrix.artifact }}"
-          file "dist/${{ matrix.artifact }}"
-
-      - name: Smoke test (--version)
-        shell: bash
-        run: |
-          # Only runs when the built binary matches the runner architecture.
-          if [ -x "dist/${{ matrix.artifact }}" ]; then
-            "dist/${{ matrix.artifact }}" --version || echo "cannot execute on this runner (cross-compiled) — skipping"
-          fi
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
-          if-no-files-found: error
+    uses: ./.github/workflows/dist.yml
 
   release:
     needs: build
