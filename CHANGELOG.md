@@ -14,6 +14,22 @@ history was separated; they do not match the pull requests of this repository.
 
 ### Fixed
 
+- **Closing the terminal left icdu running** (0.5.0): the process stayed, kept one processor
+  core busy, and did not react to `SIGTERM` or `SIGHUP`, so that only `kill -9` ended it. It
+  ends now when its terminal goes away, with or without a hang-up signal.
+- **`SIGTERM` and `SIGHUP` end icdu whatever it is doing**, within about a second: also while
+  a shell (`b`) or the delete command has the terminal, where it used to wait for that command
+  to finish, and while the terminal takes no output.
+- `SIGINT` and `SIGQUIT` from outside ended icdu with the terminal still in raw mode on the
+  alternate screen. It gives the terminal back first now, as for `SIGTERM`.
+- `Ctrl-C` typed in a command that icdu started (`NCDU_SHELL`, the delete command) ended
+  icdu along with the command. It is the command's alone now.
+- `SIGTSTP` did nothing while a shell or the delete command had the terminal. It stops icdu.
+- Quitting left the cursor hidden, for the shell to switch on again.
+- `Ctrl-L`, and coming back after `Ctrl-Z`, ended icdu with an error on a terminal that does
+  not answer when asked for the cursor position. icdu no longer asks.
+- Started without a terminal, icdu aborted with a panic message. It says that it has no
+  terminal and exits with status 1.
 - The install script refused to install when the GitHub CLI on the machine was logged in but
   too old to have `gh attestation` (the one in Debian 12, for example). It installs now and
   says that it could not check who built the archive.

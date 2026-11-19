@@ -33,6 +33,10 @@ cargo build --release
 - **What cannot be unit-tested is said and checked by hand.** That is mostly what the terminal
   shows. Say in the pull request what you looked at. The browser can be driven in a detached
   `tmux` session (`tmux send-keys`, `tmux capture-pane -p`), which is how most of it is checked.
+- **How icdu behaves towards its terminal has a script**, `tools/terminal-test.py`: signals, a
+  terminal that is closed or takes no output, `Ctrl-Z`, the shell and the delete command. It
+  runs the release build on pseudo-terminals, here and in CI. A change to any of that gets a
+  check there.
 - **Measurements for anything about speed or memory**: what was measured, on what, before and
   after.
 - **A line in `CHANGELOG.md`** under "Unreleased", if a user can notice the change.

@@ -518,9 +518,37 @@ If set, icdu starts without colours.
 .TP
 .BR HOME ", " XDG_CONFIG_HOME
 Where the configuration files are looked for.
+.SH SIGNALS
+.BR SIGTERM ", " SIGHUP ", " SIGINT " and " SIGQUIT
+end icdu.
+The browser first gives the terminal back (line mode, the screen that was there before, the
+cursor) and then ends by the same signal.
+That takes a fraction of a second, and about a second if icdu is busy or the terminal is not
+taking output.
+Closing the terminal ends icdu as well, with or without a hang-up signal.
+.PP
+.BR SIGTSTP ,
+like
+.BR Ctrl\-Z ,
+stops icdu with the terminal given back, and
+.B SIGCONT
+brings the browser back.
+.PP
+While a shell or the delete command has the terminal,
+.BR SIGTERM " and " SIGHUP
+end icdu at once, and
+.B SIGTSTP
+stops it.
+.BR Ctrl\-C " and " Ctrl\-\e
+typed there are for that command and do not end icdu.
+.PP
+Without the browser
+.RB ( \-o ),
+every signal has its default effect.
 .SH EXIT STATUS
-0 on success, 1 if the command line or a configuration file is wrong, or a scan, an export
-or an import fails.
+0 on success, 1 if the command line or a configuration file is wrong, a scan, an export or an
+import fails, or the browser has no terminal.
+Ended by a signal, icdu reports that signal and no status of its own.
 .SH HARD LINKS
 A file with several names is counted once: at the first of its names that the scan comes
 across.

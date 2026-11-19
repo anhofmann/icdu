@@ -39,6 +39,10 @@ jobs:
         run: cargo test --locked --release
       - name: Build (release)
         run: cargo build --locked --release
+      # What only a terminal shows: that icdu ends when it is told to (signals, a closed
+      # terminal), suspends and comes back, and leaves the terminal as it found it.
+      - name: On a terminal
+        run: python3 tools/terminal-test.py target/release/icdu
 
   # The workflows and the shell scripts themselves.
   lint:

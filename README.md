@@ -303,6 +303,22 @@ started with, so a prompt can show that it runs inside icdu.
 By default sizes are **on-disk usage** (`st_blocks × 512`); press `a` for apparent size.
 Symlinks are never followed (counted as the link itself), matching ncdu's default.
 
+### Signals and the terminal
+
+icdu ends when it is asked to, and leaves the terminal as it found it.
+
+- **`SIGTERM`, `SIGHUP`, `SIGINT` and `SIGQUIT` end it.** It first gives the terminal back
+  (line mode, the screen that was there before, the cursor) and then ends by that same
+  signal, so whoever started it sees the real cause. That takes a fraction of a second, and
+  about a second if icdu is busy or the terminal is not taking output.
+- **Closing the terminal ends it**, with or without a hang-up signal.
+- **`SIGTSTP`**, like `Ctrl-z`, stops it with the terminal given back, and `SIGCONT` (`fg`)
+  brings the browser back.
+- **While a shell (`b`) or the delete command has the terminal**, `SIGTERM` and `SIGHUP` end
+  icdu at once, and `SIGTSTP` stops it. `Ctrl-c` and `Ctrl-\` typed there are for that
+  command and do not end icdu behind it.
+- **Without the browser** (`-o`), every signal does what it does to any program.
+
 ### Searching
 
 Press `/` to ask: *where in this tree is anything called X?* Type part of a name. Case is
@@ -757,6 +773,15 @@ everything it must leave alone. The dump reader and writer are held against dump
 ncdu. The interface is driven key by key without a terminal, and whole frames are drawn on a
 test backend and compared as text. CI runs all of it on Linux and macOS, in debug and release
 builds, and with the oldest supported Rust.
+
+What needs a terminal is tried on one: `tools/terminal-test.py` starts the release build on
+pseudo-terminals and checks that it ends when it is told to (signals, a closed terminal, a
+terminal that takes no output), that `Ctrl-z` and `fg` work, and in which state the terminal
+is left each time. CI runs it on Linux and macOS as well.
+
+```sh
+cargo build --release && python3 tools/terminal-test.py
+```
 
 ## Contributing, changes, security
 

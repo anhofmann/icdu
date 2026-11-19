@@ -19,10 +19,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use ratatui::backend::Backend;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 
 use app::{App, InputMode, KeyAction};
 use args::{Args, Feedback, Parsed};
@@ -345,17 +348,42 @@ fn write_export(tree: &Tree, dest: &str) -> std::io::Result<()> {
 }
 
 /// Enter the TUI: raw mode and the alternate screen (ratatui), plus bracketed paste, so that
-/// pasted text arrives as one event and not as a burst of key presses.
-fn init_terminal() -> ratatui::DefaultTerminal {
-    let terminal = ratatui::init();
+/// pasted text arrives as one event and not as a burst of key presses. Fails if there is no
+/// terminal, or none any more.
+fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
+    let terminal = ratatui::try_init()?;
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    terminal
+    Ok(terminal)
 }
 
-/// Leave the TUI and give the terminal back as it was.
+/// Leave the TUI and give the terminal back as it was: line mode, the screen that was there
+/// before, a cursor. Each step is tried whatever became of the one before, and none of them
+/// reports: this also runs for a terminal that has gone away, where all of them fail and there
+/// is nobody to tell. Raw mode goes first because that is a setting and not output, so it
+/// still works on a terminal that takes no output at the moment.
 fn restore_terminal() {
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    ratatui::restore();
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
+}
+
+/// Empty the screen, so that the next frame draws all of it. (`Terminal::clear` does that too,
+/// but asks the terminal for the cursor position first and waits two seconds for the answer:
+/// a terminal that does not answer would end icdu with an error on Ctrl-L.)
+fn clear_screen(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+    terminal.backend_mut().clear()?;
+    terminal.swap_buffers();
+    Ok(())
+}
+
+/// Say what went wrong, on standard error. Unlike `eprintln!`, this does not panic if that
+/// cannot be written to, which is the case when the terminal has gone away.
+fn complain(message: std::fmt::Arguments) {
+    let _ = writeln!(std::io::stderr(), "icdu: {message}");
 }
 
 /// Run the TUI until the user quits or a signal ends it. Does not return: the process exits
@@ -368,8 +396,20 @@ fn run_ui(app: &mut App, slow: bool) -> ! {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         default_hook(info);
     }));
-    let signals = unwrap_or_die(Signals::install(), "cannot install signal handlers");
-    let mut terminal = init_terminal();
+    let signals = unwrap_or_die(
+        Signals::install(restore_terminal),
+        "cannot install signal handlers",
+    );
+    let mut terminal = match init_terminal() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            // Nothing has been drawn. Standard output may not even be a terminal, so it gets
+            // no escape sequences; only raw mode is undone, in case it got that far.
+            let _ = disable_raw_mode();
+            complain(format_args!("cannot use the terminal: {e}"));
+            std::process::exit(1);
+        }
+    };
     let result = run(&mut terminal, app, &signals, slow);
     restore_terminal();
     match result {
@@ -381,7 +421,7 @@ fn run_ui(app: &mut App, slow: bool) -> ! {
         // Nothing is pending here: exports and deletions finish inside the loop.
         Ok(None) => std::process::exit(0),
         Err(e) => {
-            eprintln!("icdu: {e}");
+            complain(format_args!("{e}"));
             std::process::exit(1);
         }
     }
@@ -394,9 +434,9 @@ fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::i
     restore_terminal();
     signals::stop_process();
     // Running again. The SIGCONT that woke us needs no second answer.
-    signals.take_cont();
-    *terminal = init_terminal();
-    terminal.clear()
+    signals.continued();
+    *terminal = init_terminal()?;
+    clear_screen(terminal)
 }
 
 /// How long a frame may spend taking scan results into the tree. With drawing on top, this
@@ -437,8 +477,8 @@ fn run(
             // Stopped and continued behind our back (SIGSTOP cannot be caught): whatever
             // ran in between may have changed the terminal. Set it up again.
             restore_terminal();
-            *terminal = init_terminal();
-            terminal.clear()?;
+            *terminal = init_terminal()?;
+            clear_screen(terminal)?;
         }
 
         // Take in what the scanners produced since the last frame, for a few milliseconds
@@ -464,14 +504,14 @@ fn run(
         // background; its events buffer until we're back.
         // A deletion by the user's delete command, which gets the terminal like a shell.
         if let Some(request) = app.take_delete_command() {
-            let ran = run_delete_command(terminal, &request.command, &request.path);
+            let ran = run_delete_command(terminal, signals, &request.command, &request.path)?;
             app.finish_delete_command(&request, ran);
             while event::poll(Duration::from_millis(0))? {
                 let _ = event::read();
             }
         }
         if let Some(dir) = app.take_shell_request() {
-            app.status = run_shell(terminal, &dir);
+            app.status = run_shell(terminal, signals, &dir)?;
             // Swallow any keys typed at the moment the shell exited.
             while event::poll(Duration::from_millis(0))? {
                 let _ = event::read();
@@ -519,7 +559,7 @@ fn run(
                         .unwrap_or(20);
                     match decode_key(key.code, key.modifiers, mode, page) {
                         // The actions that need the terminal itself.
-                        Some(KeyAction::Redraw) => terminal.clear()?,
+                        Some(KeyAction::Redraw) => clear_screen(terminal)?,
                         Some(KeyAction::Suspend) => suspend(terminal, signals)?,
                         Some(action) => app.on_key(action),
                         None => {}
@@ -594,28 +634,38 @@ fn delete_command(command: &str, path: &Path, level: u32) -> Command {
 /// fails has usually said why, so the user gets to read that before the list comes back.
 fn run_delete_command(
     terminal: &mut ratatui::DefaultTerminal,
+    signals: &Signals,
     command: &str,
     path: &Path,
-) -> Result<(), String> {
+) -> std::io::Result<Result<(), String>> {
     let level = shell_to_run(None, None, std::env::var("NCDU_LEVEL").ok().as_deref()).1;
     restore_terminal();
-    let ran = match delete_command(command, path, level).status() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!("the delete command ended with {status}")),
-        Err(e) => Err(format!("the delete command could not be run: {e}")),
+    let ran = {
+        // Until the UI is back, signals are answered as for a terminal that is not icdu's.
+        let _child = signals.hand_over();
+        let ran = match delete_command(command, path, level).status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("the delete command ended with {status}")),
+            Err(e) => Err(format!("the delete command could not be run: {e}")),
+        };
+        if let Err(why) = &ran {
+            let _ = writeln!(std::io::stderr(), "\nicdu: {why}. Press Enter to go back.");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
+        ran
     };
-    if let Err(why) = &ran {
-        eprintln!("\nicdu: {why}. Press Enter to go back.");
-        let _ = std::io::stdin().read_line(&mut String::new());
-    }
-    *terminal = init_terminal();
-    ran
+    *terminal = init_terminal()?;
+    Ok(ran)
 }
 
 /// Suspend the TUI, run a shell interactively in `dir`, and rebuild the UI when it exits.
 /// Returns a status line describing the outcome. This is the documented ratatui pattern for
 /// handing the terminal to a child process; the child gets the real tty, keystrokes and all.
-fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<String> {
+fn run_shell(
+    terminal: &mut ratatui::DefaultTerminal,
+    signals: &Signals,
+    dir: &Path,
+) -> std::io::Result<Option<String>> {
     let var = |name: &str| std::env::var(name).ok();
     let (shell, level) = shell_to_run(
         var("NCDU_SHELL").as_deref(),
@@ -634,16 +684,20 @@ fn run_shell(terminal: &mut ratatui::DefaultTerminal, dir: &Path) -> Option<Stri
         .current_dir(dir)
         .env("NCDU_LEVEL", level.to_string());
     restore_terminal();
-    let outcome = match command.status() {
-        Ok(status) if status.success() => format!("shell exited (was in {})", dir.display()),
-        Ok(status) => format!("shell exited with {status}"),
-        Err(e) => match shell {
-            Shell::Line(_) => format!("shell failed: /bin/sh: {e}"),
-            Shell::Program(program) => format!("shell failed: {program}: {e}"),
-        },
+    let outcome = {
+        // Until the UI is back, signals are answered as for a terminal that is not icdu's.
+        let _child = signals.hand_over();
+        match command.status() {
+            Ok(status) if status.success() => format!("shell exited (was in {})", dir.display()),
+            Ok(status) => format!("shell exited with {status}"),
+            Err(e) => match shell {
+                Shell::Line(_) => format!("shell failed: /bin/sh: {e}"),
+                Shell::Program(program) => format!("shell failed: {program}: {e}"),
+            },
+        }
     };
-    *terminal = init_terminal();
-    Some(outcome)
+    *terminal = init_terminal()?;
+    Ok(Some(outcome))
 }
 
 /// How many rows PgUp and PgDn move by in a terminal of the given height.
