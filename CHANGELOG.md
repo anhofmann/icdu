@@ -29,7 +29,10 @@ history was separated; they do not match the pull requests of this repository.
 - `Ctrl-L`, and coming back after `Ctrl-Z`, ended icdu with an error on a terminal that does
   not answer when asked for the cursor position. icdu no longer asks.
 - Started without a terminal, icdu aborted with a panic message. It says that it has no
-  terminal and exits with status 1.
+  terminal and exits with status 1, and it says so before an import or a scan (`-0`, `-1`)
+  that nobody would get to see.
+- Output that nobody reads any more (`icdu -o- / | head`, `icdu --help | head -1`) ended in
+  "export failed: Broken pipe", or in a panic. icdu ends quietly there, as other programs do.
 - The install script refused to install when the GitHub CLI on the machine was logged in but
   too old to have `gh attestation` (the one in Debian 12, for example). It installs now and
   says that it could not check who built the archive.

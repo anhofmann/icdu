@@ -317,7 +317,8 @@ icdu ends when it is asked to, and leaves the terminal as it found it.
 - **While a shell (`b`) or the delete command has the terminal**, `SIGTERM` and `SIGHUP` end
   icdu at once, and `SIGTSTP` stops it. `Ctrl-c` and `Ctrl-\` typed there are for that
   command and do not end icdu behind it.
-- **Without the browser** (`-o`), every signal does what it does to any program.
+- **Without the browser** (`-o`), every signal does what it does to any program. That
+  includes `SIGPIPE`: `icdu -o- / | head` ends without a complaint once `head` has enough.
 
 ### Searching
 

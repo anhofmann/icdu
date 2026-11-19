@@ -544,7 +544,9 @@ typed there are for that command and do not end icdu.
 .PP
 Without the browser
 .RB ( \-o ),
-every signal has its default effect.
+every signal has its default effect, also
+.B SIGPIPE
+when nobody reads the output any more.
 .SH EXIT STATUS
 0 on success, 1 if the command line or a configuration file is wrong, a scan, an export or an
 import fails, or the browser has no terminal.

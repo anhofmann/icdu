@@ -12,7 +12,7 @@ mod scan;
 mod signals;
 mod ui;
 
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -38,8 +38,19 @@ fn version_line() -> String {
     format!("icdu {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Write to standard output what was asked for: the help, the version. `println!` panics when
+/// that fails, and it fails as soon as nobody reads any more (`icdu --help | head -1`).
+fn print_out(text: &str) {
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        signals::end_if_broken_pipe(&e);
+        complain(format_args!("cannot write to standard output: {e}"));
+        std::process::exit(1);
+    }
+}
+
 fn print_help() {
-    println!(
+    print_out(&format!(
         "icdu {} — disk usage you can browse and search while it scans (ncdu-compatible)
 
 USAGE:
@@ -68,10 +79,11 @@ KEYS:
     e               show / hide dot files and excluded entries
     m               modification times (with -e)
     C-l             redraw        C-z             suspend (fg resumes)
-    in the search:  C-u clear the line, C-w delete a word",
+    in the search:  C-u clear the line, C-w delete a word
+",
         env!("CARGO_PKG_VERSION"),
         args::options_help().trim_end()
-    );
+    ));
 }
 
 fn main() {
@@ -97,7 +109,7 @@ fn main() {
                 return;
             }
             Ok((Parsed::Version, _)) => {
-                println!("{}", version_line());
+                print_out(&format!("{}\n", version_line()));
                 return;
             }
             Err(e) => {
@@ -125,11 +137,22 @@ fn main() {
             scan_to_completion(tree, root, opts, args.feedback_mode())
         };
         if let Err(e) = write_export(&tree, &dest) {
+            // `icdu -o- | head`: whoever read the dump has what it wanted.
+            signals::end_if_broken_pipe(&e);
             eprintln!("icdu: export failed: {e}");
             std::process::exit(1);
         }
         // The dump is written and flushed. See `run_ui` for why not to return from here.
         std::process::exit(0);
+    }
+
+    // Everything from here on ends in the browser, and that needs a terminal. Better to say
+    // so now than after an import or a scan that nobody gets to see.
+    if !terminal_there() {
+        complain(format_args!(
+            "the browser needs a terminal, and there is none (to scan without one: -o FILE)"
+        ));
+        std::process::exit(1);
     }
 
     // --- Import mode: load a dump, browse it, no scanning. ---
@@ -280,7 +303,6 @@ fn prepare_scan(args: &Args) -> (Tree, PathBuf, Opts) {
 /// standard error, if that is a terminal; anything else shows nothing, so that a dump on
 /// standard output or a cron job is not disturbed.
 fn scan_to_completion(mut tree: Tree, root: PathBuf, opts: Opts, feedback: Feedback) -> Tree {
-    use std::io::IsTerminal;
     let show = feedback == Feedback::Line && std::io::stderr().is_terminal();
     let scan = scan::start(root, opts);
     let mut shown = Instant::now();
@@ -345,6 +367,18 @@ fn write_export(tree: &Tree, dest: &str) -> std::io::Result<()> {
         dump::export(tree, &mut w)?;
         w.flush()
     }
+}
+
+/// Whether there is a terminal for the browser, which is where the terminal library reads the
+/// keys from: standard input if that is one, and the controlling terminal otherwise
+/// (`icdu -f- < dump`).
+fn terminal_there() -> bool {
+    std::io::stdin().is_terminal()
+        || std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
 }
 
 /// Enter the TUI: raw mode and the alternate screen (ratatui), plus bracketed paste, so that

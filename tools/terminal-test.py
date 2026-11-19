@@ -19,6 +19,7 @@ What is covered:
   - the signals while a command started with `b`, or the delete command, has the terminal
   - Ctrl-L
   - signals before the browser has started, and a start without any terminal
+  - output into a pipe that nobody reads (`icdu -o- | head`)
 
 Needs Python 3 and nothing else. The exit status is 0 if every check passed.
 """
@@ -674,25 +675,35 @@ def before_the_browser(binary, tree):
     return problems
 
 
-@check("without a terminal, icdu says so and exits with status 1")
-def no_terminal(binary, tree):
-    # No terminal anywhere: not on standard input or output, and none to open.
+def without_terminal(binary, args, closed_output=False):
+    """Run icdu with no terminal anywhere: not on standard input or output, and none to
+    open. Returns its wait status (None if it did not end) and what it said. With
+    `closed_output`, standard output is a pipe that nobody reads, and only standard error
+    is collected."""
     reader, writer = os.pipe()
     null = os.open(os.devnull, os.O_RDWR)
+    nobody, output = os.pipe() if closed_output else (None, writer)
     pid = os.fork()
     if pid == 0:
         try:
             os.setsid()
+            if nobody is not None:
+                os.close(nobody)
+            # As a shell starts it. (Python itself runs with this signal ignored.)
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
             os.dup2(null, 0)
-            os.dup2(writer, 1)
+            os.dup2(output, 1)
             os.dup2(writer, 2)
             os.closerange(3, 1024)
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            os.execv(binary, [binary, "--ignore-config", tree])
+            os.execv(binary, [binary, "--ignore-config"] + args)
         finally:
             os._exit(127)
     os.close(writer)
     os.close(null)
+    if nobody is not None:
+        os.close(nobody)
+        os.close(output)
     said = b""
     deadline = time.monotonic() + LIMIT
     while time.monotonic() < deadline:
@@ -705,9 +716,16 @@ def no_terminal(binary, tree):
     os.close(reader)
     done, status = os.waitpid(pid, os.WNOHANG)
     if not done:
+        time.sleep(0.2)
+        done, status = os.waitpid(pid, os.WNOHANG)
+    if not done:
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
-        return ["icdu is still running without a terminal"]
+        return None, said
+    return status, said
+
+
+def no_terminal_problems(status, said):
     problems = []
     if not exit_status(status, 1):
         problems.append("expected exit status 1: %s" % how(status))
@@ -716,6 +734,39 @@ def no_terminal(binary, tree):
     if b"\x1b" in said:
         problems.append("escape sequences were written to what is not a terminal")
     return problems
+
+
+@check("without a terminal, icdu says so and exits with status 1")
+def no_terminal(binary, tree):
+    return no_terminal_problems(*without_terminal(binary, [tree]))
+
+
+@check("without a terminal, icdu does not start on work that it could not show")
+def no_terminal_before_work(binary, tree):
+    # A dump that never arrives. With a terminal, icdu would wait for it.
+    fifo = os.path.join(os.path.dirname(tree), "never-written")
+    os.mkfifo(fifo)
+    return no_terminal_problems(*without_terminal(binary, ["-f", fifo]))
+
+
+def quiet_end(binary, args):
+    status, said = without_terminal(binary, args, closed_output=True)
+    problems = []
+    if not by_signal(status, signal.SIGPIPE):
+        problems.append("expected to end by SIGPIPE: %s" % how(status))
+    if said:
+        problems.append("expected no message: %r" % said[:200])
+    return problems
+
+
+@check("output that nobody reads ends icdu quietly: the help")
+def help_into_closed_pipe(binary, tree):
+    return quiet_end(binary, ["--help"])
+
+
+@check("output that nobody reads ends icdu quietly: a dump")
+def dump_into_closed_pipe(binary, tree):
+    return quiet_end(binary, ["-o-", tree])
 
 
 def main():

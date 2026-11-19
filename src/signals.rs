@@ -26,7 +26,8 @@
 //!
 //! In raw mode Ctrl-Z arrives as a key press, not as SIGTSTP, so the event loop takes the same
 //! path for the key. All of this is installed only for the TUI: a headless run (`-o`) keeps the
-//! default behaviour of every signal.
+//! default behaviour of every signal, and gets back the one that Rust takes away: see
+//! [`end_if_broken_pipe`].
 
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -34,7 +35,7 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use signal_hook::consts::{SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP};
+use signal_hook::consts::{SIGCONT, SIGHUP, SIGINT, SIGPIPE, SIGQUIT, SIGTERM, SIGTSTP};
 use signal_hook::{iterator, low_level};
 
 /// How long the event loop gets to end the process in an orderly way before the watcher ends
@@ -275,6 +276,16 @@ pub fn die_by(signal: i32) -> ! {
     let _ = low_level::emulate_default_handler(signal);
     // Not reached if the signal did its work; the conventional exit status otherwise.
     std::process::exit(128 + signal)
+}
+
+/// If `error` says that nobody reads the output any more, end the way programs do then: by
+/// SIGPIPE, and without a word. (Rust starts every program with that signal ignored, so that a
+/// write to a closed pipe is an error to handle. For output that was the whole point of the
+/// run, the error has one right answer.)
+pub fn end_if_broken_pipe(error: &io::Error) {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        die_by(SIGPIPE);
+    }
 }
 
 #[cfg(test)]
