@@ -1,0 +1,30 @@
+name: Probe
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: cargo build --locked --release
+      - name: The check for a closed terminal without a hang-up signal, 25 times
+        timeout-minutes: 8
+        run: |
+          failed=0
+          for i in $(seq 1 25); do
+            python3 tools/terminal-test.py target/release/icdu "no hang-up" || failed=$((failed + 1))
+          done
+          echo "failed: $failed of 25"
+          test "$failed" = 0
+      - name: All checks, 3 times
+        timeout-minutes: 8
+        run: |
+          for i in 1 2 3; do python3 tools/terminal-test.py target/release/icdu | grep -v "^ok" || true; done
