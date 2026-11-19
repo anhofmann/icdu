@@ -261,7 +261,10 @@ impl Signals {
 /// fails. Asking whether it is still a terminal does not do: on macOS a closed terminal is one.
 fn terminal_gone(mut terminal: &File) -> bool {
     match terminal.write(&[]) {
-        Ok(_) => false,
+        Ok(written) => {
+            debug_assert_eq!(written, 0, "nothing was to be written");
+            false
+        }
         Err(e) => !matches!(
             e.kind(),
             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
