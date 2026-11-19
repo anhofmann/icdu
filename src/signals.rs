@@ -20,16 +20,18 @@
 //!   terminal sends to everything in the foreground, and they are meant for the command the
 //!   user is looking at. That is what `system(3)` does, too.
 //!
-//! A second thread looks every [`TERMINAL_CHECK`] whether the terminal is still a terminal.
-//! Closing a terminal normally sends SIGHUP, but not to a process that is not in the
-//! terminal's session, and then nothing else would end it.
+//! A second thread looks every [`TERMINAL_CHECK`] whether the terminal is still there
+//! ([`terminal_gone`]). Closing a terminal normally sends SIGHUP, but not to a process that is
+//! not in the terminal's session, and then nothing else would end it.
 //!
 //! In raw mode Ctrl-Z arrives as a key press, not as SIGTSTP, so the event loop takes the same
 //! path for the key. All of this is installed only for the TUI: a headless run (`-o`) keeps the
 //! default behaviour of every signal, and gets back the one that Rust takes away: see
 //! [`end_if_broken_pipe`].
 
-use std::io::{self, IsTerminal};
+use std::fs::File;
+use std::io::{self, IsTerminal, Write};
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -170,13 +172,15 @@ impl Signals {
             Box::new(stop_process),
         )?;
         if io::stdout().is_terminal() {
+            // A handle of its own on the terminal: `Stdout` collects what is written to it,
+            // and the question has to reach the terminal.
+            let terminal = File::from(io::stdout().as_fd().try_clone_to_owned()?);
             thread::Builder::new()
                 .name("terminal".into())
-                .spawn(|| loop {
+                .spawn(move || loop {
                     thread::sleep(TERMINAL_CHECK);
-                    if !io::stdout().is_terminal() {
-                        // It was one and is none: it has been closed. Nothing is left to give
-                        // back, and nothing to wait for.
+                    if terminal_gone(&terminal) {
+                        // Nothing is left to give back, and nothing to wait for.
                         die_by(SIGHUP);
                     }
                 })?;
@@ -249,6 +253,19 @@ impl Signals {
     pub fn hand_over(&self) -> HandOver<'_> {
         *lock(&self.holder) = Holder::Child;
         HandOver(self)
+    }
+}
+
+/// Whether the terminal behind this handle has been closed. Asked by writing nothing to it:
+/// on a terminal that is there, that succeeds and changes nothing, and on one that is gone it
+/// fails. Asking whether it is still a terminal does not do: on macOS a closed terminal is one.
+fn terminal_gone(mut terminal: &File) -> bool {
+    match terminal.write(&[]) {
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ),
     }
 }
 
@@ -396,6 +413,14 @@ mod tests {
         assert_eq!(deaths()[1], (SIGHUP, Holder::Ui));
 
         over.store(true, Ordering::SeqCst);
+    }
+
+    /// The other side, a terminal that has been closed, needs a terminal to close:
+    /// `tools/terminal-test.py` has that.
+    #[test]
+    fn something_that_can_be_written_to_is_not_a_terminal_that_is_gone() {
+        let there = File::options().write(true).open("/dev/null").unwrap();
+        assert!(!terminal_gone(&there));
     }
 
     #[test]
