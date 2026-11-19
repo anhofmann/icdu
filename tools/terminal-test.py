@@ -40,41 +40,165 @@ import time
 # the point is that it happens at all, also on a slow machine.
 LIMIT = 6.0
 
+# How long one check may take altogether before it is given up.
+CHECK_LIMIT = 90
+
 ALT_ON, ALT_OFF = b"\x1b[?1049h", b"\x1b[?1049l"
 PASTE_ON, PASTE_OFF = b"\x1b[?2004h", b"\x1b[?2004l"
 CURSOR_ON, CURSOR_OFF = b"\x1b[?25h", b"\x1b[?25l"
 
 
-class Run:
-    """One icdu on a pseudo-terminal of its own."""
+# What a shell ignores for itself, and gives back to the programs it starts.
+SHELL_IGNORES = (
+    signal.SIGHUP,
+    signal.SIGINT,
+    signal.SIGQUIT,
+    signal.SIGTERM,
+    signal.SIGTSTP,
+    signal.SIGTTIN,
+    signal.SIGTTOU,
+)
 
-    def __init__(self, binary, args, env=None, controlling=True):
+
+class Run:
+    """One icdu on a pseudo-terminal of its own.
+
+    Normally it runs the way it does when it is typed at a prompt: a stand-in for the shell
+    is the session leader of the terminal, and icdu is its foreground job. With `leader`,
+    icdu is the terminal's own command instead (`xterm -e icdu`): the session leader itself,
+    with no shell above it. Without `controlling`, the terminal is nobody's controlling
+    terminal, and then no hang-up signal is sent when it goes away.
+    """
+
+    def __init__(self, binary, args, env=None, controlling=True, leader=False):
         self.master, self.slave = os.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         # The settings icdu finds, and has to leave behind.
         self.found = termios.tcgetattr(self.slave)
         self.out = bytearray()
-        self.status = None
+        self.pid = self.status = None
+        self.stops = self.stops_seen = 0
+        self.shell = self.events = self.control = None
+        self.told = b""
         environment = dict(os.environ, TERM="xterm-256color")
         environment.pop("NCDU_SHELL", None)
         environment.update(env or {})
-        self.pid = os.fork()
-        if self.pid == 0:
+        command = [binary] + args
+        if leader:
+            self.pid = os.fork()
+            if self.pid == 0:
+                try:
+                    os.setsid()
+                    if controlling:
+                        fcntl.ioctl(self.slave, termios.TIOCSCTTY, 0)
+                    self.become(command, environment)
+                finally:
+                    os._exit(127)
+        else:
+            self.start_under_a_shell(command, environment, controlling)
+        os.set_blocking(self.master, False)
+
+    def become(self, command, environment):
+        """In a child process: turn into icdu on the terminal."""
+        for sig in SHELL_IGNORES + (signal.SIGPIPE,):
+            signal.signal(sig, signal.SIG_DFL)
+        for fd in (0, 1, 2):
+            os.dup2(self.slave, fd)
+        os.closerange(3, 1024)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        os.execve(command[0], command, environment)
+
+    def start_under_a_shell(self, command, environment, controlling):
+        # The stand-in for the shell tells what becomes of its job, and stays until it is
+        # told to go: a terminal whose session leader has gone is taken away from everybody.
+        events, tell = os.pipe()
+        stay, control = os.pipe()
+        self.shell = os.fork()
+        if self.shell == 0:
             try:
-                # As under a terminal emulator: a session of its own, with the terminal as
-                # its controlling terminal. Without `controlling`, no hang-up signal is
-                # sent when the terminal goes away.
+                os.close(events)
+                os.close(control)
+                os.close(self.master)
                 os.setsid()
                 if controlling:
                     fcntl.ioctl(self.slave, termios.TIOCSCTTY, 0)
-                for fd in (0, 1, 2):
-                    os.dup2(self.slave, fd)
-                os.closerange(3, 1024)
-                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-                os.execve(binary, [binary] + args, environment)
+                for sig in SHELL_IGNORES:
+                    signal.signal(sig, signal.SIG_IGN)
+                wait, go = os.pipe()
+                job = os.fork()
+                if job:
+                    # What a shell does when its terminal is closed: it passes the hang-up
+                    # on to its jobs, and continues the stopped ones so that they get it.
+                    def hang_up(signum, frame):
+                        for sig in (signal.SIGHUP, signal.SIGCONT):
+                            try:
+                                os.killpg(job, sig)
+                            except OSError:
+                                pass
+
+                    signal.signal(signal.SIGHUP, hang_up)
+                if job == 0:
+                    try:
+                        os.close(go)
+                        os.setpgid(0, 0)
+                        os.read(wait, 1)  # until the job is in the foreground
+                        self.become(command, environment)
+                    finally:
+                        os._exit(127)
+                os.close(wait)
+                try:
+                    os.setpgid(job, job)
+                except OSError:
+                    pass
+                if controlling:
+                    os.tcsetpgrp(self.slave, job)
+                os.write(tell, b"started %d\n" % job)
+                os.close(go)
+                while True:
+                    _, status = os.waitpid(job, os.WUNTRACED)
+                    if os.WIFSTOPPED(status):
+                        os.write(tell, b"stopped\n")
+                    else:
+                        os.write(tell, b"ended %d\n" % status)
+                        break
+                os.read(stay, 1)
             finally:
-                os._exit(127)
-        os.set_blocking(self.master, False)
+                os._exit(0)
+        os.close(tell)
+        os.close(stay)
+        self.events, self.control = events, control
+        os.set_blocking(self.events, False)
+        deadline = time.monotonic() + LIMIT
+        while self.pid is None:
+            if time.monotonic() > deadline:
+                raise RuntimeError("icdu could not be started")
+            self.look()
+            time.sleep(0.005)
+
+    def look(self):
+        """Take in what has become of the process since the last look."""
+        if self.status is not None:
+            return
+        if self.shell is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG | os.WUNTRACED)
+            if pid and os.WIFSTOPPED(status):
+                self.stops += 1
+            elif pid:
+                self.status = status
+            return
+        try:
+            self.told += os.read(self.events, 4096)
+        except BlockingIOError:
+            return
+        while b"\n" in self.told:
+            line, self.told = self.told.split(b"\n", 1)
+            word, _, value = line.partition(b" ")
+            if word == b"started":
+                self.pid = int(value)
+            elif word == b"stopped":
+                self.stops += 1
+            elif word == b"ended":
+                self.status = int(value)
 
     def drain(self, wait=0.0):
         """Take what icdu has written, waiting up to `wait` seconds for more."""
@@ -111,13 +235,9 @@ class Run:
         """True once icdu has entered its screen for the `times`-th time and drawn on it."""
         return self.out.count(ALT_ON) >= times and b"first-file" in self.out[self.out.rfind(ALT_ON):]
 
-    def poll(self, flags=0):
-        if self.status is None:
-            pid, status = os.waitpid(self.pid, os.WNOHANG | flags)
-            if pid and not os.WIFSTOPPED(status):
-                self.status = status
-            elif pid:
-                return status
+    def poll(self):
+        """The wait status of the process, or None while it is there."""
+        self.look()
         return self.status
 
     def ended(self, limit=LIMIT):
@@ -128,15 +248,16 @@ class Run:
 
     def stopped(self, limit=LIMIT):
         """Wait for the process to be stopped (as by Ctrl-Z)."""
-        state = {}
 
-        def is_stopped():
-            status = self.poll(os.WUNTRACED)
-            state["stopped"] = status is not None and os.WIFSTOPPED(status)
-            return state["stopped"] or self.status is not None
+        def stopped_or_gone():
+            self.look()
+            return self.stops > self.stops_seen or self.status is not None
 
-        self.until(is_stopped, limit)
-        return state.get("stopped", False)
+        self.until(stopped_or_gone, limit)
+        if self.stops == self.stops_seen:
+            return False
+        self.stops_seen = self.stops
+        return True
 
     def close_terminal(self):
         """What closing the window does: the terminal is gone."""
@@ -158,15 +279,34 @@ class Run:
         return problems
 
     def cleanup(self):
-        if self.status is None:
+        self.look()
+        if self.status is None and self.pid:
             try:
                 os.kill(self.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            os.waitpid(self.pid, 0)
-        for fd in (self.master, self.slave):
+        # The terminal goes before the process is waited for: on some systems a process
+        # cannot finish ending while output of its waits in a terminal that nobody reads.
+        # Closing `control` lets the stand-in for the shell go.
+        for fd in (self.master, self.slave, self.control):
             if fd is not None:
                 os.close(fd)
+        self.master = self.slave = self.control = None
+        child = self.shell if self.shell is not None else self.pid
+        deadline = time.monotonic() + LIMIT
+        while True:
+            try:
+                if os.waitpid(child, os.WNOHANG)[0]:
+                    break
+            except ChildProcessError:
+                break
+            if time.monotonic() > deadline:
+                os.kill(child, signal.SIGKILL)
+                deadline += LIMIT
+            time.sleep(0.01)
+        if self.events is not None:
+            os.close(self.events)
+            self.events = None
 
 
 def how(status):
@@ -265,6 +405,19 @@ def redraw(binary, tree):
 @check("closing the terminal ends icdu")
 def closed_terminal(binary, tree):
     run = browser(binary, tree)
+    try:
+        run.close_terminal()
+        status = run.ended()
+        if status is None:
+            return ["icdu is still running %.0f s after its terminal was closed" % LIMIT]
+        return []
+    finally:
+        run.cleanup()
+
+
+@check("closing the terminal ends icdu when it is the terminal's own command")
+def closed_terminal_of_its_own(binary, tree):
+    run = browser(binary, tree, leader=True)
     try:
         run.close_terminal()
         status = run.ended()
@@ -577,16 +730,23 @@ def main():
         with open(os.path.join(tree, name), "wb") as file:
             file.write(b"x" * size)
 
+    def too_long(signum, frame):
+        raise TimeoutError("the check did not come back within %d s" % CHECK_LIMIT)
+
+    signal.signal(signal.SIGALRM, too_long)
     failed = skipped = 0
     try:
         for name, function in CHECKS:
             if word not in name:
                 continue
             started = time.monotonic()
+            signal.alarm(CHECK_LIMIT)
             try:
                 problems = function(binary, tree)
             except Exception as error:  # a check that could not be made is a failed check
                 problems = ["%s: %s" % (type(error).__name__, error)]
+            finally:
+                signal.alarm(0)
             took = time.monotonic() - started
             if problems is None:
                 skipped += 1
