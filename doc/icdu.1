@@ -527,18 +527,20 @@ That takes a fraction of a second, and about a second if icdu is busy or the ter
 taking output.
 Closing the terminal ends icdu as well, with or without a hang-up signal.
 .PP
-.BR SIGTSTP ,
-like
-.BR Ctrl\-Z ,
-stops icdu with the terminal given back, and
+.B Ctrl\-Z
+gives the terminal back and stops icdu, and
 .B SIGCONT
 brings the browser back.
+Where no shell is above icdu that could continue it, as when icdu is the command a terminal
+was started with, the system does not stop it, and icdu says so.
+.B SIGTSTP
+from outside stops icdu as it is, like
+.BR SIGSTOP ;
+the screen is set up again when icdu is continued.
 .PP
 While a shell or the delete command has the terminal,
 .BR SIGTERM " and " SIGHUP
-end icdu at once, and
-.B SIGTSTP
-stops it.
+end icdu at once.
 .BR Ctrl\-C " and " Ctrl\-\e
 typed there are for that command and do not end icdu.
 .PP

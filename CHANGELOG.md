@@ -35,6 +35,11 @@ history was separated; they do not match the pull requests of this repository.
 - `Ctrl-C` typed in a command that icdu started (`NCDU_SHELL`, the delete command) ended
   icdu along with the command. It is the command's alone now.
 - `SIGTSTP` did nothing while a shell or the delete command had the terminal. It stops icdu.
+- `Ctrl-Z` froze the terminal where icdu ran without a shell above it (`ssh -t host icdu /`,
+  `xterm -e icdu`): icdu stopped, and nothing was there to continue it. Stopping is left to
+  the system now, which does not stop a program in that position, and icdu says that it was
+  not suspended. A `SIGTSTP` sent from outside stops icdu as it is, like `SIGSTOP`; the
+  screen is set up again when it is continued.
 - Quitting left the cursor hidden, for the shell to switch on again.
 - `Ctrl-L`, and coming back after `Ctrl-Z`, ended icdu with an error on a terminal that does
   not answer when asked for the cursor position. icdu no longer asks.

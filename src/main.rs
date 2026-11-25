@@ -461,16 +461,19 @@ fn run_ui(app: &mut App, slow: bool) -> ! {
     }
 }
 
-/// Give the terminal back and stop the process (Ctrl-Z, or SIGTSTP from outside). Returns
-/// once the process is continued, with the TUI set up again. The scan threads stop and
-/// continue with the process.
-fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::io::Result<()> {
+/// Give the terminal back and stop the process (Ctrl-Z). Returns once the process is
+/// continued, with the TUI set up again, and says whether it had been stopped: the system does
+/// not stop a process that nothing could continue. The scan threads stop and continue with
+/// the process.
+fn suspend(terminal: &mut ratatui::DefaultTerminal, signals: &Signals) -> std::io::Result<bool> {
     restore_terminal();
+    // A report from before is not about this stop.
+    signals.take_cont();
     signals::stop_process();
-    // Running again. The SIGCONT that woke us needs no second answer.
-    signals.continued();
+    let stopped = signals.continued();
     *terminal = init_terminal()?;
-    clear_screen(terminal)
+    clear_screen(terminal)?;
+    Ok(stopped)
 }
 
 /// How long a frame may spend taking scan results into the tree. With drawing on top, this
@@ -505,11 +508,10 @@ fn run(
         if let Some(signal) = signals.terminated() {
             return Ok(Some(signal));
         }
-        if signals.take_stop() {
-            suspend(terminal, signals)?;
-        } else if signals.take_cont() {
-            // Stopped and continued behind our back (SIGSTOP cannot be caught): whatever
-            // ran in between may have changed the terminal. Set it up again.
+        if signals.take_cont() {
+            // Stopped and continued from outside (SIGSTOP, or SIGTSTP, which has no handler:
+            // see `signals.rs`). Whatever ran in between may have changed the terminal. Set
+            // it up again.
             restore_terminal();
             *terminal = init_terminal()?;
             clear_screen(terminal)?;
@@ -594,7 +596,12 @@ fn run(
                     match decode_key(key.code, key.modifiers, mode, page) {
                         // The actions that need the terminal itself.
                         Some(KeyAction::Redraw) => clear_screen(terminal)?,
-                        Some(KeyAction::Suspend) => suspend(terminal, signals)?,
+                        Some(KeyAction::Suspend) => {
+                            if !suspend(terminal, signals)? {
+                                app.status =
+                                    Some("not suspended: there is no shell to return to".into());
+                            }
+                        }
                         Some(action) => app.on_key(action),
                         None => {}
                     }

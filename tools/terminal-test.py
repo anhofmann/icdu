@@ -15,7 +15,8 @@ What is covered:
   - quitting, and SIGTERM, SIGHUP, SIGINT and SIGQUIT in the browser
   - a terminal that is closed, with and without the hang-up signal
   - a terminal that stops taking output
-  - Ctrl-Z, SIGTSTP and SIGCONT, and SIGTERM or a closed terminal for a stopped icdu
+  - Ctrl-Z under a shell and without one, SIGTSTP and SIGCONT, and SIGTERM or a closed
+    terminal for a stopped icdu
   - the signals while a command started with `b`, or the delete command, has the terminal
   - Ctrl-L
   - signals before the browser has started, and a start without any terminal
@@ -480,7 +481,7 @@ def stuck_terminal(binary, tree):
         run.cleanup()
 
 
-def suspend_and_resume(stop):
+def suspend_and_resume(stop, given_back=True):
     def function(binary, tree):
         run = browser(binary, tree)
         try:
@@ -488,7 +489,9 @@ def suspend_and_resume(stop):
             if not run.stopped():
                 return ["icdu did not stop: %s" % how(run.status)]
             run.drain(0.1)
-            problems = ["while stopped: " + p for p in run.terminal_problems()]
+            problems = []
+            if given_back:
+                problems = ["while stopped: " + p for p in run.terminal_problems()]
             os.kill(run.pid, signal.SIGCONT)
             if not run.until(lambda: run.in_browser(2)):
                 return problems + ["the browser did not come back after SIGCONT"]
@@ -509,9 +512,31 @@ def suspend_and_resume(stop):
 check("Ctrl-Z stops icdu with the terminal given back, and SIGCONT brings it back")(
     suspend_and_resume(lambda run: run.send(b"\x1a"))
 )
-check("SIGTSTP stops icdu with the terminal given back, and SIGCONT brings it back")(
-    suspend_and_resume(lambda run: os.kill(run.pid, signal.SIGTSTP))
+# From outside, SIGTSTP stops icdu as it is, like SIGSTOP: icdu has no handler for it, so
+# that the system can decide whether to stop it at all (the next check).
+check("SIGTSTP from outside stops icdu, and SIGCONT brings the browser back")(
+    suspend_and_resume(lambda run: os.kill(run.pid, signal.SIGTSTP), given_back=False)
 )
+
+
+@check("Ctrl-Z does not stop icdu where no shell is above it")
+def no_stop_without_a_shell(binary, tree):
+    # As the terminal's own command, nothing could continue icdu: the window would be
+    # frozen. The system does not stop a process in that position, if it is left to it.
+    run = browser(binary, tree, leader=True)
+    try:
+        run.send(b"\x1a")
+        if run.stopped(1.5):
+            return ["icdu is stopped, and nothing is there to continue it"]
+        problems = []
+        if not run.until(lambda: run.in_browser(2) and run.seen(b"not suspended")):
+            problems.append("the browser did not come back and say so: %s" % how(run.poll()))
+        run.send(b"q")
+        if not exit_status(run.ended(), 0):
+            problems.append("expected to quit with status 0: %s" % how(run.status))
+        return problems
+    finally:
+        run.cleanup()
 
 
 @check("SIGTERM for a stopped icdu takes effect when it is continued")
