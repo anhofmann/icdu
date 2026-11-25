@@ -12,6 +12,13 @@ history was separated; they do not match the pull requests of this repository.
 
 ## [Unreleased]
 
+### Changed
+
+- **The footer shows how many entries the scan reads per second** (`files/s`), over the last
+  30 seconds, instead of the size found per second. The size said nothing about the speed of
+  the scan: one big file made it look fast. The new figure drops when the scan slows down,
+  e.g. on reaching a slow mount.
+
 ### Fixed
 
 - **Closing the terminal left icdu running** (0.5.0): the process stayed, kept one processor

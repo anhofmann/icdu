@@ -811,12 +811,13 @@ fn sort_label(sort: Sort, disk_usage: bool) -> String {
 }
 
 /// What the running scans have done and have left to do, for the footer:
-/// `scanning  12.3 MiB/s  1,234 dirs  56,789 files  321 dirs left`. The last figure is not a
+/// `scanning  4,821 files/s  1,234 dirs  56,789 files  321 dirs left`. The rate counts every
+/// entry read, directories too, over the last half minute. The last figure is not a
 /// percentage (the total is unknown until the scan is over), but it shrinks to nothing, which
 /// tells the user the scan is getting there.
 fn scan_progress(rate: Option<u64>, dirs: u64, files: u64, left: u32) -> String {
     let rate = rate
-        .map(|bytes| format!("  {}/s", fmt_size(bytes).trim_start()))
+        .map(|entries| format!("  {} files/s", fmt_count(entries as usize)))
         .unwrap_or_default();
     let left = match left {
         0 => String::new(),
@@ -1876,8 +1877,8 @@ mod tests {
     #[test]
     fn scan_progress_says_what_is_left() {
         assert_eq!(
-            scan_progress(Some(12 << 20), 1_234, 56_789, 321),
-            "scanning  12.0 MiB/s  1,234 dirs  56,789 files  321 dirs left"
+            scan_progress(Some(4_821), 1_234, 56_789, 321),
+            "scanning  4,821 files/s  1,234 dirs  56,789 files  321 dirs left"
         );
         assert_eq!(
             scan_progress(None, 1, 0, 1),
@@ -1886,7 +1887,7 @@ mod tests {
         // The last batches are in but the streams have not closed yet.
         assert_eq!(
             scan_progress(Some(0), 10, 20, 0),
-            "scanning  0   B/s  10 dirs  20 files"
+            "scanning  0 files/s  10 dirs  20 files"
         );
     }
 

@@ -5,7 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io::BufWriter;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -544,12 +544,21 @@ struct ScanHandle {
     rx: Events,
     refresh: bool,
     alive: bool,
-    /// When this stream started, and the counted bytes it has delivered, in both metrics:
-    /// the footer shows the throughput of the streams that are running.
+    /// When this stream started, and the entries it has delivered lately: the footer shows
+    /// how fast the running streams read.
     started: Instant,
-    apparent: u64,
-    disk: u64,
+    /// Entries delivered in the last [`RATE_WINDOW`], as (when, how many), oldest first.
+    /// Batches that arrive within [`RATE_SAMPLE`] of each other share one sample, so this
+    /// stays short however fast the scan is.
+    recent: VecDeque<(Instant, u64)>,
 }
+
+/// The footer's scan rate is what the running scans read in this much time, not the average
+/// since the start: it shows when a scan slows down, e.g. on reaching a slow mount.
+const RATE_WINDOW: Duration = Duration::from_secs(30);
+
+/// How close together batches may arrive and still be counted as one sample of the rate.
+const RATE_SAMPLE: Duration = Duration::from_millis(100);
 
 impl ScanHandle {
     fn new(rx: Events, refresh: bool, started: Instant) -> Self {
@@ -558,9 +567,33 @@ impl ScanHandle {
             refresh,
             alive: true,
             started,
-            apparent: 0,
-            disk: 0,
+            recent: VecDeque::new(),
         }
+    }
+
+    /// Note `entries` delivered at `now`, and forget what has left the rate window.
+    fn record(&mut self, now: Instant, entries: u64) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) >= RATE_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        match self.recent.back_mut() {
+            Some((t, n)) if now.saturating_duration_since(*t) < RATE_SAMPLE => {
+                *n = n.saturating_add(entries)
+            }
+            _ => self.recent.push_back((now, entries)),
+        }
+    }
+
+    /// The entries this stream delivered in the [`RATE_WINDOW`] up to `now`.
+    fn recent_entries(&self, now: Instant) -> u64 {
+        self.recent
+            .iter()
+            .filter(|&&(t, _)| now.saturating_duration_since(t) < RATE_WINDOW)
+            .fold(0u64, |sum, &(_, n)| sum.saturating_add(n))
     }
 }
 
@@ -822,6 +855,12 @@ impl App {
     /// The budget is counted in entries, not batches: a batch holds anything from nothing to
     /// thousands of entries. At least one batch is applied per call.
     pub fn poll_scans_until(&mut self, max_entries: usize, deadline: Option<Instant>) {
+        self.poll_scans_at(max_entries, deadline, Instant::now());
+    }
+
+    /// [`App::poll_scans_until`], with what arrives counted for the scan rate as arriving at
+    /// `now`.
+    fn poll_scans_at(&mut self, max_entries: usize, deadline: Option<Instant>, now: Instant) {
         let mut entries = 0usize;
         self.scan_backlog = false;
         'streams: for i in 0..self.scans.len() {
@@ -838,13 +877,9 @@ impl App {
                     Ok(batch) => {
                         // An empty directory is work too.
                         entries += batch.nodes.len().max(1);
-                        // Count the batch's bytes before `apply` moves it, for the footer's
-                        // throughput display.
-                        let stream = &mut self.scans[i];
-                        for n in batch.nodes.iter().filter(|n| n.excluded == Excluded::No) {
-                            stream.apparent = stream.apparent.saturating_add(n.apparent);
-                            stream.disk = stream.disk.saturating_add(n.disk);
-                        }
+                        // Every entry cost the scanner an `lstat`, excluded ones too: that is
+                        // the work the footer's rate measures.
+                        self.scans[i].record(now, batch.nodes.len() as u64);
                         self.tree.apply(batch);
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -1021,24 +1056,26 @@ impl App {
         self.rescan_is_resync
     }
 
-    /// Bytes per second the running scans are bringing in, for the footer, in the size
-    /// metric on screen. None when no scan is running.
+    /// Entries per second the running scans are reading right now, for the footer. None when
+    /// no scan is running.
     pub fn scan_rate(&self) -> Option<u64> {
         self.scan_rate_at(Instant::now())
     }
 
-    /// [`App::scan_rate`] at a given moment: the bytes of every stream that is still running,
-    /// over the time since the oldest of them started (at least one second, so the first
+    /// [`App::scan_rate`] at a given moment: the entries every stream that is still running
+    /// delivered in the last [`RATE_WINDOW`], over that window, or over the time since the
+    /// oldest of them started while that is shorter (at least one second, so the first
     /// second reports what has been seen so far). Each stream keeps its own count, so a
     /// rescan neither resets the figure of a scan that is still running nor inherits the
-    /// bytes of one that has finished.
+    /// entries of one that has finished.
     fn scan_rate_at(&self, now: Instant) -> Option<u64> {
         let running = || self.scans.iter().filter(|s| s.alive);
         let started = running().map(|s| s.started).min()?;
-        let bytes = running().fold(0u64, |sum, s| {
-            sum.saturating_add(if self.disk_usage { s.disk } else { s.apparent })
-        });
-        Some(bytes / now.saturating_duration_since(started).as_secs().max(1))
+        let entries = running().fold(0u64, |sum, s| sum.saturating_add(s.recent_entries(now)));
+        let span = now
+            .saturating_duration_since(started)
+            .clamp(Duration::from_secs(1), RATE_WINDOW);
+        Some((u128::from(entries) * 1000 / span.as_millis()) as u64)
     }
 
     /// Directories the running scans have not read yet, in the whole tree.
@@ -4649,36 +4686,98 @@ mod tests {
         assert!(app.scan_backlog());
     }
 
-    /// The footer's throughput figure: bytes per second of the streams that are running, in
-    /// the size metric on screen; none when nothing is being scanned.
+    /// A batch of `n` files (at least one), for the directory with id `parent_id`.
+    fn files_batch(parent_id: u64, prefix: &str, n: u64) -> Batch {
+        let mut batch = file_batch(&format!("{prefix}0"), 1);
+        batch.parent_id = parent_id;
+        for i in 1..n {
+            batch
+                .nodes
+                .extend(file_batch(&format!("{prefix}{i}"), i + 1).nodes);
+        }
+        batch
+    }
+
+    /// The footer's rate: entries per second of the streams that are running, excluded
+    /// entries included (the scanner `lstat`ed them too); none when nothing is being scanned.
     #[test]
-    fn scan_rate_counts_in_the_metric_on_screen() {
+    fn scan_rate_counts_entries_per_second() {
         let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
         let t0 = Instant::now();
+        let secs = Duration::from_secs;
         assert_eq!(app.scan_rate_at(t0), None, "no scan attached");
 
         let tx = add_stream(&mut app, false, t0);
-        // A sparse file: 4 GB by its length, 8 MB on disk.
-        tx.send(sized_batch(0, "sparse", 4_000_000_000, 8_000_000))
-            .unwrap();
-        app.poll_scans(100);
+        tx.send(files_batch(0, "a", 8)).unwrap();
+        app.poll_scans_at(100, None, t0);
         // Within the first second the rate is what has been seen so far.
-        assert_eq!(app.scan_rate_at(t0), Some(8_000_000), "disk usage");
+        assert_eq!(app.scan_rate_at(t0), Some(8));
+        assert_eq!(app.scan_rate_at(t0 + secs(4)), Some(2));
+
+        // Sizes do not matter, and excluded entries count.
+        let mut batch = files_batch(0, "b", 4);
+        batch.nodes[0].apparent = u64::MAX;
+        batch.nodes[1].excluded = Excluded::Pattern;
+        batch.nodes[2].excluded = Excluded::OtherFs;
+        tx.send(batch).unwrap();
+        app.poll_scans_at(100, None, t0 + secs(4));
         assert_eq!(
-            app.scan_rate_at(t0 + Duration::from_secs(4)),
-            Some(2_000_000)
-        );
-        app.on_key(KeyAction::ToggleUsage);
-        assert_eq!(
-            app.scan_rate_at(t0 + Duration::from_secs(4)),
-            Some(1_000_000_000),
-            "apparent size"
+            app.scan_rate_at(t0 + secs(4)),
+            Some(3),
+            "12 entries in 4 seconds"
         );
 
         drop(tx);
-        app.poll_scans(100);
+        app.poll_scans_at(100, None, t0 + secs(5));
         assert!(!app.scanning);
-        assert_eq!(app.scan_rate_at(t0 + Duration::from_secs(5)), None);
+        assert_eq!(app.scan_rate_at(t0 + secs(5)), None);
+    }
+
+    /// The rate is what was read in the last 30 seconds, not the average since the start:
+    /// a scan that has stopped making progress drops to 0.
+    #[test]
+    fn scan_rate_is_the_current_rate() {
+        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), true, false, true);
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        let tx = add_stream(&mut app, false, t0);
+        tx.send(files_batch(0, "a", 300)).unwrap();
+        app.poll_scans_at(1000, None, t0);
+        tx.send(files_batch(0, "b", 300)).unwrap();
+        app.poll_scans_at(1000, None, t0 + secs(10));
+        assert_eq!(
+            app.scan_rate_at(t0 + secs(10)),
+            Some(60),
+            "600 in 10 seconds"
+        );
+        assert_eq!(
+            app.scan_rate_at(t0 + secs(30)),
+            Some(10),
+            "the first 300 have left the window: 300 in the last 30 seconds"
+        );
+        assert_eq!(
+            app.scan_rate_at(t0 + secs(40)),
+            Some(0),
+            "nothing for 30 seconds"
+        );
+
+        // Batches that arrive close together share a sample, and old samples are dropped, so
+        // a long fast scan keeps only a few hundred of them.
+        for i in 0..1_000u64 {
+            tx.send(files_batch(0, &format!("c{i}-"), 1)).unwrap();
+            app.poll_scans_at(10, None, t0 + secs(40) + Duration::from_millis(60 * i));
+        }
+        assert!(
+            app.scans[0].recent.len() <= 301,
+            "{}",
+            app.scans[0].recent.len()
+        );
+        let end = t0 + secs(40) + Duration::from_millis(60 * 999);
+        assert_eq!(
+            app.scan_rate_at(end),
+            Some(16),
+            "one entry every 60 ms: 500 in the last 30 seconds"
+        );
     }
 
     /// A rescan that starts while the first scan is still running does not reset the figure:
@@ -4689,29 +4788,29 @@ mod tests {
         let t0 = Instant::now();
         let secs = Duration::from_secs;
         let first = add_stream(&mut app, false, t0);
-        first.send(sized_batch(0, "a", 6_000, 6_000)).unwrap();
-        app.poll_scans(100);
-        assert_eq!(app.scan_rate_at(t0 + secs(2)), Some(3_000));
+        first.send(files_batch(0, "a", 6)).unwrap();
+        app.poll_scans_at(100, None, t0);
+        assert_eq!(app.scan_rate_at(t0 + secs(2)), Some(3));
 
         // Two seconds in, a rescan of some directory starts and delivers as well.
         let base = SCAN_ID_STRIDE;
         app.tree.begin_refresh(app.tree.root, base);
         let rescan = add_stream(&mut app, true, t0 + secs(2));
-        rescan.send(sized_batch(base, "b", 2_000, 2_000)).unwrap();
-        app.poll_scans(100);
+        rescan.send(files_batch(base, "b", 2)).unwrap();
+        app.poll_scans_at(100, None, t0 + secs(2));
         assert_eq!(
             app.scan_rate_at(t0 + secs(4)),
-            Some(2_000),
-            "8,000 bytes in the 4 seconds since the older stream started"
+            Some(2),
+            "8 entries in the 4 seconds since the older stream started"
         );
 
         // The first scan is done: what remains is the rescan, measured from its own start.
         drop(first);
-        app.poll_scans(100);
+        app.poll_scans_at(100, None, t0 + secs(4));
         assert!(app.scanning, "the rescan is still running");
-        assert_eq!(app.scan_rate_at(t0 + secs(4)), Some(1_000));
+        assert_eq!(app.scan_rate_at(t0 + secs(4)), Some(1));
         drop(rescan);
-        app.poll_scans(100);
+        app.poll_scans_at(100, None, t0 + secs(4));
         assert_eq!(app.scan_rate_at(t0 + secs(4)), None);
     }
 
@@ -5865,45 +5964,6 @@ mod tests {
         app.find_tick(t0 + FIND_REPASS * 3, usize::MAX);
         assert!(!app.find_busy());
         assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
-    }
-
-    /// The footer's byte counter saturates like the totals do.
-    #[test]
-    fn scan_rate_saturates() {
-        use crate::scan::NewNode;
-        let huge = |name: &str, ino| NewNode {
-            name: name.into(),
-            raw_name: None,
-            kind: NodeKind::File,
-            apparent: u64::MAX / 2 + 1,
-            disk: 4096,
-            dev: 1,
-            ino,
-            hlink: false,
-            nlink: 1,
-            excluded: Excluded::No,
-            error: None,
-            dir_id: None,
-            followed: None,
-        };
-        let mut app = App::new(Tree::new("/r".into(), 0, 0, 1, 1), false, false, true);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let started = Instant::now();
-        app.scans
-            .push(ScanHandle::new(Events::from_channel(rx), false, started));
-        tx.send(Batch {
-            parent_id: 0,
-            nodes: vec![huge("x", 2), huge("y", 3)],
-            error: None,
-            more: false,
-            ext: Vec::new(),
-        })
-        .unwrap();
-        app.poll_scans(100);
-        assert_eq!(app.scan_rate_at(started), Some(u64::MAX));
-        drop(tx);
-        app.poll_scans(100);
-        assert_eq!(app.size_of(app.tree.root), u64::MAX);
     }
 
     /// Entries a running scan adds after the pass are picked up by later ticks.
