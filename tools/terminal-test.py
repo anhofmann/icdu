@@ -41,6 +41,10 @@ import time
 # the point is that it happens at all, also on a slow machine.
 LIMIT = 6.0
 
+# How long icdu gets to show its first screen. Starting is not what the checks are about, and
+# a machine that is busy with something else must not fail them.
+START_LIMIT = 30.0
+
 # How long one check may take altogether before it is given up.
 CHECK_LIMIT = 90
 
@@ -341,9 +345,13 @@ def check(name):
 def browser(binary, tree, options=(), **more):
     """icdu in the browser, with the scan of the small tree over."""
     run = Run(binary, ["--ignore-config", *options, tree], **more)
-    if not run.until(run.in_browser):
+    run.until(lambda: run.in_browser() or run.poll() is not None, START_LIMIT)
+    if not run.in_browser():
+        # Enough to tell next time whether icdu was slow, stopped, or gone.
+        state = "stopped" if run.stops else how(run.poll())
+        said = bytes(run.out[-200:])
         run.cleanup()
-        raise RuntimeError("the browser did not come up: %r" % bytes(run.out[-200:]))
+        raise RuntimeError("the browser did not come up: icdu is %s and wrote %r" % (state, said))
     return run
 
 
