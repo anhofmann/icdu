@@ -814,7 +814,8 @@ fn sort_label(sort: Sort, disk_usage: bool) -> String {
 /// `scanning  4,821 files/s  1,234 dirs  56,789 files  321 dirs left`. The rate counts every
 /// entry read, directories too, over the last half minute. The last figure is not a
 /// percentage (the total is unknown until the scan is over), but it shrinks to nothing, which
-/// tells the user the scan is getting there.
+/// tells the user the scan is getting there. It is left out (`left` is 0) where the header
+/// has the same number.
 fn scan_progress(rate: Option<u64>, dirs: u64, files: u64, left: u32) -> String {
     let rate = rate
         .map(|entries| format!("  {} files/s", fmt_count(entries as usize)))
@@ -865,13 +866,19 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Cyan),
         ))
     } else if app.scanning {
+        // The header says how many directories are left below the one on screen. Where that
+        // is all there is left, as at the top, the footer does not say it a second time.
+        let left = match app.dirs_left() {
+            here if here == app.tree.nodes[app.cur].unscanned => 0,
+            everywhere => everywhere,
+        };
         let mut text = format!(
             "{spinner} {}",
             scan_progress(
                 app.scan_rate(),
                 app.tree.total_dirs,
                 app.tree.total_files,
-                app.dirs_left(),
+                left,
             )
         );
         // An in-place rescan is worth naming.
@@ -1819,9 +1826,66 @@ mod tests {
         let both = footer(&scanning);
         assert!(both.starts_with(" no read errors"), "{both}");
         assert!(
-            both.contains("scanning") && both.contains("1 dir left"),
+            both.contains("scanning") && both.contains("0 files"),
             "{both}"
         );
+    }
+
+    /// How many directories are left to read is on screen once: in the header, for the
+    /// directory on screen, and in the footer only where the whole tree has another number.
+    #[test]
+    fn what_is_left_to_read_is_said_once() {
+        use crate::scan::{Batch, NewNode};
+        let dir = |name: &str, id: u64| NewNode {
+            name: name.into(),
+            raw_name: None,
+            kind: NodeKind::Dir,
+            apparent: 0,
+            disk: 0,
+            dev: 1,
+            ino: id,
+            hlink: false,
+            nlink: 1,
+            excluded: Excluded::No,
+            error: None,
+            dir_id: Some(id),
+            followed: None,
+        };
+        let read = |parent_id, nodes| Batch {
+            parent_id,
+            nodes,
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        };
+        let mut t = Tree::new("/data".into(), 0, 0, 1, 1);
+        t.apply(read(0, vec![dir("a", 1), dir("b", 2)]));
+        let a = t.nodes.iter().position(|n| n.name == "a").unwrap();
+        let mut app = crate::app::App::new(t, true, false, true);
+        let said = |app: &crate::app::App| {
+            let rows = screen(app, 140, 12);
+            (rows[1].clone(), rows[11].clone())
+        };
+
+        // At the top, all that is left is below the directory on screen.
+        let (header, footer) = said(&app);
+        assert!(header.ends_with("2 directories left to read"), "{header}");
+        assert!(
+            footer.contains("scanning") && !footer.contains("left"),
+            "{footer}"
+        );
+
+        // In `a`, one of the two is below it. The header says that, the footer the total.
+        app.cur = a;
+        let (header, footer) = said(&app);
+        assert!(header.ends_with("1 directory left to read"), "{header}");
+        assert!(footer.ends_with("2 dirs left"), "{footer}");
+
+        // `a` has been read and the scan goes on elsewhere: only the footer has a number.
+        app.tree.apply(read(1, Vec::new()));
+        let (header, footer) = said(&app);
+        assert!(!header.contains("left"), "{header}");
+        assert!(footer.ends_with("1 dir left"), "{footer}");
     }
 
     /// The search popup over the list: a title with the number of matches and the scope,

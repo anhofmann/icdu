@@ -18,6 +18,9 @@ history was separated; they do not match the pull requests of this repository.
   30 seconds, instead of the size found per second. The size said nothing about the speed of
   the scan: one big file made it look fast. The new figure drops when the scan slows down,
   e.g. on reaching a slow mount.
+- While a scan runs, the number of directories left to read was on screen twice, in the
+  header and in the footer. The footer has it only where it is another number: the whole
+  tree's, while the header counts what is below the directory on screen.
 
 ### Fixed
 
