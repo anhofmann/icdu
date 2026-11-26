@@ -524,10 +524,10 @@ impl Tree {
         }
     }
 
-    fn bump_unscanned(&mut self, start: NodeIdx, delta: i32) {
+    fn bump_unscanned(&mut self, start: NodeIdx, delta: i64) {
         let mut cur = Some(start);
         while let Some(i) = cur {
-            let v = self.nodes[i].unscanned as i64 + delta as i64;
+            let v = i64::from(self.nodes[i].unscanned) + delta;
             self.nodes[i].unscanned = v.max(0) as u32;
             cur = self.nodes[i].parent;
         }
@@ -711,13 +711,18 @@ impl Tree {
     /// items — so every ancestor's total stays correct while the rescan streams back in — and
     /// the subtree is marked unscanned again. `id_base` registers the node as the root of a new
     /// scan generation (see `scan::start_at`); batches from that scan graft back into this node.
+    ///
+    /// The subtree has to be read completely, or else no scan may be running any more (one
+    /// that was stopped): a scan could still deliver into it and count twice.
     pub fn begin_refresh(&mut self, idx: NodeIdx, id_base: u64) {
         self.generation += 1;
         debug_assert!(self.nodes[idx].is_dir());
         debug_assert!(
-            self.subtree_complete(idx),
-            "only a fully scanned subtree may be rescanned"
+            self.subtree_complete(idx) || self.dir_index.is_empty(),
+            "only a fully scanned subtree may be rescanned while a scan runs"
         );
+        // What a stopped scan left unread below here is detached with the rest.
+        let unread = self.nodes[idx].unscanned;
         // Own size first: the aggregate minus the counted children is this node's own size,
         // which is what the reset aggregate becomes.
         let (own_apparent, own_disk) = (self.own_apparent(idx), self.own_disk(idx));
@@ -778,7 +783,7 @@ impl Tree {
         // This directory is unread again, and every ancestor has to count it: the batch that
         // reads it takes one off the whole chain (see `graft`), and until then nothing above
         // it may pass the delete/rescan gate.
-        self.bump_unscanned(idx, 1);
+        self.bump_unscanned(idx, 1 - i64::from(unread));
         self.dir_index.insert(id_base, idx);
         // Inodes whose counted link was below `idx` are counted through a link elsewhere in
         // the tree from now on, if they have one. The links the rescan brings back are then
@@ -838,6 +843,33 @@ impl Tree {
         }
         parts.reverse();
         parts.join("/")
+    }
+
+    /// The path of `idx` below `base` as the search matches it, into `out`: `/a/b/name`, with
+    /// a `/` after a directory. Returns where the name starts in it.
+    pub fn search_path(&self, idx: NodeIdx, base: NodeIdx, out: &mut String) -> usize {
+        out.clear();
+        let mut parts = Vec::new();
+        let mut cur = idx;
+        while cur != base {
+            match self.nodes[cur].parent {
+                Some(p) => {
+                    parts.push(self.nodes[cur].name.as_str());
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        let mut name_start = 0;
+        for part in parts.iter().rev() {
+            out.push('/');
+            name_start = out.len();
+            out.push_str(part);
+        }
+        if self.nodes[idx].is_dir() {
+            out.push('/');
+        }
+        name_start
     }
 
     /// Flag or unflag `idx` as unreadable, and keep the error counts of its ancestors in step.
@@ -1516,6 +1548,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A scan that was stopped leaves directories unread. Once no scan runs, one of them can
+    /// be read again with `r`: the rescan takes what the stopped scan left below it off every
+    /// count, so only the rescan's own directories are waiting, and the rest stays unread.
+    #[test]
+    fn a_rescan_after_a_stopped_scan_reads_what_was_left() {
+        let mut t = Tree::new("/r".into(), 100, 100, 1, 1);
+        t.apply(Batch {
+            parent_id: 0,
+            nodes: vec![dir("a", 1), dir("c", 2)],
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        });
+        // `a` was read and holds `b`; the scan stopped before `b` and `c`.
+        t.apply(Batch {
+            parent_id: 1,
+            nodes: vec![file("x", 11), dir("b", 3)],
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        });
+        t.finish_scan();
+        let (a, c) = (idx_of(&t, "a"), idx_of(&t, "c"));
+        assert_eq!(t.nodes[t.root].unscanned, 2, "b and c");
+        assert_counts_in_step(&t, "stopped");
+
+        let base = 1 << 40;
+        t.begin_refresh(a, base);
+        assert_eq!(
+            t.nodes[a].unscanned, 1,
+            "only a itself, b is gone with the rest"
+        );
+        assert_eq!(t.nodes[t.root].unscanned, 2, "a and c");
+        assert_counts_in_step(&t, "rescan started");
+
+        t.apply(Batch {
+            parent_id: base,
+            nodes: vec![file("x", 11)],
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        });
+        assert!(t.subtree_complete(a));
+        assert!(!t.subtree_complete(c), "c was not asked for");
+        assert_eq!(t.nodes[t.root].unscanned, 1);
+        assert_counts_in_step(&t, "rescan done");
+        assert_eq!(t.total_files, 1);
     }
 
     /// A rescan makes its directory unread again, and every ancestor has to know: their

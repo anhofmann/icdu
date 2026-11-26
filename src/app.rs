@@ -17,7 +17,7 @@ use crossbeam_channel::{unbounded, Receiver};
 
 use crate::delete::{kind_of, Plan, Report};
 use crate::dump::Exporter;
-use crate::matcher::Matcher;
+use crate::matcher::Query;
 use crate::model::{Excluded, Ext, NodeIdx, NodeKind, Tree};
 use crate::natsort::{natural_cmp, prefix, prefix_order};
 use crate::scan::{
@@ -175,6 +175,23 @@ const FIND_RESORT: Duration = Duration::from_millis(250);
 /// How long a capped hit list stands during a scan before the tree is searched again: sizes
 /// grow, and what was too small to be listed may not be any more.
 pub const FIND_REPASS: Duration = Duration::from_secs(2);
+
+/// For a query that looks at paths: whether the path of `idx` below `base` matches. Kept out
+/// of the search loop, which is the same for name queries then as without paths.
+#[inline(never)]
+fn path_matches(
+    query: &Query,
+    tree: &Tree,
+    idx: NodeIdx,
+    base: NodeIdx,
+    path: &mut String,
+) -> bool {
+    if !query.wants_path() {
+        return true;
+    }
+    let name_start = tree.search_path(idx, base, path);
+    query.matches_path(path, name_start)
+}
 
 /// State of the search popup (`/`).
 ///
@@ -359,19 +376,27 @@ impl Find {
 
         let Some(query) = &self.active else { return };
         // Prepared once per frame, used for every node of the slice.
-        let matcher = Matcher::new(query);
+        let query = Query::new(query);
         let was_busy = self.cursor < len;
         let end = len.min(self.cursor.saturating_add(budget));
         // Tombstones exist only after a delete or rescan; until then skip the parent walk.
         let check_attached = tree.detached > 0;
-        // The whole pass stays linear: the walk up to the scope is paid only by names that
-        // match. Scoped to the root is the whole tree.
-        let scope = self.scope().filter(|&d| d != tree.root);
+        // The whole pass stays linear: the walk up to the scope, and the path a path query
+        // looks at, are paid only by names that match. Scoped to the root is the whole tree.
+        let base = self.scope().unwrap_or(tree.root);
+        let scope = Some(base).filter(|&d| d != tree.root);
+        let mut path = String::new();
+        let names = query.name_matcher();
         for i in self.cursor..end {
+            let name_matches = match names {
+                Some(matcher) => matcher.matches(&tree.nodes[i].name),
+                None => query.matches_name(&tree.nodes[i].name, tree.nodes[i].is_dir()),
+            };
             if i != tree.root
-                && matcher.matches(&tree.nodes[i].name)
+                && name_matches
                 && scope.is_none_or(|d| i != d && tree.is_within(i, d))
                 && (!check_attached || tree.is_attached(i))
+                && (names.is_some() || path_matches(&query, tree, i, base, &mut path))
             {
                 self.counted += 1;
                 // Keep it if there is room, or if it is larger than the smallest one kept
@@ -664,6 +689,8 @@ pub struct App {
     scan_opts: Option<Opts>,
     /// The subtree currently being rescanned in place, if any.
     pub refreshing_idx: Option<NodeIdx>,
+    /// The user stopped the running scans (`S`), and they have not all ended yet.
+    pub stopping: bool,
     /// A directory to read again as soon as the running rescan has finished: a deletion left
     /// things behind in it while another rescan held the single rescan slot.
     rescan_queued: Option<NodeIdx>,
@@ -749,6 +776,7 @@ impl App {
             controls: Vec::new(),
             scan_opts: None,
             refreshing_idx: None,
+            stopping: false,
             rescan_queued: None,
             rescan_is_resync: false,
             next_scan_base: 1,
@@ -806,6 +834,22 @@ impl App {
             1 => "1 directory".to_string(),
             left => format!("{left} directories"),
         };
+        if self.stopping {
+            self.status = Some(format!(
+                "can't {action} {} yet: the scan is stopping. Try again in a moment.",
+                n.name
+            ));
+            return;
+        }
+        if !self.scanning {
+            // A stopped scan left them unread, and nothing is going to read them.
+            let were = if n.unscanned == 1 { "was" } else { "were" };
+            self.status = Some(format!(
+                "can't {action} {}: {left} in it {were} not read. r reads it.",
+                n.name
+            ));
+            return;
+        }
         self.status = Some(format!(
             "can't {action} {} yet: {left} left to read in it. Reading it first.",
             n.name
@@ -893,7 +937,7 @@ impl App {
 
         if self.refreshing_idx.is_some() && !self.scans.iter().any(|h| h.alive && h.refresh) {
             let idx = self.refreshing_idx.take().unwrap();
-            if !std::mem::take(&mut self.rescan_is_resync) {
+            if !std::mem::take(&mut self.rescan_is_resync) && !self.stopping {
                 self.status = Some(format!("rescanned {}", self.tree.path_of(idx)));
             }
             // The rescan slot is free again: read the directory a deletion left out of step.
@@ -904,8 +948,26 @@ impl App {
         let any_alive = self.scans.iter().any(|h| h.alive);
         if self.scanning && !any_alive {
             self.scanning = false;
+            self.stopping = false;
             self.tree.finish_scan();
         }
+    }
+
+    /// Stop every running scan (`S`). What has been read stays; the directories that were not
+    /// read stay unread, marked as incomplete, and `r` reads one again. The scans end a moment
+    /// later, when their readers have left the directories they are in.
+    fn stop_scans(&mut self) {
+        if !self.scanning {
+            self.status = Some("no scan is running".into());
+            return;
+        }
+        for ctrl in &self.controls {
+            ctrl.stop();
+        }
+        self.stopping = true;
+        // Nothing is going to read the directory a refused delete or rescan waits for.
+        self.waiting_for = None;
+        self.status = Some("scan stopped. What it did not read is marked …; r reads it.".into());
     }
 
     /// True if the last poll stopped at its budget, so batches may be waiting to be applied.
@@ -991,7 +1053,9 @@ impl App {
         }
         // The subtree must be fully known before tearing it down — otherwise the original
         // scan could still deliver batches for it and double-count.
-        if !self.tree.subtree_complete(sel) {
+        // With no scan running, nothing can arrive for it any more: what a stopped scan left
+        // unread below it is read now.
+        if !self.tree.subtree_complete(sel) && self.scanning {
             self.wait_for(sel, "rescan");
             return;
         }
@@ -1037,6 +1101,7 @@ impl App {
         self.controls.push(scan.control);
         self.refreshing_idx = Some(idx);
         self.scanning = true;
+        self.stopping = false;
         Some(self.tree.path_of(idx))
     }
 
@@ -1914,9 +1979,12 @@ impl App {
             }
             Modal::ConfirmQuit => {
                 // `y` quits. Every other key is "no", as in ncdu: the point of the question
-                // is that a slip of the finger does not end a long scan.
-                if action == KeyAction::Confirm {
-                    self.quit_now();
+                // is that a slip of the finger does not end a long scan. `S` stops the scan
+                // and stays.
+                match action {
+                    KeyAction::Confirm => self.quit_now(),
+                    KeyAction::StopScan if self.scanning => self.stop_scans(),
+                    _ => {}
                 }
                 return;
             }
@@ -2172,6 +2240,7 @@ impl App {
             KeyAction::Open => self.open_selected(),
             KeyAction::TopFiles => self.open_top_files(),
             KeyAction::Refresh => self.request_refresh(),
+            KeyAction::StopScan => self.stop_scans(),
             KeyAction::Info => self.open_info(),
             KeyAction::Export => self.request_export(),
             KeyAction::NextError => self.jump_to_next_error(),
@@ -2657,6 +2726,8 @@ pub enum KeyAction {
     Cancel,
     TopFiles,
     Refresh,
+    /// `S`: stop the running scans, keeping what they read.
+    StopScan,
     Info,
     /// Jump by this many rows (the visible page height).
     PageDown(usize),
@@ -5807,9 +5878,91 @@ mod tests {
             "first hit selected"
         );
 
+        // The root's name, `/r`, is a path query from the top now: the root is not a hit, the
+        // entry at the top whose name starts with `r` is.
         let mut app = app_for_find();
         search(&mut app, "/r");
-        assert!(hit_names(&app).is_empty(), "root excluded");
+        assert_eq!(hit_names(&app), vec!["readme"], "root excluded");
+    }
+
+    /// A query with a `/` is found in the path, and the match has to reach into the name of
+    /// the entry: `sub/read` finds what starts with `read` in a directory ending in `sub`,
+    /// `sub/` finds that directory, and a leading `/` starts at the top of what is searched.
+    #[test]
+    fn find_matches_paths() {
+        let mut app = app_for_find();
+        search(&mut app, "sub/read");
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "docs/");
+        assert_eq!(
+            hit_names(&app),
+            vec!["docs"],
+            "the directory, not what is in it"
+        );
+
+        let mut app = app_for_find();
+        search(&mut app, "s/");
+        assert_eq!(hit_names(&app), vec!["docs"], "names that end in s");
+
+        let mut app = app_for_find();
+        search(&mut app, "docs/sub/readme.TXT");
+        assert_eq!(hit_names(&app), vec!["README.txt"], "case is ignored");
+
+        let mut app = app_for_find();
+        search(&mut app, "/sub");
+        assert!(hit_names(&app).is_empty(), "sub is not at the top");
+
+        let mut app = app_for_find();
+        search(&mut app, "/docs/sub/");
+        assert_eq!(hit_names(&app), vec!["sub"]);
+
+        // `/` alone: every directory.
+        let mut app = app_for_find();
+        search(&mut app, "/");
+        assert_eq!(hit_names(&app), vec!["docs", "sub"]);
+
+        // Searched from `docs`, paths start there.
+        let mut app = app_for_find();
+        app.cur = idx_named(&app, "docs");
+        search(&mut app, "/sub/r");
+        assert!(hit_names(&app).is_empty(), "the whole tree is searched");
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(Instant::now() + FIND_DEBOUNCE * 4, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+    }
+
+    /// A query with `*` or `?` is a pattern the whole name has to match, ignoring case. With
+    /// a `/` it is matched against the path, and a `/` at the end asks for directories.
+    #[test]
+    fn find_matches_patterns() {
+        let mut app = app_for_find();
+        search(&mut app, "*.md");
+        assert_eq!(hit_names(&app), vec!["readme.md"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "readme*");
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "readm?");
+        assert_eq!(hit_names(&app), vec!["readme"], "the whole name");
+
+        let mut app = app_for_find();
+        search(&mut app, "s*/");
+        assert_eq!(hit_names(&app), vec!["sub"], "directories only");
+
+        let mut app = app_for_find();
+        search(&mut app, "sub/*");
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "/*.md");
+        assert!(hit_names(&app).is_empty(), "* stays within the top level");
+        let mut app = app_for_find();
+        search(&mut app, "/docs/*.md");
+        assert_eq!(hit_names(&app), vec!["readme.md"]);
     }
 
     /// The pass runs only once the query has been left alone for the debounce interval, and
@@ -6059,6 +6212,8 @@ mod tests {
         let mut app = app_for_find();
         let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
         app.tree.begin_refresh(sub, SCAN_ID_STRIDE);
+        // As `start_rescan` does.
+        app.scanning = true;
 
         app.selected = Some(docs);
         app.on_key(KeyAction::Delete);
@@ -6293,6 +6448,153 @@ mod tests {
             app.poll_scans(20_000);
             app.poll_delete();
         }
+    }
+
+    /// An entry of `path`, as the scanner reports it; `dir_id` for a directory to be read.
+    fn entry_of(path: &Path, dir_id: Option<u64>) -> NewNode {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        NewNode {
+            name: path.file_name().unwrap().to_string_lossy().into(),
+            raw_name: None,
+            kind: if meta.is_dir() {
+                NodeKind::Dir
+            } else {
+                NodeKind::File
+            },
+            apparent: meta.len(),
+            disk: meta.blocks() * 512,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            hlink: false,
+            nlink: 1,
+            excluded: Excluded::No,
+            error: None,
+            dir_id,
+            followed: None,
+        }
+    }
+
+    /// `S` stops the scans and keeps what they read. What they did not read stays unread:
+    /// it cannot be deleted, and `r` reads it once the scans have ended.
+    #[test]
+    fn a_stopped_scan_leaves_the_rest_unread_and_r_reads_it() {
+        let root = real_dir("stop_scan");
+        std::fs::create_dir_all(root.join("a/x")).unwrap();
+        std::fs::write(root.join("a/x/inside"), b"12345").unwrap();
+        std::fs::write(root.join("a/f"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        let meta = std::fs::symlink_metadata(&root).unwrap();
+        let tree = Tree::new(
+            root.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let mut app = App::new(tree, false, false, true);
+        app.scan_opts = Some(Opts {
+            root_dev: meta.dev(),
+            ..test_opts()
+        });
+        app.controls.push(ScanControl::idle());
+        let tx = add_stream(&mut app, false, Instant::now());
+        // The scan has read the root and `a`, but not `a/x` and `c`.
+        let batch = |parent_id, nodes| Batch {
+            parent_id,
+            nodes,
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        };
+        tx.send(batch(
+            0,
+            vec![
+                entry_of(&root.join("a"), Some(1)),
+                entry_of(&root.join("c"), Some(2)),
+            ],
+        ))
+        .unwrap();
+        tx.send(batch(
+            1,
+            vec![
+                entry_of(&root.join("a/f"), None),
+                entry_of(&root.join("a/x"), Some(3)),
+            ],
+        ))
+        .unwrap();
+        app.poll_scans(100);
+        let a = idx_named(&app, "a");
+
+        app.on_key(KeyAction::StopScan);
+        assert!(app.controls[0].is_stopped());
+        assert!(app.stopping);
+        assert!(app.status.as_deref().unwrap().starts_with("scan stopped"));
+        // Until the scans have ended, something could still arrive for `a`.
+        app.cur = a;
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't rescan a yet: the scan is stopping. Try again in a moment.")
+        );
+
+        drop(tx);
+        app.poll_scans(100);
+        assert!(!app.scanning && !app.stopping);
+        assert_eq!(app.tree.nodes[app.tree.root].unscanned, 2, "a/x and c");
+        assert_eq!(app.tree.total_files, 1);
+
+        // Deleting stays refused: the user has not seen what is in `a/x`.
+        app.cur = app.tree.root;
+        app.selected = Some(a);
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no dialog");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't delete a: 1 directory in it was not read. r reads it.")
+        );
+        assert_eq!(app.waiting_for, None, "nothing is going to read it");
+
+        // `r` reads it, and only it.
+        app.cur = a;
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, Some(a), "{:?}", app.status);
+        pump(&mut app, "the rescan", |app| !app.scanning);
+        assert!(app.tree.subtree_complete(a));
+        assert_eq!(
+            app.tree.nodes[app.tree.root].unscanned, 1,
+            "c is still unread"
+        );
+        assert_eq!(app.tree.total_files, 2);
+        assert_eq!(app.size_of(a), app.tree.nodes[a].apparent);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("rescanned {}/a", root.display()).as_str())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Without a running scan there is nothing to stop.
+    #[test]
+    fn stop_without_a_scan_says_so() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::StopScan);
+        assert_eq!(app.status.as_deref(), Some("no scan is running"));
+        assert!(!app.stopping);
+    }
+
+    /// The quit question offers to stop the scan instead; `S` there stops it and stays.
+    #[test]
+    fn the_quit_question_can_stop_the_scan() {
+        let mut app = app_with_an_unfinished_directory();
+        app.confirm_quit = true;
+        let _tx = add_stream(&mut app, false, Instant::now());
+        app.on_key(KeyAction::Quit);
+        assert!(matches!(app.modal, Modal::ConfirmQuit));
+        app.on_key(KeyAction::StopScan);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(!app.quit);
+        assert!(app.controls[0].is_stopped());
     }
 
     /// Select `name` in the root view and confirm its deletion.
@@ -7182,7 +7484,21 @@ mod tests {
         }
         let nodes = t.nodes.len();
         let mut app = App::new(t, true, false, false);
-        for query in ["zzz", "file-0999", "ubung", "übung", "ÜBUNGSBLATT-0990"] {
+        for query in [
+            "zzz",
+            "file-0999",
+            "ubung",
+            "übung",
+            "ÜBUNGSBLATT-0990",
+            "dir-00999/file-0999",
+            "/dir-00999/",
+            "*.pdf",
+            "dir-0099?/*.pdf",
+        ] {
+            // The popup opens with the last search in it.
+            app.on_key(KeyAction::Find);
+            app.on_key(KeyAction::FindClear);
+            app.on_key(KeyAction::Cancel);
             let start = Instant::now();
             search(&mut app, query);
             let took = start.elapsed();

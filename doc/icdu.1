@@ -358,6 +358,36 @@ Go to the parent directory.
 .B /
 Search by name in the whole tree.
 Matches are listed as the query is typed, largest first.
+Case is ignored.
+A query with a
+.B /
+is looked for in the path of each entry, and the match has to reach into the entry's name:
+.B src/main
+finds
+.IR \&.../src/main.rs ,
+.B src/
+the directories called
+.IR src ,
+and a
+.B /
+in front starts at the top of what is searched.
+A query with
+.B *
+or
+.B ?
+is a pattern that the whole name has to match, as in a shell:
+.B *.iso
+finds the names that end in
+.IR .iso .
+With a
+.B /
+it is matched against the path, and
+.B *
+does not pass a
+.BR / ;
+a
+.B /
+at the end asks for directories.
 .B Enter
 goes to the selected one,
 .B Tab
@@ -412,6 +442,17 @@ A directory can only be deleted when all of it has been scanned.
 .TP
 .B r
 Scan the directory on screen again.
+.TP
+.B S
+Stop the scan.
+What it has read stays, and the directories it has not read are marked as unfinished.
+They cannot be deleted;
+.B r
+reads them.
+Also offered by the question that
+.B \-\-confirm\-quit
+asks.
+Not in ncdu.
 .TP
 .B b
 Start a shell in the directory on screen.

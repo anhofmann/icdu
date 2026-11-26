@@ -256,6 +256,9 @@ struct Frontier {
     /// Queued + in-flight jobs. The scan is finished when this hits zero.
     pending: usize,
     done: bool,
+    /// The user stopped the scan: nothing is queued any more, and the directories that are
+    /// being read are left as soon as possible.
+    stopped: bool,
     /// The most jobs that were ever queued at once.
     #[cfg(test)]
     peak: usize,
@@ -270,6 +273,7 @@ impl Frontier {
             stale: Vec::new(),
             pending: 1, // the root job
             done: false,
+            stopped: false,
             #[cfg(test)]
             peak: 0,
         };
@@ -294,7 +298,6 @@ impl Frontier {
         }
     }
 
-    #[cfg(test)]
     fn queued(&self) -> usize {
         self.classes.iter().chain(&self.stale).map(Queue::len).sum()
     }
@@ -320,6 +323,18 @@ impl Frontier {
         // The last queue is worked off first: what used to be most urgent goes last.
         self.stale
             .extend(old.into_iter().rev().filter(|queue| queue.len() > 0));
+    }
+
+    /// Read nothing more: drop every queued job. What is being read is the workers' to
+    /// leave; they see `stopped` when they come back to queue what they found.
+    fn stop(&mut self) {
+        self.stopped = true;
+        self.pending -= self.queued();
+        self.classes = Self::empty_classes();
+        self.stale.clear();
+        if self.pending == 0 {
+            self.done = true;
+        }
     }
 
     /// The next directory to read.
@@ -372,6 +387,16 @@ impl ScanControl {
         // Workers that are mid-directory pick up the new order on their next pop; no need to
         // wake anyone, because no job was added.
     }
+
+    /// Stop the scan: no directory is read that has not been started, and one that is being
+    /// read is left after at most [`BATCH_ENTRIES`] more entries. What was read stays in the
+    /// tree; the rest stays unread there. The event channel disconnects as usual once the
+    /// workers have left.
+    pub fn stop(&self) {
+        let (lock, cv) = &*self.frontier;
+        lock.lock().unwrap().stop();
+        cv.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +421,11 @@ impl ScanControl {
         ScanControl {
             frontier: Arc::new((Mutex::new(frontier), Condvar::new())),
         }
+    }
+
+    /// True once [`ScanControl::stop`] was called.
+    pub fn is_stopped(&self) -> bool {
+        self.frontier.0.lock().unwrap().stopped
     }
 
     /// The priorities last set: the directory to finish first, and the focused one.
@@ -845,13 +875,18 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                 None,
                 true,
             );
-            enqueue(frontier, std::mem::take(&mut child_jobs));
+            if !enqueue(frontier, std::mem::take(&mut child_jobs)) {
+                // Stopped: the directory stays unread, with the entries sent so far.
+                return;
+            }
         }
     }
 
     // The last (usually the only) batch says that the directory has been read.
     send(nodes, exts, listing.error, false);
-    enqueue(frontier, child_jobs);
+    if !child_jobs.is_empty() {
+        enqueue(frontier, child_jobs);
+    }
 }
 
 /// The filesystems that are a view into the kernel and not storage: ncdu's list for
@@ -962,17 +997,24 @@ pub fn ext_of(meta: &std::fs::Metadata) -> Ext {
 /// holds those subdirectories was sent: a node's creation then reaches the UI before any
 /// batch of its descendants, so the tree is grafted parent-first. The readdir/stat work runs
 /// outside the lock; only queueing takes it.
-fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>) {
-    if child_jobs.is_empty() {
-        return;
-    }
+///
+/// Returns false if the scan was stopped: nothing is queued then, and the caller leaves the
+/// directory it is reading.
+fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>) -> bool {
     let (lock, cv) = &**frontier;
+    if child_jobs.is_empty() {
+        return !lock.lock().unwrap().stopped;
+    }
     let mut f = lock.lock().unwrap();
+    if f.stopped {
+        return false;
+    }
     f.pending += child_jobs.len();
     for cj in child_jobs {
         f.push(cj);
     }
     cv.notify_all();
+    true
 }
 
 /// Outside the `--older-than`/`--newer-than` window: `older_than` excludes entries modified
@@ -1897,6 +1939,121 @@ mod tests {
         let received: usize = scan.events.iter().map(|b| b.nodes.len()).sum();
         assert_eq!(received, total);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Wait until the scan has sent something, then a while longer, so that its readers are
+    /// held at the gate (nothing is taken from the channel).
+    fn until_held(scan: &Scan) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while scan.events.rx.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scan sent nothing"
+            );
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    /// A stopped scan reads nothing it had not started and ends: the channel disconnects.
+    /// What it read is in the tree, consistently; the rest is unread, and counted as such.
+    #[test]
+    fn a_stopped_scan_ends_with_the_rest_unread() {
+        let base = std::env::temp_dir().join(format!("icdu_stop_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for d in 0..50 {
+            let dir = base.join(format!("d{d:02}/sub"));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..10 {
+                fs::write(dir.join(format!("f{f}")), b"x").unwrap();
+            }
+        }
+        let meta = fs::symlink_metadata(&base).unwrap();
+        let scan = start_limited(base.clone(), opts(2, meta.dev()), 0, None, 20);
+        until_held(&scan);
+        scan.control.stop();
+        assert!(scan.control.is_stopped());
+
+        let mut tree = Tree::new("root".into(), meta.len(), 0, meta.dev(), meta.ino());
+        for batch in scan.events.iter() {
+            tree.apply(batch);
+        }
+        tree.finish_scan();
+        let unread = tree
+            .nodes
+            .iter()
+            .filter(|n| n.is_dir() && !n.scanned)
+            .count();
+        assert!(unread > 0, "the scan was stopped before its end");
+        assert_eq!(tree.nodes[tree.root].unscanned as usize, unread);
+        assert!(tree.total_files < 500, "{} files", tree.total_files);
+        let files_seen = tree.nodes.iter().filter(|n| !n.is_dir()).count() as u64;
+        assert_eq!(tree.total_files, files_seen);
+        // Every entry that arrived is counted once, at the root.
+        assert_eq!(tree.nodes[tree.root].items as usize, tree.nodes.len() - 1);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A directory with more entries than go into one batch is left in the middle when the
+    /// scan is stopped: it stays unread, with what had been sent of it.
+    #[test]
+    fn a_stop_leaves_a_large_directory_in_the_middle() {
+        let base = std::env::temp_dir().join(format!("icdu_stop_big_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let big = base.join("big");
+        fs::create_dir_all(&big).unwrap();
+        for f in 0..BATCH_ENTRIES + 500 {
+            fs::write(big.join(format!("f{f}")), b"").unwrap();
+        }
+        let meta = fs::symlink_metadata(&base).unwrap();
+        // The root's batch is not taken, so the first part of `big` waits at the gate.
+        let scan = start_limited(base.clone(), opts(1, meta.dev()), 0, None, 1);
+        until_held(&scan);
+        scan.control.stop();
+
+        let mut tree = Tree::new("root".into(), meta.len(), 0, meta.dev(), meta.ino());
+        let mut parts = 0;
+        for batch in scan.events.iter() {
+            parts += 1;
+            tree.apply(batch);
+        }
+        let big = tree.nodes[tree.root].children[0];
+        assert!(!tree.nodes[big].scanned, "big stays unread");
+        assert_eq!(tree.nodes[tree.root].unscanned, 1);
+        // The reader was held with the first part, or had not started on `big` at all.
+        let read = tree.nodes[big].children.len();
+        assert!(read == BATCH_ENTRIES || read == 0, "{read} entries of big");
+        assert!(parts <= 2, "{parts} batches");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Stopping drops what is queued; the scan is over once what is being read is done.
+    #[test]
+    fn stopping_the_frontier_drops_the_queue() {
+        let job = |id| DirJob {
+            id,
+            path: PathBuf::from(format!("/d{id}")),
+        };
+        let mut f = Frontier::new(job(0));
+        let taken = f.pop().unwrap();
+        assert_eq!(taken.id, 0);
+        // The root is being read; it found three directories.
+        f.pending += 3;
+        for id in 1..=3 {
+            f.push(job(id));
+        }
+        f.set_priorities(None, Some(PathBuf::from("/d2")));
+        f.stop();
+        assert!(f.pop().is_none());
+        assert_eq!(f.pending, 1, "only the root, which is being read");
+        assert!(!f.done);
+        f.pending -= 1;
+        assert_eq!(f.queued(), 0);
+
+        // Stopped with nothing in flight: done at once.
+        let mut idle = Frontier::new(job(0));
+        idle.stop();
+        assert!(idle.done && idle.pop().is_none());
     }
 
     /// A consumer that goes away does not leave the workers waiting at the gate.
