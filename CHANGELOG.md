@@ -21,6 +21,9 @@ history was separated; they do not match the pull requests of this repository.
   path: `src/main` finds `…/src/main.rs`, `src/` the directories called `src`, and `/src`
   only the one at the top. A query with `*` or `?` is a pattern the whole name has to match:
   `*.iso` finds the names that end in `.iso`.
+- **The search can keep only what is larger than a size** (#50): `*.iso >1G` finds the
+  `.iso` files above 1 GiB, and `>1G` on its own everything that large. The units are those
+  on the screen (`--si` makes them powers of 1000).
 
 ### Changed
 

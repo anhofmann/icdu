@@ -370,13 +370,14 @@ impl Find {
         let due = self
             .passed
             .is_some_and(|at| now.saturating_duration_since(at) >= FIND_REPASS);
-        if scanning && self.capped() && self.cursor >= len && due {
+        let Some(query) = &self.active else { return };
+        // Prepared once per frame, used for every node of the slice.
+        let query = Query::new(query, crate::ui::si());
+        // So does a list with a size limit: an entry too small then may be large enough now.
+        if scanning && (self.capped() || query.has_size_limit()) && self.cursor >= len && due {
             self.search_again();
         }
 
-        let Some(query) = &self.active else { return };
-        // Prepared once per frame, used for every node of the slice.
-        let query = Query::new(query);
         let was_busy = self.cursor < len;
         let end = len.min(self.cursor.saturating_add(budget));
         // Tombstones exist only after a delete or rescan; until then skip the parent walk.
@@ -394,6 +395,7 @@ impl Find {
             };
             if i != tree.root
                 && name_matches
+                && query.matches_size(size(i))
                 && scope.is_none_or(|d| i != d && tree.is_within(i, d))
                 && (!check_attached || tree.is_attached(i))
                 && (names.is_some() || path_matches(&query, tree, i, base, &mut path))
@@ -461,7 +463,12 @@ impl Find {
             return;
         }
         self.hits.retain(|&i| tree.is_attached(i));
-        if self.capped() || self.refreshing {
+        // What is left of a directory may have shrunk below a size limit.
+        let sized = self
+            .active
+            .as_deref()
+            .is_some_and(|q| Query::new(q, crate::ui::si()).has_size_limit());
+        if self.capped() || self.refreshing || sized {
             self.search_again();
         } else {
             // Every match found so far is kept, so the count can simply follow.
@@ -5965,6 +5972,70 @@ mod tests {
         assert_eq!(hit_names(&app), vec!["readme.md"]);
     }
 
+    /// A word `>SIZE` at the end keeps only entries larger than that; on its own it lists
+    /// everything that large. A `>` word that is no size is part of the query.
+    #[test]
+    fn find_keeps_only_entries_above_a_size() {
+        let mut app = app_for_find();
+        search(&mut app, ">100");
+        assert_eq!(
+            hit_names(&app),
+            vec!["other.bin", "docs", "README.txt", "sub"]
+        );
+
+        let mut app = app_for_find();
+        search(&mut app, "readme >40");
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "sub/ >100");
+        assert_eq!(hit_names(&app), vec!["sub"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "*.md >100");
+        assert!(hit_names(&app).is_empty());
+
+        let mut app = app_for_find();
+        search(&mut app, "readme >1K");
+        assert!(hit_names(&app).is_empty(), "1K is 1024 bytes");
+
+        let mut app = app_for_find();
+        search(&mut app, "readme >many");
+        assert!(hit_names(&app).is_empty(), "a name with a > in it");
+    }
+
+    /// While a scan runs, an entry too small for the limit when the pass went by can grow
+    /// past it. A list with a size limit is searched again every so often, as a capped one is.
+    #[test]
+    fn find_with_a_size_limit_catches_up_with_the_scan() {
+        let mut app = app_for_find();
+        app.scanning = true;
+        let readme = idx_named(&app, "readme");
+        let t0 = search(&mut app, "readme >100");
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+
+        app.tree.nodes[readme].disk = 5_000;
+        app.find_tick(t0 + FIND_REPASS, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["readme", "README.txt"]);
+    }
+
+    /// A delete below a hit makes it smaller: the list is searched again, and a directory
+    /// that is no longer above the limit leaves it.
+    #[test]
+    fn find_with_a_size_limit_drops_what_a_delete_made_smaller() {
+        let mut app = app_for_find();
+        search(&mut app, ">100");
+        let readme = idx_named(&app, "README.txt");
+        app.tree.delete_subtree(readme);
+        app.prune_find();
+        app.find_tick(Instant::now(), usize::MAX);
+        assert_eq!(
+            hit_names(&app),
+            vec!["other.bin"],
+            "docs is down to 50 bytes"
+        );
+    }
+
     /// The pass runs only once the query has been left alone for the debounce interval, and
     /// every keystroke restarts the wait.
     #[test]
@@ -7494,6 +7565,8 @@ mod tests {
             "/dir-00999/",
             "*.pdf",
             "dir-0099?/*.pdf",
+            ">1M",
+            "file-0999 >1K",
         ] {
             // The popup opens with the last search in it.
             app.on_key(KeyAction::Find);

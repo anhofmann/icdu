@@ -28,10 +28,15 @@ pub fn set_si(si: bool) {
     SI.store(si, Ordering::Relaxed);
 }
 
+/// Whether sizes are in powers of 1000, as set by [`set_si`].
+pub fn si() -> bool {
+    SI.load(Ordering::Relaxed)
+}
+
 /// Human-readable size in ncdu's units: powers of 1024 (KiB, MiB), or with `--si` powers of
 /// 1000 (kB, MB).
 pub fn fmt_size(bytes: u64) -> String {
-    fmt_size_in(bytes, SI.load(Ordering::Relaxed))
+    fmt_size_in(bytes, si())
 }
 
 fn fmt_size_in(bytes: u64, si: bool) -> String {
@@ -334,8 +339,8 @@ fn find_empty_message(
 ) -> &'static str {
     match active {
         None if !query.is_empty() => "",
-        None if scoped => "  type to search below this directory: a name, a/path, *.pattern",
-        None => "  type to search the whole tree: a name, a/path, *.pattern",
+        None if scoped => "  type to search below this directory: a name, a/path, *.pattern, >1G",
+        None => "  type to search the whole tree: a name, a/path, *.pattern, >1G",
         // The list is for an earlier query, or the pass is still running.
         Some(active) if active != query || busy => "",
         // A scan may still bring a match: "no matches" would be a promise it cannot keep.
@@ -455,7 +460,7 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
             rows,
         );
         find.offset.set(offset);
-        let query = Query::new(find.active.as_deref().unwrap_or(""));
+        let query = Query::new(find.active.as_deref().unwrap_or(""), si());
         let mut slashed = String::new();
         // Size column (10 + 2 spaces) and the rest for the path.
         let path_width = (list_area.width as usize).saturating_sub(12).max(8);
@@ -1000,6 +1005,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("    again", "turn the order around"),
     ("t", "directories first, or not"),
     ("/", "search a name, a/path or *.pattern"),
+    ("    … >1G", "only what is larger than 1 GiB"),
     ("    Tab", "search this directory only"),
     ("    C-u / C-w", "clear the query / delete a word"),
     ("] / [", "next / previous match of that search"),

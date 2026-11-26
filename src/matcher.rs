@@ -31,8 +31,14 @@ use crate::glob::Pattern;
 ///   end asks for directories.
 ///
 /// Case is ignored in all three.
+///
+/// A word `>SIZE` at the end, such as `*.iso >1G`, keeps only entries larger than that, in
+/// the size the list shows. On its own it lists everything that large. The units are those
+/// of the screen: powers of 1024, or with `--si` of 1000.
 pub struct Query {
     kind: Kind,
+    /// Only entries larger than this many bytes match.
+    larger_than: Option<u64>,
 }
 
 enum Kind {
@@ -58,7 +64,9 @@ enum Kind {
 }
 
 impl Query {
-    pub fn new(query: &str) -> Self {
+    /// `si`: the units of a size limit are powers of 1000 instead of 1024.
+    pub fn new(query: &str, si: bool) -> Self {
+        let (query, larger_than) = split_size(query, si);
         let kind = if query.contains(['*', '?']) {
             let (text, dirs) = match query.strip_suffix('/') {
                 Some(text) if !text.is_empty() => (text, true),
@@ -87,7 +95,18 @@ impl Query {
         } else {
             Kind::Name(Matcher::new(query))
         };
-        Query { kind }
+        Query { kind, larger_than }
+    }
+
+    /// True if an entry of `size` bytes is large enough for the query.
+    pub fn matches_size(&self, size: u64) -> bool {
+        self.larger_than.is_none_or(|limit| size > limit)
+    }
+
+    /// True if the query keeps only entries above a size. Sizes change while a scan runs
+    /// and after a delete, so what matches does too.
+    pub fn has_size_limit(&self) -> bool {
+        self.larger_than.is_some()
     }
 
     /// The matcher of a query for names, the common kind. A search over millions of
@@ -170,6 +189,43 @@ impl Query {
             whole.find_ending_after(path, name_start)
         }
     }
+}
+
+/// Split a size limit (`>100M`, see [`Query`]) off the end of `query`: the text before it,
+/// and the limit in bytes. A `>` word that is not a size stays part of the text.
+fn split_size(query: &str, si: bool) -> (&str, Option<u64>) {
+    let (text, word) = match query.rfind(' ') {
+        Some(space) => (&query[..space], &query[space + 1..]),
+        None => ("", query),
+    };
+    match word.strip_prefix('>').and_then(|size| parse_size(size, si)) {
+        Some(limit) => (text.trim_end_matches(' '), Some(limit)),
+        None => (query, None),
+    }
+}
+
+/// A size such as `100M`, `1.5G`, `2GiB` or `4096`, in bytes. The unit letter is one of
+/// K, M, G, T, P, E in either case, optionally followed by `B`; `iB` asks for powers of 1024
+/// whatever `si` says.
+fn parse_size(text: &str, si: bool) -> Option<u64> {
+    let digits = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(digits);
+    let number: f64 = number.parse().ok()?;
+    let unit = unit.to_ascii_lowercase();
+    let (power, rest) = match unit.chars().next() {
+        None | Some('b') => (0, unit.as_str()),
+        Some(letter) => (1 + "kmgtpe".find(letter)? as i32, &unit[1..]),
+    };
+    let step: f64 = match rest {
+        "" | "b" if power == 0 => 1.0,
+        "" | "b" if si => 1000.0,
+        "" | "b" | "ib" => 1024.0,
+        _ => return None,
+    };
+    // `as` saturates: an absurd limit is the largest there is.
+    Some((number * step.powi(power)) as u64)
 }
 
 /// `text` in lower case, as patterns are matched. Most names have no capital letter and are
@@ -381,7 +437,7 @@ mod tests {
     /// Whether `query` finds the entry with the search path `path` (see [`Query`]), and what
     /// it highlights there.
     fn query_hit<'a>(query: &str, path: &'a str) -> Option<&'a str> {
-        let query = Query::new(query);
+        let query = Query::new(query, false);
         let is_dir = path.ends_with('/');
         let name_start = path.trim_end_matches('/').rfind('/').unwrap() + 1;
         let name = path[name_start..].trim_end_matches('/');
@@ -413,7 +469,7 @@ mod tests {
         assert_eq!(query_hit("/src", "/src/"), Some("/src"));
         // The match is the one that reaches the name, not the first in the path.
         assert_eq!(query_hit("a/b", "/a/b/x/a/bc"), Some("a/b"));
-        let query = Query::new("a/b");
+        let query = Query::new("a/b", false);
         assert_eq!(query.highlight("/a/b/x/a/bc", 9), Some(7..10));
         // `/`: every directory, no file.
         assert_eq!(query_hit("/", "/a/b/"), Some("/"));
@@ -441,6 +497,36 @@ mod tests {
         assert_eq!(query_hit("src/*.rs", "/icdu/src/bin/x.rs"), None);
         assert_eq!(query_hit("/*.rs", "/icdu/src/main.rs"), None);
         assert_eq!(query_hit("/icdu/*/", "/icdu/src/"), Some("src"));
+    }
+
+    /// A word `>SIZE` at the end is a size limit, in the units of the screen; the rest is
+    /// the query. Anything else with a `>` stays text.
+    #[test]
+    fn a_size_at_the_end_is_a_limit() {
+        assert_eq!(split_size("*.iso >1G", false), ("*.iso", Some(1 << 30)));
+        assert_eq!(split_size(">100M", false), ("", Some(100 << 20)));
+        assert_eq!(split_size("a b  >2k", false), ("a b", Some(2048)));
+        assert_eq!(split_size(">1.5K", false), ("", Some(1536)));
+        assert_eq!(split_size(">1G", true), ("", Some(1_000_000_000)));
+        assert_eq!(
+            split_size(">1GiB", true),
+            ("", Some(1 << 30)),
+            "iB is binary"
+        );
+        assert_eq!(split_size(">1mb", false), ("", Some(1 << 20)));
+        assert_eq!(split_size(">4096", true), ("", Some(4096)));
+        assert_eq!(split_size(">10B", false), ("", Some(10)));
+        assert_eq!(split_size(">99E", false).1, Some(u64::MAX), "saturates");
+        for text in [
+            "a>1G", "a >", "a >G", "a >1X", "a >1KiBs", "a >1iB", "a >1.2.3", "a >-1",
+        ] {
+            assert_eq!(split_size(text, false), (text, None), "{text}");
+        }
+        let query = Query::new("*.iso >1K", false);
+        assert!(query.has_size_limit());
+        assert!(!query.matches_size(1024) && query.matches_size(1025));
+        assert!(query.matches_name("x.iso", false));
+        assert!(Query::new("iso", false).matches_size(0));
     }
 
     fn found<'a>(name: &'a str, query: &str) -> Option<&'a str> {
