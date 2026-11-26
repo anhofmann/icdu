@@ -664,6 +664,8 @@ pub struct App {
     scan_opts: Option<Opts>,
     /// The subtree currently being rescanned in place, if any.
     pub refreshing_idx: Option<NodeIdx>,
+    /// The user stopped the running scans (`S`), and they have not all ended yet.
+    pub stopping: bool,
     /// A directory to read again as soon as the running rescan has finished: a deletion left
     /// things behind in it while another rescan held the single rescan slot.
     rescan_queued: Option<NodeIdx>,
@@ -749,6 +751,7 @@ impl App {
             controls: Vec::new(),
             scan_opts: None,
             refreshing_idx: None,
+            stopping: false,
             rescan_queued: None,
             rescan_is_resync: false,
             next_scan_base: 1,
@@ -806,6 +809,22 @@ impl App {
             1 => "1 directory".to_string(),
             left => format!("{left} directories"),
         };
+        if self.stopping {
+            self.status = Some(format!(
+                "can't {action} {} yet: the scan is stopping. Try again in a moment.",
+                n.name
+            ));
+            return;
+        }
+        if !self.scanning {
+            // A stopped scan left them unread, and nothing is going to read them.
+            let were = if n.unscanned == 1 { "was" } else { "were" };
+            self.status = Some(format!(
+                "can't {action} {}: {left} in it {were} not read. r reads it.",
+                n.name
+            ));
+            return;
+        }
         self.status = Some(format!(
             "can't {action} {} yet: {left} left to read in it. Reading it first.",
             n.name
@@ -893,7 +912,7 @@ impl App {
 
         if self.refreshing_idx.is_some() && !self.scans.iter().any(|h| h.alive && h.refresh) {
             let idx = self.refreshing_idx.take().unwrap();
-            if !std::mem::take(&mut self.rescan_is_resync) {
+            if !std::mem::take(&mut self.rescan_is_resync) && !self.stopping {
                 self.status = Some(format!("rescanned {}", self.tree.path_of(idx)));
             }
             // The rescan slot is free again: read the directory a deletion left out of step.
@@ -904,8 +923,26 @@ impl App {
         let any_alive = self.scans.iter().any(|h| h.alive);
         if self.scanning && !any_alive {
             self.scanning = false;
+            self.stopping = false;
             self.tree.finish_scan();
         }
+    }
+
+    /// Stop every running scan (`S`). What has been read stays; the directories that were not
+    /// read stay unread, marked as incomplete, and `r` reads one again. The scans end a moment
+    /// later, when their readers have left the directories they are in.
+    fn stop_scans(&mut self) {
+        if !self.scanning {
+            self.status = Some("no scan is running".into());
+            return;
+        }
+        for ctrl in &self.controls {
+            ctrl.stop();
+        }
+        self.stopping = true;
+        // Nothing is going to read the directory a refused delete or rescan waits for.
+        self.waiting_for = None;
+        self.status = Some("scan stopped. What it did not read is marked …; r reads it.".into());
     }
 
     /// True if the last poll stopped at its budget, so batches may be waiting to be applied.
@@ -991,7 +1028,9 @@ impl App {
         }
         // The subtree must be fully known before tearing it down — otherwise the original
         // scan could still deliver batches for it and double-count.
-        if !self.tree.subtree_complete(sel) {
+        // With no scan running, nothing can arrive for it any more: what a stopped scan left
+        // unread below it is read now.
+        if !self.tree.subtree_complete(sel) && self.scanning {
             self.wait_for(sel, "rescan");
             return;
         }
@@ -1037,6 +1076,7 @@ impl App {
         self.controls.push(scan.control);
         self.refreshing_idx = Some(idx);
         self.scanning = true;
+        self.stopping = false;
         Some(self.tree.path_of(idx))
     }
 
@@ -1914,9 +1954,12 @@ impl App {
             }
             Modal::ConfirmQuit => {
                 // `y` quits. Every other key is "no", as in ncdu: the point of the question
-                // is that a slip of the finger does not end a long scan.
-                if action == KeyAction::Confirm {
-                    self.quit_now();
+                // is that a slip of the finger does not end a long scan. `S` stops the scan
+                // and stays.
+                match action {
+                    KeyAction::Confirm => self.quit_now(),
+                    KeyAction::StopScan if self.scanning => self.stop_scans(),
+                    _ => {}
                 }
                 return;
             }
@@ -2172,6 +2215,7 @@ impl App {
             KeyAction::Open => self.open_selected(),
             KeyAction::TopFiles => self.open_top_files(),
             KeyAction::Refresh => self.request_refresh(),
+            KeyAction::StopScan => self.stop_scans(),
             KeyAction::Info => self.open_info(),
             KeyAction::Export => self.request_export(),
             KeyAction::NextError => self.jump_to_next_error(),
@@ -2657,6 +2701,8 @@ pub enum KeyAction {
     Cancel,
     TopFiles,
     Refresh,
+    /// `S`: stop the running scans, keeping what they read.
+    StopScan,
     Info,
     /// Jump by this many rows (the visible page height).
     PageDown(usize),
@@ -6059,6 +6105,8 @@ mod tests {
         let mut app = app_for_find();
         let (docs, sub) = (idx_named(&app, "docs"), idx_named(&app, "sub"));
         app.tree.begin_refresh(sub, SCAN_ID_STRIDE);
+        // As `start_rescan` does.
+        app.scanning = true;
 
         app.selected = Some(docs);
         app.on_key(KeyAction::Delete);
@@ -6293,6 +6341,153 @@ mod tests {
             app.poll_scans(20_000);
             app.poll_delete();
         }
+    }
+
+    /// An entry of `path`, as the scanner reports it; `dir_id` for a directory to be read.
+    fn entry_of(path: &Path, dir_id: Option<u64>) -> NewNode {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        NewNode {
+            name: path.file_name().unwrap().to_string_lossy().into(),
+            raw_name: None,
+            kind: if meta.is_dir() {
+                NodeKind::Dir
+            } else {
+                NodeKind::File
+            },
+            apparent: meta.len(),
+            disk: meta.blocks() * 512,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            hlink: false,
+            nlink: 1,
+            excluded: Excluded::No,
+            error: None,
+            dir_id,
+            followed: None,
+        }
+    }
+
+    /// `S` stops the scans and keeps what they read. What they did not read stays unread:
+    /// it cannot be deleted, and `r` reads it once the scans have ended.
+    #[test]
+    fn a_stopped_scan_leaves_the_rest_unread_and_r_reads_it() {
+        let root = real_dir("stop_scan");
+        std::fs::create_dir_all(root.join("a/x")).unwrap();
+        std::fs::write(root.join("a/x/inside"), b"12345").unwrap();
+        std::fs::write(root.join("a/f"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        let meta = std::fs::symlink_metadata(&root).unwrap();
+        let tree = Tree::new(
+            root.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let mut app = App::new(tree, false, false, true);
+        app.scan_opts = Some(Opts {
+            root_dev: meta.dev(),
+            ..test_opts()
+        });
+        app.controls.push(ScanControl::idle());
+        let tx = add_stream(&mut app, false, Instant::now());
+        // The scan has read the root and `a`, but not `a/x` and `c`.
+        let batch = |parent_id, nodes| Batch {
+            parent_id,
+            nodes,
+            error: None,
+            more: false,
+            ext: Vec::new(),
+        };
+        tx.send(batch(
+            0,
+            vec![
+                entry_of(&root.join("a"), Some(1)),
+                entry_of(&root.join("c"), Some(2)),
+            ],
+        ))
+        .unwrap();
+        tx.send(batch(
+            1,
+            vec![
+                entry_of(&root.join("a/f"), None),
+                entry_of(&root.join("a/x"), Some(3)),
+            ],
+        ))
+        .unwrap();
+        app.poll_scans(100);
+        let a = idx_named(&app, "a");
+
+        app.on_key(KeyAction::StopScan);
+        assert!(app.controls[0].is_stopped());
+        assert!(app.stopping);
+        assert!(app.status.as_deref().unwrap().starts_with("scan stopped"));
+        // Until the scans have ended, something could still arrive for `a`.
+        app.cur = a;
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, None);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't rescan a yet: the scan is stopping. Try again in a moment.")
+        );
+
+        drop(tx);
+        app.poll_scans(100);
+        assert!(!app.scanning && !app.stopping);
+        assert_eq!(app.tree.nodes[app.tree.root].unscanned, 2, "a/x and c");
+        assert_eq!(app.tree.total_files, 1);
+
+        // Deleting stays refused: the user has not seen what is in `a/x`.
+        app.cur = app.tree.root;
+        app.selected = Some(a);
+        app.on_key(KeyAction::Delete);
+        assert!(matches!(app.modal, Modal::None), "no dialog");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("can't delete a: 1 directory in it was not read. r reads it.")
+        );
+        assert_eq!(app.waiting_for, None, "nothing is going to read it");
+
+        // `r` reads it, and only it.
+        app.cur = a;
+        app.on_key(KeyAction::Refresh);
+        assert_eq!(app.refreshing_idx, Some(a), "{:?}", app.status);
+        pump(&mut app, "the rescan", |app| !app.scanning);
+        assert!(app.tree.subtree_complete(a));
+        assert_eq!(
+            app.tree.nodes[app.tree.root].unscanned, 1,
+            "c is still unread"
+        );
+        assert_eq!(app.tree.total_files, 2);
+        assert_eq!(app.size_of(a), app.tree.nodes[a].apparent);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("rescanned {}/a", root.display()).as_str())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Without a running scan there is nothing to stop.
+    #[test]
+    fn stop_without_a_scan_says_so() {
+        let mut app = app_with_entries();
+        app.on_key(KeyAction::StopScan);
+        assert_eq!(app.status.as_deref(), Some("no scan is running"));
+        assert!(!app.stopping);
+    }
+
+    /// The quit question offers to stop the scan instead; `S` there stops it and stays.
+    #[test]
+    fn the_quit_question_can_stop_the_scan() {
+        let mut app = app_with_an_unfinished_directory();
+        app.confirm_quit = true;
+        let _tx = add_stream(&mut app, false, Instant::now());
+        app.on_key(KeyAction::Quit);
+        assert!(matches!(app.modal, Modal::ConfirmQuit));
+        app.on_key(KeyAction::StopScan);
+        assert!(matches!(app.modal, Modal::None));
+        assert!(!app.quit);
+        assert!(app.controls[0].is_stopped());
     }
 
     /// Select `name` in the root view and confirm its deletion.
