@@ -12,6 +12,12 @@ history was separated; they do not match the pull requests of this repository.
 
 ## [Unreleased]
 
+### Added
+
+- **`S` stops a running scan or rescan** and keeps what it has read. Directories it has not
+  read stay marked as unfinished and cannot be deleted; `r` reads one of them. The question
+  of `--confirm-quit` offers it too (#43).
+
 ### Changed
 
 - **The footer shows how many entries the scan reads per second** (`files/s`), over the last
