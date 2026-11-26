@@ -110,6 +110,9 @@ pub struct Pattern {
     /// The pattern is plain text without a `/`. It can then only ever equal the last
     /// component of a path, which saves trying every tail.
     plain_name: Option<Box<[u8]>>,
+    /// `*`, `?` and brackets do not match a `/` (`fnmatch` with `FNM_PATHNAME`), as in a
+    /// shell. The search wants that; `--exclude` patterns are matched as ncdu does, without.
+    within_components: bool,
 }
 
 impl Pattern {
@@ -158,6 +161,16 @@ impl Pattern {
         Pattern {
             tokens,
             plain_name: plain.map(Vec::into_boxed_slice),
+            within_components: false,
+        }
+    }
+
+    /// A pattern whose `*`, `?` and brackets never match a `/`, as in a shell: `src/*.rs`
+    /// matches `src/main.rs` and not `src/bin/x.rs`.
+    pub fn within_components(pattern: &str) -> Self {
+        Pattern {
+            within_components: true,
+            ..Pattern::new(pattern)
         }
     }
 
@@ -179,6 +192,7 @@ impl Pattern {
                 None => None,
                 Some(_) if s == text.len() => None,
                 Some(Token::Literal(byte)) => (text[s] == *byte).then_some(1),
+                Some(_) if self.within_components && text[s] == b'/' => None,
                 Some(Token::Any) => Some(char_len(&text[s..])),
                 Some(Token::Class { negated, items }) => {
                     let (c, len) = decode(&text[s..]);
@@ -191,7 +205,9 @@ impl Pattern {
                     t += 1;
                     s += len;
                 }
-                (None, Some((star_t, taken))) if taken < text.len() => {
+                (None, Some((star_t, taken)))
+                    if taken < text.len() && !(self.within_components && text[taken] == b'/') =>
+                {
                     let taken = taken + char_len(&text[taken..]);
                     star = Some((star_t, taken));
                     t = star_t + 1;
@@ -306,6 +322,24 @@ mod tests {
 
     fn matches(pattern: &str, text: &str) -> bool {
         Pattern::new(pattern).matches(text.as_bytes())
+    }
+
+    /// For the search, `*`, `?` and brackets stay within one component, as in a shell; for
+    /// `--exclude` they do not, as in ncdu.
+    #[test]
+    fn within_components_keeps_wildcards_off_slashes() {
+        let shell = |pattern: &str, text: &str| {
+            Pattern::within_components(pattern).matches(text.as_bytes())
+        };
+        assert!(shell("src/*.rs", "src/main.rs"));
+        assert!(!shell("src/*.rs", "src/bin/x.rs"));
+        assert!(matches("src/*.rs", "src/bin/x.rs"));
+        assert!(!shell("a?b", "a/b"));
+        assert!(matches("a?b", "a/b"));
+        assert!(!shell("a[/]b", "a/b"));
+        assert!(shell("*/*", "a/b"));
+        assert!(!shell("*", "a/b"));
+        assert!(shell("*", "ab"));
     }
 
     #[test]
