@@ -206,20 +206,59 @@ struct Queue {
     /// Jobs that were queued under earlier priorities and classified into this queue later.
     /// They are older than everything in `fresh`.
     late: VecDeque<DirJob>,
-    /// Jobs queued under the current priorities, oldest at the front.
+    /// Jobs queued under the current priorities, oldest at the front, in a queue that all
+    /// workers share.
     fresh: VecDeque<DirJob>,
+    /// Or, in a queue that is walked by work stealing, the jobs each worker queued: one
+    /// stack per worker, oldest at the front.
+    own: Vec<VecDeque<DirJob>>,
 }
 
 impl Queue {
     fn len(&self) -> usize {
-        self.late.len() + self.fresh.len()
+        self.late.len() + self.fresh.len() + self.own.iter().map(VecDeque::len).sum::<usize>()
     }
 
+    fn push(&mut self, job: DirJob, worker: usize) {
+        match self.own.get_mut(worker) {
+            Some(stack) => stack.push_back(job),
+            None => self.fresh.push_back(job),
+        }
+    }
+
+    /// The next job for `worker`. With work stealing: the newest it queued itself, so it
+    /// walks its subtree depth-first; else the oldest of those classified late; else it
+    /// steals the oldest, which is the shallowest, of the worker with the most queued.
+    fn pop_for(&mut self, worker: usize) -> Option<DirJob> {
+        if self.own.is_empty() {
+            return self.pop();
+        }
+        if let Some(job) = self.own.get_mut(worker).and_then(VecDeque::pop_back) {
+            return Some(job);
+        }
+        if let Some(job) = self.late.pop_front() {
+            return Some(job);
+        }
+        self.own
+            .iter_mut()
+            .max_by_key(|stack| stack.len())
+            .and_then(VecDeque::pop_front)
+    }
+
+    /// The next job for whoever asks: for a shared queue, and to classify stale jobs.
     fn pop(&mut self) -> Option<DirJob> {
         if self.newest_first {
             self.fresh.pop_back().or_else(|| self.late.pop_back())
         } else {
-            self.late.pop_front().or_else(|| self.fresh.pop_front())
+            self.late
+                .pop_front()
+                .or_else(|| self.fresh.pop_front())
+                .or_else(|| {
+                    self.own
+                        .iter_mut()
+                        .find(|stack| !stack.is_empty())
+                        .and_then(VecDeque::pop_front)
+                })
         }
     }
 }
@@ -230,15 +269,20 @@ impl Queue {
 /// (`first`), under the directory being viewed (`focus`), and the rest. A class is emptied
 /// before the next is touched.
 ///
-/// **Order.** The focused directory and the rest are read oldest job first, which is a
-/// breadth-first walk: every entry on screen gets a size early, and the readers spread over
-/// the whole tree, and with it over all its disks. Measurements on a machine with several
-/// filesystems of very different speed decided this: a depth-first walk sent every reader
-/// into the first big directory while the rows next to it stayed empty, and letting the rows
-/// take turns tied the fast filesystems to the pace of the slowest one (see #38).
+/// **Order.** The focused directory and the rest are walked by work stealing. Each worker
+/// keeps the directories it found on a stack of its own and reads the newest first, so it
+/// walks its subtree depth-first and finishes it; a worker without work takes the shallowest
+/// directory of the worker with the most queued. Workers then stay on the filesystem their
+/// subtree is on: a slow one holds only the workers that its own work keeps there, and the
+/// fast ones are not held to its pace. Sizes become final early, and the queues stay small.
+/// On a machine with filesystems of very different speed this read about twice as many
+/// directories in the first 10 seconds as a breadth-first walk did, and completed most rows
+/// within seconds instead of minutes (#117). One shared queue taken newest first sent every
+/// worker into the same directory, and letting the rows take turns tied the fast
+/// filesystems to the pace of the slowest one (#38).
 ///
-/// A directory the user is waiting for is different. There the aim is to have that one
-/// subtree complete as soon as possible, so it is read newest job first, depth-first.
+/// A directory the user is waiting for is read from one shared stack, newest job first:
+/// every worker helps to finish that one subtree.
 ///
 /// **Changing the priorities is cheap.** Re-classifying every queued job when the user moves
 /// would block the UI thread and stall the workers on a large pool. Instead the queues are
@@ -262,28 +306,41 @@ struct Frontier {
     /// The most jobs that were ever queued at once.
     #[cfg(test)]
     peak: usize,
+    /// The number of workers, each with a stack of its own in the focus and the rest.
+    workers: usize,
 }
 
 impl Frontier {
+    /// A frontier for one worker.
+    #[cfg(test)]
     fn new(root: DirJob) -> Self {
+        Self::with_workers(root, 1)
+    }
+
+    fn with_workers(root: DirJob, workers: usize) -> Self {
         let mut frontier = Frontier {
             first: None,
             focus: None,
-            classes: Self::empty_classes(),
+            classes: Default::default(),
             stale: Vec::new(),
             pending: 1, // the root job
             done: false,
             stopped: false,
             #[cfg(test)]
             peak: 0,
+            workers: workers.max(1),
         };
-        frontier.push(root);
+        frontier.classes = frontier.empty_classes();
+        frontier.push_for(root, 0);
         frontier
     }
 
-    fn empty_classes() -> [Queue; 3] {
+    fn empty_classes(&self) -> [Queue; 3] {
         let mut classes: [Queue; 3] = Default::default();
         classes[FIRST].newest_first = true;
+        for queue in &mut classes[FOCUSED..] {
+            queue.own = (0..self.workers).map(|_| VecDeque::new()).collect();
+        }
         classes
     }
 
@@ -302,9 +359,16 @@ impl Frontier {
         self.classes.iter().chain(&self.stale).map(Queue::len).sum()
     }
 
+    /// Queue a job, found by the first worker.
+    #[cfg(test)]
     fn push(&mut self, job: DirJob) {
+        self.push_for(job, 0);
+    }
+
+    /// Queue a job that `worker` found.
+    fn push_for(&mut self, job: DirJob, worker: usize) {
         let class = self.class_of(&job.path);
-        self.classes[class].fresh.push_back(job);
+        self.classes[class].push(job, worker);
         #[cfg(test)]
         {
             self.peak = self.peak.max(self.queued());
@@ -319,7 +383,8 @@ impl Frontier {
         }
         self.first = first;
         self.focus = focus;
-        let old = std::mem::replace(&mut self.classes, Self::empty_classes());
+        let empty = self.empty_classes();
+        let old = std::mem::replace(&mut self.classes, empty);
         // The last queue is worked off first: what used to be most urgent goes last.
         self.stale
             .extend(old.into_iter().rev().filter(|queue| queue.len() > 0));
@@ -330,15 +395,21 @@ impl Frontier {
     fn stop(&mut self) {
         self.stopped = true;
         self.pending -= self.queued();
-        self.classes = Self::empty_classes();
+        self.classes = self.empty_classes();
         self.stale.clear();
         if self.pending == 0 {
             self.done = true;
         }
     }
 
-    /// The next directory to read.
+    /// The next directory for the first worker to read.
+    #[cfg(test)]
     fn pop(&mut self) -> Option<DirJob> {
+        self.pop_for(0)
+    }
+
+    /// The next directory for `worker` to read.
+    fn pop_for(&mut self, worker: usize) -> Option<DirJob> {
         loop {
             // Classify some of the jobs that predate the current priorities, in the order
             // they would have been read in.
@@ -361,7 +432,7 @@ impl Frontier {
             // Take the most urgent job known. While stale jobs remain, one of them could be
             // more urgent than what is found here; that is accepted, a chunk at a time, in
             // exchange for never stalling.
-            if let Some(job) = self.classes.iter_mut().find_map(Queue::pop) {
+            if let Some(job) = self.classes.iter_mut().find_map(|q| q.pop_for(worker)) {
                 return Some(job);
             }
             if self.stale.is_empty() {
@@ -404,6 +475,13 @@ impl ScanControl {
     /// The most directories that were waiting to be read at any one time.
     fn peak_queued(&self) -> usize {
         self.frontier.0.lock().unwrap().peak
+    }
+
+    /// Directories queued, and directories being read.
+    fn load(&self) -> (usize, usize) {
+        let f = self.frontier.0.lock().unwrap();
+        let queued = f.queued();
+        (queued, f.pending - queued)
     }
 
     /// Prioritize the subtree rooted at `path` only, as when the user navigates into it.
@@ -605,10 +683,13 @@ fn start_steered(
     let gate = Arc::new(Gate::new(queued_entries));
 
     let frontier: FrontierArc = Arc::new((
-        Mutex::new(Frontier::new(DirJob {
-            id: id_base,
-            path: root,
-        })),
+        Mutex::new(Frontier::with_workers(
+            DirJob {
+                id: id_base,
+                path: root,
+            },
+            opts.threads,
+        )),
         Condvar::new(),
     ));
 
@@ -642,10 +723,10 @@ fn start_steered(
     };
     steer(&control);
 
-    for _ in 0..opts.threads {
+    for me in 0..opts.threads {
         let frontier = Arc::clone(&frontier);
         let shared = Arc::clone(&shared);
-        thread::spawn(move || worker(frontier, shared));
+        thread::spawn(move || worker(frontier, shared, me));
     }
 
     // Drop our worker-state reference so the event channel is kept alive only by the workers;
@@ -661,7 +742,7 @@ fn start_steered(
     }
 }
 
-fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
+fn worker(frontier: FrontierArc, shared: Arc<Shared>, me: usize) {
     let (lock, cv) = &*frontier;
     loop {
         // Take the next job, preferring the focused subtree; block until one is available or
@@ -669,7 +750,7 @@ fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
         let job = {
             let mut f = lock.lock().unwrap();
             loop {
-                if let Some(job) = f.pop() {
+                if let Some(job) = f.pop_for(me) {
                     break job;
                 }
                 if f.done {
@@ -679,7 +760,7 @@ fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
             }
         };
 
-        process(&job, &frontier, &shared);
+        process(&job, &frontier, &shared, me);
 
         // This job is complete. If it was the last one, finish the scan and wake everyone.
         let mut f = lock.lock().unwrap();
@@ -691,7 +772,7 @@ fn worker(frontier: FrontierArc, shared: Arc<Shared>) {
     }
 }
 
-fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
+fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared, me: usize) {
     // Send entries of this directory to the UI, waiting if too much is on its way already.
     let send = |nodes: Vec<NewNode>, ext: Vec<Ext>, error: Option<String>, more: bool| {
         debug_assert!(ext.is_empty() || ext.len() == nodes.len());
@@ -875,7 +956,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
                 None,
                 true,
             );
-            if !enqueue(frontier, std::mem::take(&mut child_jobs)) {
+            if !enqueue(frontier, std::mem::take(&mut child_jobs), me) {
                 // Stopped: the directory stays unread, with the entries sent so far.
                 return;
             }
@@ -885,7 +966,7 @@ fn process(job: &DirJob, frontier: &FrontierArc, shared: &Shared) {
     // The last (usually the only) batch says that the directory has been read.
     send(nodes, exts, listing.error, false);
     if !child_jobs.is_empty() {
-        enqueue(frontier, child_jobs);
+        enqueue(frontier, child_jobs, me);
     }
 }
 
@@ -1000,7 +1081,7 @@ pub fn ext_of(meta: &std::fs::Metadata) -> Ext {
 ///
 /// Returns false if the scan was stopped: nothing is queued then, and the caller leaves the
 /// directory it is reading.
-fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>) -> bool {
+fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>, me: usize) -> bool {
     let (lock, cv) = &**frontier;
     if child_jobs.is_empty() {
         return !lock.lock().unwrap().stopped;
@@ -1011,7 +1092,7 @@ fn enqueue(frontier: &FrontierArc, child_jobs: Vec<DirJob>) -> bool {
     }
     f.pending += child_jobs.len();
     for cj in child_jobs {
-        f.push(cj);
+        f.push_for(cj, me);
     }
     cv.notify_all();
     true
@@ -1219,16 +1300,47 @@ mod tests {
         std::iter::from_fn(|| f.pop().map(|j| j.id)).collect()
     }
 
-    /// Without priorities the oldest job is taken first: a breadth-first walk. Every entry
-    /// of a directory is read before any of their subdirectories.
+    /// A worker reads the newest directory it found itself first: it walks its subtree
+    /// depth-first and finishes it before it goes on.
     #[test]
-    fn frontier_reads_breadth_first() {
+    fn frontier_reads_a_workers_own_finds_depth_first() {
         let mut f = frontier_with(&["/r/a", "/r/b"]);
-        assert_eq!(f.pop().map(|j| j.id), Some(1), "/r/a, the oldest");
-        // Reading /r/a found two subdirectories. /r/b comes before them.
-        f.push(job(10, "/r/a/x"));
-        f.push(job(11, "/r/a/y"));
-        assert_eq!(drain(&mut f), vec![2, 10, 11]);
+        assert_eq!(f.pop().map(|j| j.id), Some(2), "/r/b, the newest");
+        // Reading /r/b found two subdirectories. They come before /r/a.
+        f.push(job(10, "/r/b/x"));
+        f.push(job(11, "/r/b/y"));
+        assert_eq!(drain(&mut f), vec![11, 10, 1]);
+    }
+
+    /// A worker without work of its own takes the shallowest directory of the worker with
+    /// the most queued, and then walks on from there with what it finds.
+    #[test]
+    fn frontier_lets_an_idle_worker_steal_the_shallowest() {
+        let mut f = Frontier::with_workers(job(0, "/r"), 3);
+        assert_eq!(f.pop_for(0).map(|j| j.id), Some(0));
+        f.push_for(job(1, "/r/a"), 0);
+        f.push_for(job(2, "/r/b"), 0);
+        f.push_for(job(3, "/r/c"), 0);
+        assert_eq!(f.pop_for(0).map(|j| j.id), Some(3), "its own newest");
+        f.push_for(job(30, "/r/c/x"), 0);
+        assert_eq!(
+            f.pop_for(1).map(|j| j.id),
+            Some(1),
+            "stolen: the oldest of worker 0"
+        );
+        f.push_for(job(10, "/r/a/x"), 1);
+        f.push_for(job(11, "/r/a/y"), 1);
+        assert_eq!(f.pop_for(1).map(|j| j.id), Some(11), "then its own");
+        // Worker 0 has two queued and worker 1 one: from worker 0.
+        assert_eq!(f.pop_for(2).map(|j| j.id), Some(2));
+        assert_eq!(f.pop_for(0).map(|j| j.id), Some(30));
+        assert_eq!(
+            f.pop_for(0).map(|j| j.id),
+            Some(10),
+            "its own are done: stolen"
+        );
+        assert_eq!(f.pop_for(2).map(|j| j.id), None, "nothing is left anywhere");
+        assert_eq!(f.queued(), 0);
     }
 
     /// A directory the user is waiting for is read depth-first: its newest job first, so its
@@ -1262,12 +1374,13 @@ mod tests {
         f.set_priorities(Some("/r/C".into()), Some("/r/B".into()));
         assert_eq!(drain(&mut f), vec![4, 2, 5, 1, 3]);
 
-        // New jobs are classified as they arrive, behind the older ones of their class.
+        // New jobs are classified as they arrive. In their class a worker takes what it
+        // found itself before older jobs.
         let mut f = frontier_with(&["/r/A/x"]);
         f.set_priorities(None, Some("/r/B".into()));
         f.push(job(7, "/r/B/new"));
         f.push(job(8, "/r/A/new"));
-        assert_eq!(drain(&mut f), vec![7, 1, 8]);
+        assert_eq!(drain(&mut f), vec![7, 8, 1]);
 
         // A path is under a directory by components, not by prefix of its text.
         let mut f = frontier_with(&["/r/Bee", "/r/B"]);
@@ -1574,6 +1687,93 @@ mod tests {
         println!(
             "{:<44} {:>13}",
             "most directories queued at once",
+            scan.control.peak_queued()
+        );
+    }
+
+    /// The scan order on a whole tree, row by row, to the end (#117). Prints, at a few
+    /// moments, how many directories were read, how many top-level rows have a size and how
+    /// many are final, and in the end the total time and the most directories queued.
+    /// Read-only.
+    ///
+    /// ```sh
+    /// ICDU_MEASURE_ROOT=/ cargo test --release scan_rows_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn scan_rows_measurement() {
+        use std::time::{Duration, Instant};
+        let root = PathBuf::from(std::env::var("ICDU_MEASURE_ROOT").unwrap_or("/usr".into()));
+        let threads = std::env::var("ICDU_MEASURE_THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or_else(default_threads);
+        let meta = fs::symlink_metadata(&root).unwrap();
+        let mut tree = Tree::new(
+            root.to_string_lossy().into(),
+            meta.len(),
+            meta.blocks() * 512,
+            meta.dev(),
+            meta.ino(),
+        );
+        let mut opts = opts(threads, meta.dev());
+        opts.exclude_kernfs = true;
+        println!("{} with {threads} threads", root.display());
+        let marks = [1, 3, 10, 30, 60, 120, 300].map(Duration::from_secs);
+        let mut next = 0;
+        let mut dirs = 0usize;
+        let started = Instant::now();
+        let scan = start(root.clone(), opts);
+        let control = &scan.control;
+        let mut finished: Vec<NodeIdx> = Vec::new();
+        let report = |tree: &Tree, dirs: usize, at: Duration| {
+            let rows: Vec<NodeIdx> = tree.nodes[tree.root]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| tree.nodes[c].is_dir() && tree.nodes[c].excluded == Excluded::No)
+                .collect();
+            let sized = rows.iter().filter(|&&r| tree.nodes[r].scanned).count();
+            let fin = rows
+                .iter()
+                .filter(|&&r| tree.nodes[r].scanned && tree.subtree_complete(r))
+                .count();
+            let (queued, reading) = control.load();
+            println!(
+                "{:>6.1?}  {dirs:>9} directories  rows: {sized:>3} of {} with a size, {fin:>3} final  queued {queued:>6}, reading {reading:>3}",
+                at,
+                rows.len()
+            );
+        };
+        for batch in scan.events.iter() {
+            if !batch.more {
+                dirs += 1;
+            }
+            tree.apply(batch);
+            for &row in &tree.nodes[tree.root].children {
+                let n = &tree.nodes[row];
+                if n.is_dir() && n.scanned && n.unscanned == 0 && !finished.contains(&row) {
+                    finished.push(row);
+                    if started.elapsed() >= Duration::from_secs(10) {
+                        println!(
+                            "        /{} final after {:.1?} ({} directories)",
+                            n.name,
+                            started.elapsed(),
+                            dirs
+                        );
+                    }
+                }
+            }
+            while next < marks.len() && started.elapsed() >= marks[next] {
+                report(&tree, dirs, marks[next]);
+                next += 1;
+            }
+        }
+        let total = started.elapsed();
+        report(&tree, dirs, total);
+        println!("scan complete after {total:.2?}");
+        println!(
+            "most directories queued at once: {}",
             scan.control.peak_queued()
         );
     }

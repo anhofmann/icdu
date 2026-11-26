@@ -20,6 +20,10 @@ history was separated; they do not match the pull requests of this repository.
 
 ### Changed
 
+- **The scan finishes one directory after the other** instead of reading the whole tree level
+  by level. Most sizes are final within seconds, so `d` and `r` work on them sooner, and in a
+  scan of a machine with disks of different speed about twice as many directories were read
+  in the first 10 seconds. It also keeps far fewer directories waiting in memory (#117).
 - **The footer shows how many entries the scan reads per second** (`files/s`), over the last
   30 seconds, instead of the size found per second. The size said nothing about the speed of
   the scan: one big file made it look fast. The new figure drops when the scan slows down,
