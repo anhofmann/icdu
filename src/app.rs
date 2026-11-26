@@ -17,7 +17,7 @@ use crossbeam_channel::{unbounded, Receiver};
 
 use crate::delete::{kind_of, Plan, Report};
 use crate::dump::Exporter;
-use crate::matcher::Matcher;
+use crate::matcher::Query;
 use crate::model::{Excluded, Ext, NodeIdx, NodeKind, Tree};
 use crate::natsort::{natural_cmp, prefix, prefix_order};
 use crate::scan::{
@@ -175,6 +175,23 @@ const FIND_RESORT: Duration = Duration::from_millis(250);
 /// How long a capped hit list stands during a scan before the tree is searched again: sizes
 /// grow, and what was too small to be listed may not be any more.
 pub const FIND_REPASS: Duration = Duration::from_secs(2);
+
+/// For a query that looks at paths: whether the path of `idx` below `base` matches. Kept out
+/// of the search loop, which is the same for name queries then as without paths.
+#[inline(never)]
+fn path_matches(
+    query: &Query,
+    tree: &Tree,
+    idx: NodeIdx,
+    base: NodeIdx,
+    path: &mut String,
+) -> bool {
+    if !query.wants_path() {
+        return true;
+    }
+    let name_start = tree.search_path(idx, base, path);
+    query.matches_path(path, name_start)
+}
 
 /// State of the search popup (`/`).
 ///
@@ -359,19 +376,27 @@ impl Find {
 
         let Some(query) = &self.active else { return };
         // Prepared once per frame, used for every node of the slice.
-        let matcher = Matcher::new(query);
+        let query = Query::new(query);
         let was_busy = self.cursor < len;
         let end = len.min(self.cursor.saturating_add(budget));
         // Tombstones exist only after a delete or rescan; until then skip the parent walk.
         let check_attached = tree.detached > 0;
-        // The whole pass stays linear: the walk up to the scope is paid only by names that
-        // match. Scoped to the root is the whole tree.
-        let scope = self.scope().filter(|&d| d != tree.root);
+        // The whole pass stays linear: the walk up to the scope, and the path a path query
+        // looks at, are paid only by names that match. Scoped to the root is the whole tree.
+        let base = self.scope().unwrap_or(tree.root);
+        let scope = Some(base).filter(|&d| d != tree.root);
+        let mut path = String::new();
+        let names = query.name_matcher();
         for i in self.cursor..end {
+            let name_matches = match names {
+                Some(matcher) => matcher.matches(&tree.nodes[i].name),
+                None => query.matches_name(&tree.nodes[i].name, tree.nodes[i].is_dir()),
+            };
             if i != tree.root
-                && matcher.matches(&tree.nodes[i].name)
+                && name_matches
                 && scope.is_none_or(|d| i != d && tree.is_within(i, d))
                 && (!check_attached || tree.is_attached(i))
+                && (names.is_some() || path_matches(&query, tree, i, base, &mut path))
             {
                 self.counted += 1;
                 // Keep it if there is room, or if it is larger than the smallest one kept
@@ -5853,9 +5878,91 @@ mod tests {
             "first hit selected"
         );
 
+        // The root's name, `/r`, is a path query from the top now: the root is not a hit, the
+        // entry at the top whose name starts with `r` is.
         let mut app = app_for_find();
         search(&mut app, "/r");
-        assert!(hit_names(&app).is_empty(), "root excluded");
+        assert_eq!(hit_names(&app), vec!["readme"], "root excluded");
+    }
+
+    /// A query with a `/` is found in the path, and the match has to reach into the name of
+    /// the entry: `sub/read` finds what starts with `read` in a directory ending in `sub`,
+    /// `sub/` finds that directory, and a leading `/` starts at the top of what is searched.
+    #[test]
+    fn find_matches_paths() {
+        let mut app = app_for_find();
+        search(&mut app, "sub/read");
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "docs/");
+        assert_eq!(
+            hit_names(&app),
+            vec!["docs"],
+            "the directory, not what is in it"
+        );
+
+        let mut app = app_for_find();
+        search(&mut app, "s/");
+        assert_eq!(hit_names(&app), vec!["docs"], "names that end in s");
+
+        let mut app = app_for_find();
+        search(&mut app, "docs/sub/readme.TXT");
+        assert_eq!(hit_names(&app), vec!["README.txt"], "case is ignored");
+
+        let mut app = app_for_find();
+        search(&mut app, "/sub");
+        assert!(hit_names(&app).is_empty(), "sub is not at the top");
+
+        let mut app = app_for_find();
+        search(&mut app, "/docs/sub/");
+        assert_eq!(hit_names(&app), vec!["sub"]);
+
+        // `/` alone: every directory.
+        let mut app = app_for_find();
+        search(&mut app, "/");
+        assert_eq!(hit_names(&app), vec!["docs", "sub"]);
+
+        // Searched from `docs`, paths start there.
+        let mut app = app_for_find();
+        app.cur = idx_named(&app, "docs");
+        search(&mut app, "/sub/r");
+        assert!(hit_names(&app).is_empty(), "the whole tree is searched");
+        app.on_key(KeyAction::FindScope);
+        app.find_tick(Instant::now() + FIND_DEBOUNCE * 4, usize::MAX);
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+    }
+
+    /// A query with `*` or `?` is a pattern the whole name has to match, ignoring case. With
+    /// a `/` it is matched against the path, and a `/` at the end asks for directories.
+    #[test]
+    fn find_matches_patterns() {
+        let mut app = app_for_find();
+        search(&mut app, "*.md");
+        assert_eq!(hit_names(&app), vec!["readme.md"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "readme*");
+        assert_eq!(hit_names(&app), vec!["README.txt", "readme.md", "readme"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "readm?");
+        assert_eq!(hit_names(&app), vec!["readme"], "the whole name");
+
+        let mut app = app_for_find();
+        search(&mut app, "s*/");
+        assert_eq!(hit_names(&app), vec!["sub"], "directories only");
+
+        let mut app = app_for_find();
+        search(&mut app, "sub/*");
+        assert_eq!(hit_names(&app), vec!["README.txt"]);
+
+        let mut app = app_for_find();
+        search(&mut app, "/*.md");
+        assert!(hit_names(&app).is_empty(), "* stays within the top level");
+        let mut app = app_for_find();
+        search(&mut app, "/docs/*.md");
+        assert_eq!(hit_names(&app), vec!["readme.md"]);
     }
 
     /// The pass runs only once the query has been left alone for the debounce interval, and
@@ -7377,7 +7484,21 @@ mod tests {
         }
         let nodes = t.nodes.len();
         let mut app = App::new(t, true, false, false);
-        for query in ["zzz", "file-0999", "ubung", "übung", "ÜBUNGSBLATT-0990"] {
+        for query in [
+            "zzz",
+            "file-0999",
+            "ubung",
+            "übung",
+            "ÜBUNGSBLATT-0990",
+            "dir-00999/file-0999",
+            "/dir-00999/",
+            "*.pdf",
+            "dir-0099?/*.pdf",
+        ] {
+            // The popup opens with the last search in it.
+            app.on_key(KeyAction::Find);
+            app.on_key(KeyAction::FindClear);
+            app.on_key(KeyAction::Cancel);
             let start = Instant::now();
             search(&mut app, query);
             let took = start.elapsed();

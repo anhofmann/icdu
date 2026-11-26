@@ -845,6 +845,33 @@ impl Tree {
         parts.join("/")
     }
 
+    /// The path of `idx` below `base` as the search matches it, into `out`: `/a/b/name`, with
+    /// a `/` after a directory. Returns where the name starts in it.
+    pub fn search_path(&self, idx: NodeIdx, base: NodeIdx, out: &mut String) -> usize {
+        out.clear();
+        let mut parts = Vec::new();
+        let mut cur = idx;
+        while cur != base {
+            match self.nodes[cur].parent {
+                Some(p) => {
+                    parts.push(self.nodes[cur].name.as_str());
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        let mut name_start = 0;
+        for part in parts.iter().rev() {
+            out.push('/');
+            name_start = out.len();
+            out.push_str(part);
+        }
+        if self.nodes[idx].is_dir() {
+            out.push('/');
+        }
+        name_start
+    }
+
     /// Flag or unflag `idx` as unreadable, and keep the error counts of its ancestors in step.
     /// Never write `Node::read_error` directly: the counts would no longer match.
     pub fn set_read_error(&mut self, idx: NodeIdx, on: bool) {

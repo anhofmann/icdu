@@ -169,7 +169,7 @@ all:
 | `C` | sort by the number of items; again reverses |
 | `M` | sort by modification time (needs `-e`); again reverses |
 | `t` | directories first, or not |
-| `/` | search by name; `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
+| `/` | search by name, path (`a/b`) or pattern (`*.iso`); `Enter` jumps to the selected match, `Tab` limits the search to the current directory |
 | `]` / `[` | go to the next / previous match of the last search |
 | `a` | toggle apparent size ↔ on-disk usage |
 | `e` | show or hide hidden entries: dot files, and what the scan excluded |
@@ -220,6 +220,7 @@ The same `…` marks unfinished directories in the search results.
 
 ### Searching
 
+`/` finds what you type in a name. With a `/` in it, the query is found in the path (`src/main`, `src/` for the directory, `/src` from the top); with `*` or `?` it is a pattern the whole name has to match (`*.iso`).
 `↑`/`↓` and `PgUp`/`PgDn` move, `Enter` jumps to the directory
 containing the selected match with it highlighted, and `Esc` closes the popup.
 The search is kept when the popup closes. 

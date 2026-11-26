@@ -15,7 +15,7 @@ use crate::app::{
     flag_of, fmt_mtime, scroll_offset, size_column, App, Find, HelpView, Modal, Sort, SortColumn,
     TopFiles, FIND_CAP,
 };
-use crate::matcher::Matcher;
+use crate::matcher::Query;
 use crate::model::{Excluded, Node, NodeIdx, NodeKind, Tree};
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
@@ -334,8 +334,8 @@ fn find_empty_message(
 ) -> &'static str {
     match active {
         None if !query.is_empty() => "",
-        None if scoped => "  type to search entry names below this directory",
-        None => "  type to search entry names across the whole tree",
+        None if scoped => "  type to search below this directory: a name, a/path, *.pattern",
+        None => "  type to search the whole tree: a name, a/path, *.pattern",
         // The list is for an earlier query, or the pass is still running.
         Some(active) if active != query || busy => "",
         // A scan may still bring a match: "no matches" would be a promise it cannot keep.
@@ -455,7 +455,8 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
             rows,
         );
         find.offset.set(offset);
-        let matcher = Matcher::new(find.active.as_deref().unwrap_or(""));
+        let query = Query::new(find.active.as_deref().unwrap_or(""));
+        let mut slashed = String::new();
         // Size column (10 + 2 spaces) and the rest for the path.
         let path_width = (list_area.width as usize).saturating_sub(12).max(8);
         let mark = Style::default()
@@ -466,17 +467,16 @@ fn render_find(f: &mut Frame, app: &App, find: &Find) {
             .iter()
             .map(|&idx| {
                 let n = &app.tree.nodes[idx];
-                let mut path = app.tree.rel_path_from(idx, scope.unwrap_or(app.tree.root));
-                // The name is the path's last component; locate the match inside it.
-                let name_start = path.len() - n.name.len();
+                // The path as the search matched it, with a `/` in front, which the list
+                // leaves out.
+                let base = scope.unwrap_or(app.tree.root);
+                let name_start = app.tree.search_path(idx, base, &mut slashed);
+                let path = slashed[1.min(slashed.len())..].to_string();
                 // The matched text can differ in length from the query (case folding, the
                 // two spellings of accented letters): highlight the range that was found.
-                let hit = matcher
-                    .find(&n.name)
-                    .map(|m| (name_start + m.start, name_start + m.end));
-                if n.is_dir() {
-                    path.push('/');
-                }
+                let hit = query
+                    .highlight(&slashed, name_start)
+                    .map(|m| (m.start.saturating_sub(1), m.end.saturating_sub(1)));
                 let cut = truncate_left(&path, path_width);
                 let incomplete = n.unscanned > 0;
                 let mut spans = vec![Span::styled(
@@ -999,7 +999,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("s / n / C / M", "sort by size / name / items / mtime"),
     ("    again", "turn the order around"),
     ("t", "directories first, or not"),
-    ("/", "search by name; Enter goes there"),
+    ("/", "search a name, a/path or *.pattern"),
     ("    Tab", "search this directory only"),
     ("    C-u / C-w", "clear the query / delete a word"),
     ("] / [", "next / previous match of that search"),
@@ -1952,6 +1952,40 @@ mod tests {
         assert!(rows[0].starts_with("icdu  /data"));
     }
 
+    /// A path query marks what it found in the path, across the `/`; a pattern marks the
+    /// whole name.
+    #[test]
+    fn the_search_marks_what_it_found_in_the_path() {
+        use crate::app::KeyAction;
+        use ratatui::{backend::TestBackend, Terminal};
+        let marked = |query: &str| {
+            let mut app = app_to_draw();
+            app.on_key(KeyAction::Find);
+            for c in query.chars() {
+                app.on_key(KeyAction::FindChar(c));
+            }
+            let typed = std::time::Instant::now();
+            app.find_tick(typed, usize::MAX);
+            app.find_tick(typed + std::time::Duration::from_secs(1), usize::MAX);
+            let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+            terminal.draw(|f| super::render(f, &app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            // The text of every cell drawn in the colour of a match, row by row.
+            (0..14)
+                .map(|y| {
+                    (0..80)
+                        .filter(|&x| buffer[(x, y)].fg == ratatui::style::Color::Yellow)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>()
+        };
+        assert!(marked("os/hol").contains(&"os/hol".to_string()));
+        assert!(marked("*.JPG").contains(&"holiday.jpg".to_string()));
+        assert!(marked("/photos/").contains(&"photos/".to_string()));
+    }
+
     /// No row may be larger than what a full bar stands for.
     #[test]
     fn bar_scale_covers_the_rows_on_screen() {
@@ -2391,7 +2425,7 @@ mod tests {
         let msg = |active, query, scoped, busy, scanning| {
             find_empty_message(active, query, scoped, busy, scanning).trim()
         };
-        assert!(msg(None, "", false, false, false).starts_with("type to search"));
+        assert!(msg(None, "", false, false, false).starts_with("type to search the whole"));
         assert!(msg(None, "", true, false, true).contains("below this directory"));
         assert_eq!(
             msg(None, "ab", false, false, false),

@@ -17,6 +17,10 @@ history was separated; they do not match the pull requests of this repository.
 - **`S` stops a running scan or rescan** and keeps what it has read. Directories it has not
   read stay marked as unfinished and cannot be deleted; `r` reads one of them. The question
   of `--confirm-quit` offers it too (#43).
+- **The search finds paths and patterns** (#50). A query with a `/` is looked for in the
+  path: `src/main` finds `…/src/main.rs`, `src/` the directories called `src`, and `/src`
+  only the one at the top. A query with `*` or `?` is a pattern the whole name has to match:
+  `*.iso` finds the names that end in `.iso`.
 
 ### Changed
 
