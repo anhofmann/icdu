@@ -413,6 +413,17 @@ A directory can only be deleted when all of it has been scanned.
 .B r
 Scan the directory on screen again.
 .TP
+.B S
+Stop the scan.
+What it has read stays, and the directories it has not read are marked as unfinished.
+They cannot be deleted;
+.B r
+reads them.
+Also offered by the question that
+.B \-\-confirm\-quit
+asks.
+Not in ncdu.
+.TP
 .B b
 Start a shell in the directory on screen.
 .TP

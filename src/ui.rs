@@ -615,15 +615,14 @@ fn size_style(incomplete: bool) -> Style {
     }
 }
 
-/// What the header says about the part of the viewed directory the scan has not reached.
-fn left_to_read(unscanned: u32) -> Option<String> {
+/// What the header says about the part of the viewed directory the scan has not reached:
+/// what is left to read while it runs, and what was not read after it was stopped.
+fn left_to_read(unscanned: u32, scanning: bool) -> Option<String> {
+    let what = if scanning { "left to read" } else { "not read" };
     match unscanned {
         0 => None,
-        1 => Some("1 directory left to read".into()),
-        n => Some(format!(
-            "{} directories left to read",
-            fmt_count(n as usize)
-        )),
+        1 => Some(format!("1 directory {what}")),
+        n => Some(format!("{} directories {what}", fmt_count(n as usize))),
     }
 }
 
@@ -654,7 +653,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     ))];
     // While the scan has not been everywhere below this directory, the total is a lower
     // bound. The count shrinks towards zero, which also shows that the scan is getting there.
-    if let Some(left) = left_to_read(app.tree.nodes[app.cur].unscanned) {
+    if let Some(left) = left_to_read(app.tree.nodes[app.cur].unscanned, app.scanning) {
         l2.push(Span::styled(
             format!("   {left}"),
             Style::default().fg(Color::Yellow),
@@ -865,6 +864,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ),
             Style::default().fg(Color::Cyan),
         ))
+    } else if app.stopping {
+        Some((
+            format!("{spinner} stopping the scan…"),
+            Style::default().fg(Color::Yellow),
+        ))
     } else if app.scanning {
         // The header says how many directories are left below the one on screen. Where that
         // is all there is left, as at the top, the footer does not say it a second time.
@@ -934,8 +938,14 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let status = match activity {
         Some((text, _)) => text,
+        // A scan that was stopped (`S`) is over, but not done.
         None => format!(
-            "done  {} dirs  {} files",
+            "{}  {} dirs  {} files",
+            if app.dirs_left() > 0 {
+                "stopped"
+            } else {
+                "done"
+            },
             fmt_count(app.tree.total_dirs as usize),
             fmt_count(app.tree.total_files as usize)
         ),
@@ -1003,6 +1013,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ("T", "largest files under this directory"),
     ("i", "details of the selected entry"),
     ("r", "rescan this directory"),
+    ("S", "stop the scan, keep what it read"),
     ("E", "export the tree as ncdu JSON"),
     ("x / !", "jump to the next read error"),
     ("b", "shell in this directory"),
@@ -1271,7 +1282,7 @@ fn confirm_quit_text(unread: usize) -> String {
 }
 
 fn render_confirm_quit(f: &mut Frame, app: &App) {
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![Span::styled(
             "Quit?",
             Style::default()
@@ -1296,6 +1307,17 @@ fn render_confirm_quit(f: &mut Frame, app: &App) {
             Span::raw(" stay"),
         ]),
     ];
+    if app.scanning && !app.stopping {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  S",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" stop the scan and stay"),
+        ]));
+    }
     let width = 76.min(f.area().width.saturating_sub(4)).max(24);
     let height = wrapped_height(&lines, width - 2) + 2;
     let area = popup(f.area(), width, height);
@@ -1806,6 +1828,11 @@ mod tests {
             footer(&app),
             " ? help  / search  d delete  sort:size↓  a usage  q quit   │   done  3 dirs  3 files"
         );
+        // Over, with directories left unread: the scan was stopped.
+        let root = app.tree.root;
+        app.tree.nodes[root].unscanned = 2;
+        assert!(footer(&app).ends_with("│   stopped  3 dirs  3 files"));
+        app.tree.nodes[root].unscanned = 0;
         app.on_key(crate::app::KeyAction::SortByName);
         assert!(footer(&app).contains("sort:name↑"));
         // Deleting is not on offer where it is switched off.
@@ -1976,11 +2003,29 @@ mod tests {
 
     #[test]
     fn left_to_read_counts_down_to_nothing() {
-        assert_eq!(left_to_read(0), None);
-        assert_eq!(left_to_read(1).as_deref(), Some("1 directory left to read"));
+        assert_eq!(left_to_read(0, true), None);
         assert_eq!(
-            left_to_read(12_345).as_deref(),
+            left_to_read(1, true).as_deref(),
+            Some("1 directory left to read")
+        );
+        assert_eq!(
+            left_to_read(12_345, true).as_deref(),
             Some("12,345 directories left to read")
+        );
+    }
+
+    /// After the scan was stopped, nothing is going to read the rest: the header says what
+    /// was not read, not what is left.
+    #[test]
+    fn left_to_read_after_a_stop_says_not_read() {
+        assert_eq!(left_to_read(0, false), None);
+        assert_eq!(
+            left_to_read(1, false).as_deref(),
+            Some("1 directory not read")
+        );
+        assert_eq!(
+            left_to_read(3, false).as_deref(),
+            Some("3 directories not read")
         );
     }
 

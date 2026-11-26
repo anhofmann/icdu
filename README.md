@@ -179,6 +179,7 @@ all:
 | `d` | delete selected entry (asks to confirm) |
 | `T` | show the largest files under the current directory |
 | `r` | rescan the current directory in place |
+| `S` | stop the scan; what it has not read stays marked as unfinished, and `r` reads it |
 | `i` | show details of the selected entry |
 | `E` | export the tree to an ncdu-format JSON file |
 | `x` | jump to the next read-error entry (`!` marker), wrapping around; the footer shows the reason |
